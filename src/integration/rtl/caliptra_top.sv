@@ -60,7 +60,9 @@ module caliptra_top
 
     // Caliptra Memory Export Interface
     el2_mem_if.veer_sram_src           el2_mem_export,
+`ifndef CALIPTRA_NO_ADAMS_BRIDGE
     abr_mem_if.req                     abr_memory_export,
+`endif
 
     //SRAM interface for mbox
     output logic mbox_sram_cs,
@@ -1096,6 +1098,7 @@ hmac_ctrl #(
 
 );
 
+`ifndef CALIPTRA_NO_ADAMS_BRIDGE
 abr_top #(
     .AHB_DATA_WIDTH(`CALIPTRA_AHB_HDATA_SIZE),
     .AHB_ADDR_WIDTH(`CALIPTRA_SLAVE_ADDR_WIDTH(`CALIPTRA_SLAVE_SEL_MLDSA))
@@ -1125,6 +1128,21 @@ abr_top #(
      .debugUnlock_or_scan_mode_switch(debug_lock_or_scan_mode_switch),
      .abr_memory_export (abr_memory_export)
 );
+`else
+    // Adams Bridge removed — tie off signals
+    assign abr_busy        = 1'b0;
+    assign abr_error_intr  = 1'b0;
+    assign abr_notif_intr  = 1'b0;
+    // AHB responder tie-off: always ready, no error, zero data
+    assign responder_inst[`CALIPTRA_SLAVE_SEL_MLDSA].hreadyout = 1'b1;
+    assign responder_inst[`CALIPTRA_SLAVE_SEL_MLDSA].hresp     = 1'b0;
+    assign responder_inst[`CALIPTRA_SLAVE_SEL_MLDSA].hrdata    = '0;
+    // KeyVault tie-offs: ABR used kv_read[7:6], kv_read[2], kv_write[1]
+    assign kv_read[7]  = '0;
+    assign kv_read[6]  = '0;
+    assign kv_read[2]  = '0;
+    assign kv_write[1] = '0;
+`endif
 
 
 
