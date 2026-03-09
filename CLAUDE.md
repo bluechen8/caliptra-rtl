@@ -119,10 +119,13 @@ Custom tiny FMC & RT that just print a banner and hand off:
 - [x] Binary sizes: test-fmc .text=472 bytes, test-rt .text=1140 bytes (both tiny, ~1.6 KB combined code)
 - [ ] Trace fake-ROM boot to determine which DCCM persistent data offsets are actually written
 
-#### Step 2: RTL — Mailbox & ROM size reduction (easy, just change defines)
-- [ ] Override `CPTRA_MBOX_SIZE_KB` in `soc_ifc_pkg.sv` (or via compile define)
-- [ ] Override `CALIPTRA_IMEM_BYTE_SIZE` in `config_defines.svh` (or via compile define)
-- [ ] Wire size params through chipyard wrapper (like ABR flag)
+#### Step 2: RTL — Mailbox & ROM size reduction — DONE
+- [x] Override `CPTRA_MBOX_SIZE_KB` in `soc_ifc_pkg.sv` via `ifdef CALIPTRA_MBOX_SIZE_KB` compile define
+- [x] Override `CALIPTRA_IMEM_BYTE_SIZE` in `config_defines.svh` via `ifndef` guard (overrideable via `+define+`)
+- [x] Wire size params through chipyard wrapper: `CaliptraParams.mboxSizeKB/imemSizeKB` → `CaliptraCoreBlackbox` → Makefile → verilator `+define+`
+- [x] Fixed hardcoded `98304` in `CaliptraCoreBlackbox.scala` and `CaliptraTile.scala` (imem_waddr width now derived from `imemSizeKB`)
+- [x] Updated `CaliptraRocketMinimalDemoConfig` with `mboxSizeKB=32`
+- [x] Verified: preprocessed RTL shows `CPTRA_MBOX_SIZE_KB = 32`
 
 #### Step 3: RTL — ICCM & DCCM reduction via VeeR config tool — DONE
 - [x] Added `Cores-VeeR-EL2` as submodule in caliptra-wrapper (`vsrc/Cores-VeeR-EL2`, pinned to commit `8d9457af`)
@@ -133,7 +136,7 @@ Custom tiny FMC & RT that just print a banner and hand off:
   - Generated `.vf` in snapshot dir overrides `el2_param.vh`, `el2_pdef.vh`, `common_defines.sv`
   - Post-processing: renames `common_defines.vh` → `.sv`, comments out `RV_TOP` define (conflicts with caliptra's `config_defines.svh`)
 - [x] Wired through chipyard: `CaliptraParams.iccmSizeKB/dccmSizeKB` → `CaliptraCoreBlackbox` → make args
-- [x] Added `CaliptraRocketMinimalDemoConfig` (noAdamsBridge=true, iccm=32KB, dccm=128KB)
+- [x] Added `CaliptraRocketMinimalDemoConfig` (noAdamsBridge=true, iccm=32KB, dccm=256KB, mbox=32KB)
 - [x] Verified: elaboration succeeds, preprocessed RTL has `ICCM_SIZE=14'h0020` (32KB), `DCCM_SIZE=14'h0080` (128KB)
 
 #### Step 4: SW linker script adjustments — DONE
@@ -143,10 +146,10 @@ Custom tiny FMC & RT that just print a banner and hand off:
 - **Key finding:** DCCM must stay at 256K — `PersistentData` is ~110K, leaving only ~14K for stack at 128K DCCM. ROM DICE chain needs ~40K+ stack. Stack overflow at 128K DCCM corrupts `dot_owner_pk_hash` in PersistentData, causing `IMAGE_VERIFIER_ERR_DOT_OWNER_PUB_KEY_DIGEST_MISMATCH` (0x000B005E).
 - Used `gen_memory_layout.py`: `--iccm-kb 32 --dccm-kb 256 --fmc-kb 8 --rt-kb 24 --total-stack-kb 40 --rom-stack-kb 40 --fmc-rt-stack-kb 14 --lib-fmc-kb 8 --lib-rt-kb 24`
 
-#### Step 5: End-to-end verification
-- [ ] Build with all size reductions + ABR disabled
-- [ ] Test with fake ROM boot
-- [ ] Verify FMC prints → RT prints → success
+#### Step 5: End-to-end verification — DONE
+- [x] Build with all size reductions + ABR disabled
+- [x] Test with fake ROM boot
+- [x] Verify FMC prints → RT prints → success
 
 ## Key Config Files Reference
 - `src/integration/rtl/caliptra_top.sv` — top-level integration (ABR instantiation)
@@ -165,3 +168,5 @@ Custom tiny FMC & RT that just print a banner and hand off:
 - 2026-03-08: Minimal demo FMC/RT working — `minimal-demo` feature in test-fmc jumps to RT via `transfer_control`. Tested with `make run DEVICE_LIFECYCLE=manufacturing NO_MLDSA=1 MINIMAL_DEMO=1`. Next: resize SRAMs in RTL.
 - 2026-03-08: ICCM/DCCM VeeR config integrated into caliptra-wrapper Makefile. Cores-VeeR-EL2 added as submodule (commit `8d9457af`). Snapshot-based caching with auto-generated `.vf`. Fixed `RV_TOP` redefine conflict. `CaliptraRocketMinimalDemoConfig` elaborates successfully with ICCM=32KB, DCCM=128KB.
 - 2026-03-09: SW linker scripts adjusted for ICCM=32K (FMC 8K + RT 24K). Discovered DCCM must stay at 256K: PersistentData ~110K + ROM stack 40K exceeds 128K. Stack overflow at 128K DCCM corrupts PersistentData.dot_owner_pk_hash → fatal error 0x000B005E. Updated memory_layout.rs, rom.ld, fmc.ld, rt.ld, common/src/lib.rs via gen_memory_layout.py.
+- 2026-03-09: Mailbox & ROM size reduction (Step 2) complete. Made `CPTRA_MBOX_SIZE_KB` overrideable via `ifdef` in `soc_ifc_pkg.sv`, `CALIPTRA_IMEM_BYTE_SIZE` via `ifndef` in `config_defines.svh`. Wired `mboxSizeKB`/`imemSizeKB` through CaliptraParams → CaliptraCoreBlackbox → Makefile → verilator +define+. Fixed hardcoded 98304 in Scala. MinimalDemoConfig now: noABR, ICCM=32K, DCCM=256K, mbox=32K. Elaboration verified.
+- 2026-03-09: End-to-end verification (Step 5) passed. MinimalDemoConfig with all size reductions + ABR disabled boots successfully: FMC prints → RT prints → success.

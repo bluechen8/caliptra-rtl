@@ -36,7 +36,9 @@ package soc_ifc_pkg;
     parameter SOC_IFC_REG_OFFSET = 32'h3000_0000;
     
     //Mailbox size configuration
-`ifdef CALIPTRA_MODE_SUBSYSTEM
+`ifdef CALIPTRA_MBOX_SIZE_KB
+    parameter CPTRA_MBOX_SIZE_KB = `CALIPTRA_MBOX_SIZE_KB;
+`elsif CALIPTRA_MODE_SUBSYSTEM
     parameter CPTRA_MBOX_SIZE_KB = 16;
 `else
     parameter CPTRA_MBOX_SIZE_KB = 256;
