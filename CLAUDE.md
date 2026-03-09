@@ -42,32 +42,111 @@ Reduce Caliptra core area for tapeout by:
 - [x] KAT: gated `mldsa87_kat` module and execute_kat call
 - [x] Common: gated `mldsa87` in verifier and debug_unlock
 - [x] ROM: gated MLDSA imports, struct fields, constructors, cert signing, key derivation across all cold_reset flows
-- [ ] Test ROM build with `NO_MLDSA=1` and verify it compiles cleanly
-- [ ] Measure ROM binary size with/without MLDSA to determine IMEM savings
+- [x] Standard ROM build with `NO_MLDSA=1` tested — compiles and boots successfully
+- [ ] (deferred) Measure ROM binary size with/without MLDSA to determine IMEM savings
+
+### Testing Status
+- [x] ABR disable tested end-to-end with **fake ROM** — boots successfully
+- [x] Full test with standard ROM (no-MLDSA) — boots successfully
 
 ## Part 2: Flexible SRAM Sizes
 
-### Current Defaults
+### Current Defaults & How to Change
 
-| Memory | Size | Config Location |
-|--------|------|-----------------|
-| ICCM | 256 KB | `src/riscv_core/veer_el2/rtl/el2_param.vh` — `ICCM_SIZE: 14'h0100` |
-| DCCM | 256 KB | `src/riscv_core/veer_el2/rtl/el2_param.vh` — `DCCM_SIZE: 14'h0100` |
-| ROM (IMEM) | 96 KB | `src/integration/rtl/config_defines.svh` — `CALIPTRA_IMEM_BYTE_SIZE: 98304` |
-| Mailbox | 256 KB (16 KB in SS mode) | `src/soc_ifc/rtl/soc_ifc_pkg.sv` — `CPTRA_MBOX_SIZE_KB` |
+| Memory | Default | How to Resize | Config Location |
+|--------|---------|---------------|-----------------|
+| ROM (IMEM) | 96 KB | Change `CALIPTRA_IMEM_BYTE_SIZE` define (auto-sizes via `$clog2`) | `src/integration/rtl/config_defines.svh:97` |
+| Mailbox | 256 KB | Change `CPTRA_MBOX_SIZE_KB` param (auto-sizes via `$clog2`) | `src/soc_ifc/rtl/soc_ifc_pkg.sv:39-51` |
+| ICCM | 256 KB | Set `iccmSizeKB` in `WithCaliptra()` — auto-generates VeeR config | `CaliptraTile.scala` / `vsrc/Makefile` |
+| DCCM | 256 KB | Set `dccmSizeKB` in `WithCaliptra()` — auto-generates VeeR config | `CaliptraTile.scala` / `vsrc/Makefile` |
 
-### TODO (RTL - caliptra-rtl)
-- [ ] Determine minimum viable sizes for each SRAM (depends on SW image sizes)
-- [ ] Parameterize or use defines to make sizes easily changeable
-- [ ] Reduce ICCM size (target TBD)
-- [ ] Reduce DCCM size (target TBD)
-- [ ] Reduce ROM/IMEM size (target TBD, must fit ROM binary)
-- [ ] Reduce Mailbox size (16 KB SS mode value may be a starting point)
-- [ ] Verify address map consistency after resizing
+**VeeR config integration:** `Cores-VeeR-EL2` is a submodule of caliptra-wrapper (commit `8d9457af`, branch `2.0-patches`). When non-default ICCM/DCCM sizes are used, the Makefile auto-runs `veer.config` to generate a snapshot at `vsrc/snapshots/caliptra_iccm<N>_dccm<M>/`, caches it, and generates a modified `.vf` that overrides VeeR param files. Default sizes (256/256) use the stock caliptra-rtl files with no generation step.
 
-### TODO (SW - caliptra-sw) — deferred until RTL sizes are decided
-- [ ] Adjust linker scripts if memory map changes
-- [ ] Verify firmware builds and runs with reduced SRAMs
+### Boot Flow & Memory Usage
+
+**Boot:** ROM (in IMEM) → loads FMC+Runtime from **mailbox** into ICCM → launches FMC → FMC hands off to Runtime.
+- **ROM uses DCCM** for stack (62 KB) + exception stacks (2 KB) + persistent data (at fixed offsets from 0x50000400)
+- **Mailbox must be ≥ firmware bundle** (manifest 1KB + FMC image + Runtime image)
+- **Output:** `cprintln!` writes to SOC_IFC generic output wires (no real UART)
+
+### SW Image Sizes (Current Full Firmware)
+
+| Component | Text | Rodata | Total | Runs In |
+|-----------|------|--------|-------|---------|
+| ROM | 76.7 KB | 10.0 KB | ~87 KB | IMEM (0x00000000) |
+| FMC | 24.8 KB | 8.6 KB | ~33.5 KB | ICCM (0x40000000) |
+| Runtime | 138.8 KB | 7.2 KB | ~146 KB | ICCM (0x40009000) |
+
+**DCCM layout:** Persistent data starts at 0x50000400 (~110 KB: manifests 34K + datavault 15K + FHT 2K + MLDSA keys/certs 20K + cert buffers + DPE state etc.) + FMC/RT data (93 KB region) + stack (14 KB FMC/RT, 40 KB ROM) + exception stacks (2 KB)
+
+### Design Points
+
+#### A) Full Firmware (with no-mldsa, current binaries)
+| Memory | Current | Target | Rationale |
+|--------|---------|--------|-----------|
+| ROM | 96 KB | 64 KB | ~15-30K MLDSA savings (needs measurement) |
+| ICCM | 256 KB | 192 KB | FMC 33.5K + RT 146K = 182K, fits in 192K |
+| DCCM | 256 KB | 192 KB | ~169K used, fits in 192K |
+| Mailbox | 256 KB | 192 KB | Bundle ~180K (manifest + FMC + RT) |
+| **Total savings** | | | **~224 KB SRAM** |
+
+#### B) Minimal Demo (FMC prints → jumps to RT → RT prints)
+Custom tiny FMC & RT that just print a banner and hand off:
+- **Minimal FMC:** init + print + jump to RT → ~2-4 KB code
+- **Minimal RT:** init + print + halt → ~2-4 KB code
+- **Mailbox:** manifest (1K) + tiny FMC + tiny RT → **16 KB sufficient**
+- **DCCM:** ROM still uses DCCM for stack + persistent data. Persistent data at fixed offsets spans ~100 KB. ROM stack needs up to 62 KB. → **128 KB minimum** (needs validation: do all persistent data fields get written, or only a subset in fake-ROM flow?)
+- **ICCM:** only holds tiny FMC + RT → **32 KB sufficient**
+- **ROM:** unchanged, use fake ROM (small) → **96 KB** (or could reduce if fake ROM binary is smaller)
+
+| Memory | Current | Minimal Demo | Savings |
+|--------|---------|--------------|---------|
+| ROM | 96 KB | 96 KB (keep) | 0 KB |
+| ICCM | 256 KB | 32 KB | 224 KB |
+| DCCM | 256 KB | 256 KB (keep, PersistentData ~110K + stack 40K) | 0 KB |
+| Mailbox | 256 KB | 16 KB | 240 KB |
+| **Total savings** | | | **464 KB SRAM** |
+
+**Resolved:** DCCM cannot be reduced — `PersistentData` struct is ~110K (manifests 34K, cert buffers 24K, DPE 5K, auth manifest metadata 10K, CSR envelopes 18K, etc.) and ROM stack needs ~40K for DICE chain crypto. Reducing PersistentData would require gating MLDSA-related fields (~20K) with `no-mldsa` feature, which is a significant code change.
+
+### Plan
+
+#### Step 1: Build minimal demo FMC & RT (SW) — DONE
+- [x] `minimal-demo` feature added to test-fmc (`Cargo.toml`, `main.rs`): prints banner, reads `data_vault.rt_entry_point()`, jumps via `transfer_control` assembly
+- [x] test-rt already minimal (prints banner, exits)
+- [x] `MINIMAL_DEMO=1` Makefile flag wired to `build-test-fmc` features
+- [x] Verified: `make run DEVICE_LIFECYCLE=manufacturing NO_MLDSA=1 MINIMAL_DEMO=1` — FMC prints → jumps to RT → RT prints Caliptra RT banner → success
+- [x] Binary sizes: test-fmc .text=472 bytes, test-rt .text=1140 bytes (both tiny, ~1.6 KB combined code)
+- [ ] Trace fake-ROM boot to determine which DCCM persistent data offsets are actually written
+
+#### Step 2: RTL — Mailbox & ROM size reduction (easy, just change defines)
+- [ ] Override `CPTRA_MBOX_SIZE_KB` in `soc_ifc_pkg.sv` (or via compile define)
+- [ ] Override `CALIPTRA_IMEM_BYTE_SIZE` in `config_defines.svh` (or via compile define)
+- [ ] Wire size params through chipyard wrapper (like ABR flag)
+
+#### Step 3: RTL — ICCM & DCCM reduction via VeeR config tool — DONE
+- [x] Added `Cores-VeeR-EL2` as submodule in caliptra-wrapper (`vsrc/Cores-VeeR-EL2`, pinned to commit `8d9457af`)
+- [x] Integrated VeeR config generation into `vsrc/Makefile`:
+  - `CALIPTRA_ICCM_SIZE_KB` / `CALIPTRA_DCCM_SIZE_KB` params (default 256)
+  - `veer-config` target auto-generates VeeR snapshot at `vsrc/snapshots/caliptra_iccm<N>_dccm<M>/`
+  - Snapshots cached — only regenerated if not present
+  - Generated `.vf` in snapshot dir overrides `el2_param.vh`, `el2_pdef.vh`, `common_defines.sv`
+  - Post-processing: renames `common_defines.vh` → `.sv`, comments out `RV_TOP` define (conflicts with caliptra's `config_defines.svh`)
+- [x] Wired through chipyard: `CaliptraParams.iccmSizeKB/dccmSizeKB` → `CaliptraCoreBlackbox` → make args
+- [x] Added `CaliptraRocketMinimalDemoConfig` (noAdamsBridge=true, iccm=32KB, dccm=128KB)
+- [x] Verified: elaboration succeeds, preprocessed RTL has `ICCM_SIZE=14'h0020` (32KB), `DCCM_SIZE=14'h0080` (128KB)
+
+#### Step 4: SW linker script adjustments — DONE
+- [x] Update `memory_layout.rs` with new ICCM/DCCM sizes (ICCM=32K, STACK=40K, ROM_STACK=40K)
+- [x] Update linker scripts (rom.ld, fmc.ld, rt.ld) memory regions and stack positions
+- [x] Update `common/src/lib.rs` FMC_SIZE=8K, RUNTIME_SIZE=24K
+- **Key finding:** DCCM must stay at 256K — `PersistentData` is ~110K, leaving only ~14K for stack at 128K DCCM. ROM DICE chain needs ~40K+ stack. Stack overflow at 128K DCCM corrupts `dot_owner_pk_hash` in PersistentData, causing `IMAGE_VERIFIER_ERR_DOT_OWNER_PUB_KEY_DIGEST_MISMATCH` (0x000B005E).
+- Used `gen_memory_layout.py`: `--iccm-kb 32 --dccm-kb 256 --fmc-kb 8 --rt-kb 24 --total-stack-kb 40 --rom-stack-kb 40 --fmc-rt-stack-kb 14 --lib-fmc-kb 8 --lib-rt-kb 24`
+
+#### Step 5: End-to-end verification
+- [ ] Build with all size reductions + ABR disabled
+- [ ] Test with fake ROM boot
+- [ ] Verify FMC prints → RT prints → success
 
 ## Key Config Files Reference
 - `src/integration/rtl/caliptra_top.sv` — top-level integration (ABR instantiation)
@@ -81,3 +160,8 @@ Reduce Caliptra core area for tapeout by:
 - 2026-03-08: Added `CALIPTRA_NO_ADAMS_BRIDGE` plumbing: Makefile define, CaliptraCoreBlackbox param, CaliptraParams field, WithCaliptra config fragment
 - 2026-03-08: RTL ifdef guards added: `caliptra_top.sv` (abr_top + tie-offs), `CaliptraCoreBlackbox.sv` (abr_mem_top)
 - 2026-03-08: SW `no-mldsa` feature flag implemented across caliptra-sw (kat, common, rom/dev) — ABR SW removal complete
+- 2026-03-08: ABR disable tested end-to-end with fake ROM — boots successfully. Standard ROM test deferred.
+- 2026-03-08: Part 2 planning: analyzed SRAM sizes, SW image sizes, VeeR config tool flow. Two design points: full firmware (224 KB savings) vs minimal demo (592 KB savings). Next: build minimal demo FMC/RT, then resize SRAMs.
+- 2026-03-08: Minimal demo FMC/RT working — `minimal-demo` feature in test-fmc jumps to RT via `transfer_control`. Tested with `make run DEVICE_LIFECYCLE=manufacturing NO_MLDSA=1 MINIMAL_DEMO=1`. Next: resize SRAMs in RTL.
+- 2026-03-08: ICCM/DCCM VeeR config integrated into caliptra-wrapper Makefile. Cores-VeeR-EL2 added as submodule (commit `8d9457af`). Snapshot-based caching with auto-generated `.vf`. Fixed `RV_TOP` redefine conflict. `CaliptraRocketMinimalDemoConfig` elaborates successfully with ICCM=32KB, DCCM=128KB.
+- 2026-03-09: SW linker scripts adjusted for ICCM=32K (FMC 8K + RT 24K). Discovered DCCM must stay at 256K: PersistentData ~110K + ROM stack 40K exceeds 128K. Stack overflow at 128K DCCM corrupts PersistentData.dot_owner_pk_hash → fatal error 0x000B005E. Updated memory_layout.rs, rom.ld, fmc.ld, rt.ld, common/src/lib.rs via gen_memory_layout.py.
