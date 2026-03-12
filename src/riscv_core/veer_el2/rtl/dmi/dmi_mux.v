@@ -61,7 +61,8 @@ module dmi_mux (
   assign dmi_uncore_addr    = dmi_addr;
   assign dmi_uncore_wdata   = dmi_wdata;
 
-  // Read mux
-  assign dmi_rdata          = is_uncore_aperture ? dmi_uncore_rdata : dmi_core_rdata;
+  // Read mux — return sentinel 0xDEADBEEF when the target aperture is disabled
+  assign dmi_rdata          = is_uncore_aperture ? (uncore_enable ? dmi_uncore_rdata : 32'hDEADBEEF)
+                                                 : (core_enable   ? dmi_core_rdata   : 32'hDEADBEEF);
 
 endmodule
