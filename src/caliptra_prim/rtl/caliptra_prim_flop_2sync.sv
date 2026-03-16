@@ -38,24 +38,53 @@ module caliptra_prim_flop_2sync #(
   always_comb d_o = d_i;
 `endif // !`ifdef CALIPTRA_SIMULATION
 
-  caliptra_prim_flop #(
-    .Width(Width),
-    .ResetValue(ResetValue)
-  ) u_sync_1 (
-    .clk_i,
-    .rst_ni,
-    .d_i(d_o),
-    .q_o(intq)
-  );
+  // caliptra_prim_flop #(
+  //   .Width(Width),
+  //   .ResetValue(ResetValue)
+  // ) u_sync_1 (
+  //   .clk_i,
+  //   .rst_ni,
+  //   .d_i(d_o),
+  //   .q_o(intq)
+  // );
 
-  caliptra_prim_flop #(
-    .Width(Width),
-    .ResetValue(ResetValue)
-  ) u_sync_2 (
-    .clk_i,
-    .rst_ni,
-    .d_i(intq),
-    .q_o
-  );
+  // caliptra_prim_flop #(
+  //   .Width(Width),
+  //   .ResetValue(ResetValue)
+  // ) u_sync_2 (
+  //   .clk_i,
+  //   .rst_ni,
+  //   .d_i(intq),
+  //   .q_o
+  // );
+
+// NOTE: DOES NOT HONOR ResetValue!
+
+  genvar i;
+   logic [Width-1:0] stage1;
+
+   generate
+      // Loop through each bit of the bus
+      for (i = 0; i < Width; i++) begin : gen_sync_cell
+         
+         // Instantiate the specific Foundry Synchronizer Cell
+         // REPLACE 'FOUNDRY_SYNC_CELL_NAME' with the actual cell name (e.g., SYNC2_D1_SS)
+
+         // need to chain 2 flip flops together to create a sync cell
+      DFFX1 u_sync_ff0 (
+        .CK (clk_i),
+        .D  (d_i[i]),
+        .Q  (stage1[i]),
+        .QN ()          // optional, leave unconnected
+      );
+
+      DFFX1 u_sync_ff1 (
+        .CK (clk_i),
+        .D  (stage1[i]),
+        .Q  (q_o[i]),
+        .QN ()
+      );
+      end
+   endgenerate
 
 endmodule : caliptra_prim_flop_2sync
