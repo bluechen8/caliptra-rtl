@@ -12,12 +12,16 @@ module caliptra_prim_sky130_clock_mux2 #(
   output logic clk_o
 );
 
-  // sky130 mux2: A0 selected when S=0, A1 selected when S=1
-  sky130_fd_sc_hd__mux2_1 u__size_only__clock_mux (
-    .A0(clk0_i),
-    .A1(clk1_i),
-    .S(sel_i),
-    .X(clk_o)
-  );
+    // The instance name "u__size_only__buf" contains the required tag.
+    // Synthesis tools must be configured to apply "size_only"
+    // constraints to any instance whose name includes "u__size_only__".
+    // This naming convention should be used for all replaced primitives.
 
-endmodule : caliptra_prim_sky130_clock_mux2
+    CLKMX2X2 u__size_only__clock_mux2 (
+      .A (clk0_i),
+      .B (clk1_i),
+      .S0 (sel_i),
+      .Y (clk_o)
+    );
+
+endmodule : caliptra_prim_generic_clock_mux2

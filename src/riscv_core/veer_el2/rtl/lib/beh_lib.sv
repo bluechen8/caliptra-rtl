@@ -439,10 +439,39 @@ module rvsyncss #(parameter WIDTH = 251)
      output logic [WIDTH-1:0]     dout
      );
 
-   logic [WIDTH-1:0]              din_ff1;
+   // logic [WIDTH-1:0]              din_ff1;
 
-   rvdff #(WIDTH) sync_ff1  (.*, .din (din[WIDTH-1:0]),     .dout(din_ff1[WIDTH-1:0]));
-   rvdff #(WIDTH) sync_ff2  (.*, .din (din_ff1[WIDTH-1:0]), .dout(dout[WIDTH-1:0]));
+   // rvdff #(WIDTH) sync_ff1  (.*, .din (din[WIDTH-1:0]),     .dout(din_ff1[WIDTH-1:0]));
+   // rvdff #(WIDTH) sync_ff2  (.*, .din (din_ff1[WIDTH-1:0]), .dout(dout[WIDTH-1:0]));
+
+   // Define the Generate Variable
+   genvar i;
+   logic [WIDTH-1:0] stage1;
+
+   generate
+      // Loop through each bit of the bus
+      for (i = 0; i < WIDTH; i++) begin : gen_sync_cell
+         
+         // Instantiate the specific Foundry Synchronizer Cell
+         // REPLACE 'FOUNDRY_SYNC_CELL_NAME' with the actual cell name (e.g., SYNC2_D1_SS)
+
+         // need to chain 2 flip flops together to create a sync cell
+      DFFX1 u_sync_ff0 (
+        .CK (clk),
+        .D  (din[i]),
+        .Q  (stage1[i]),
+        .QN ()          // optional, leave unconnected
+      );
+
+      DFFX1 u_sync_ff1 (
+        .CK (clk),
+        .D  (stage1[i]),
+        .Q  (dout[i]),
+        .QN ()
+      );
+      end
+   endgenerate
+
 
 endmodule // rvsyncss
 
@@ -836,6 +865,3 @@ module rvoclkhdr
 `endif
 
 endmodule
-
-
-
