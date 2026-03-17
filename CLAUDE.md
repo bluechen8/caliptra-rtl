@@ -24,7 +24,7 @@ Reduce Caliptra core area for tapeout by:
 - ABR files listed in `src/integration/config/compile.yml`, `caliptra_top.vf`, `caliptra_top_ss_mode.vf`
 
 ### Chipyard/Wrapper Integration (DONE)
-- [x] `CaliptraParams.noAdamsBridge` field added (`CaliptraTile.scala`)
+- [x] `CaliptraParams.noAdamsBridge` field added (`Caliptra.scala`)
 - [x] `CaliptraCoreBlackbox` accepts `noAdamsBridge` param, passes `CALIPTRA_NO_ADAMS_BRIDGE=1` to make
 - [x] `WithCaliptra(noAdamsBridge = true)` config fragment exposed for chipyard configs
 - [x] `Makefile` adds `+define+CALIPTRA_NO_ADAMS_BRIDGE` to verilator when flag is set
@@ -57,8 +57,8 @@ Reduce Caliptra core area for tapeout by:
 |--------|---------|---------------|-----------------|
 | ROM (IMEM) | 96 KB | Change `CALIPTRA_IMEM_BYTE_SIZE` define (auto-sizes via `$clog2`) | `src/integration/rtl/config_defines.svh:97` |
 | Mailbox | 256 KB | Change `CPTRA_MBOX_SIZE_KB` param (auto-sizes via `$clog2`) | `src/soc_ifc/rtl/soc_ifc_pkg.sv:39-51` |
-| ICCM | 256 KB | Set `iccmSizeKB` in `WithCaliptra()` — auto-generates VeeR config | `CaliptraTile.scala` / `vsrc/Makefile` |
-| DCCM | 256 KB | Set `dccmSizeKB` in `WithCaliptra()` — auto-generates VeeR config | `CaliptraTile.scala` / `vsrc/Makefile` |
+| ICCM | 256 KB | Set `iccmSizeKB` in `WithCaliptra()` — auto-generates VeeR config | `Caliptra.scala` / `vsrc/Makefile` |
+| DCCM | 256 KB | Set `dccmSizeKB` in `WithCaliptra()` — auto-generates VeeR config | `Caliptra.scala` / `vsrc/Makefile` |
 
 **VeeR config integration:** `Cores-VeeR-EL2` is a submodule of caliptra-wrapper (commit `8d9457af`, branch `2.0-patches`). When non-default ICCM/DCCM sizes are used, the Makefile auto-runs `veer.config` to generate a snapshot at `vsrc/snapshots/caliptra_iccm<N>_dccm<M>/`, caches it, and generates a modified `.vf` that overrides VeeR param files. Default sizes (256/256) use the stock caliptra-rtl files with no generation step.
 
@@ -123,7 +123,7 @@ Custom tiny FMC & RT that just print a banner and hand off:
 - [x] Override `CPTRA_MBOX_SIZE_KB` in `soc_ifc_pkg.sv` via `ifdef CALIPTRA_MBOX_SIZE_KB` compile define
 - [x] Override `CALIPTRA_IMEM_BYTE_SIZE` in `config_defines.svh` via `ifndef` guard (overrideable via `+define+`)
 - [x] Wire size params through chipyard wrapper: `CaliptraParams.mboxSizeKB/imemSizeKB` → `CaliptraCoreBlackbox` → Makefile → verilator `+define+`
-- [x] Fixed hardcoded `98304` in `CaliptraCoreBlackbox.scala` and `CaliptraTile.scala` (imem_waddr width now derived from `imemSizeKB`)
+- [x] Fixed hardcoded `98304` in `CaliptraCoreBlackbox.scala` and `Caliptra.scala` (imem_waddr width now derived from `imemSizeKB`)
 - [x] Updated `CaliptraRocketMinimalDemoConfig` with `mboxSizeKB=32`
 - [x] Verified: preprocessed RTL shows `CPTRA_MBOX_SIZE_KB = 32`
 
