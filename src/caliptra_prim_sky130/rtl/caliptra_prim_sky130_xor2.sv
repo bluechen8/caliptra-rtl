@@ -12,10 +12,15 @@ module caliptra_prim_sky130_xor2 #(
 );
 
   for (genvar k = 0; k < Width; k++) begin : gen_xor2
-    sky130_fd_sc_hd__xor2_1 u__size_only__xor2 (
-      .A(in0_i[k]),
-      .B(in1_i[k]),
-      .X(out_o[k])
+    // The instance name "u__size_only__buf" contains the required tag.
+    // Synthesis tools must be configured to apply "size_only"
+    // constraints to any instance whose name includes "u__size_only__".
+    // This naming convention should be used for all replaced primitives.
+
+    XOR2X1 u__size_only__xor2 (
+      .A (in0_i[k]),
+      .B (in1_i[k]),
+      .Y (out_o[k])
     );
   end
 

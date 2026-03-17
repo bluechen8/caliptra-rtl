@@ -10,10 +10,10 @@ module sky130_cptra_icg (
     output       clk_cg
 );
 
-    sky130_fd_sc_hd__dlclkp_1 u_icg (
-        .CLK(clk),
-        .GATE(en),
-        .GCLK(clk_cg)
+    ICGX1 u_gater_CALIPTRA_ICG (
+        .D (en),
+        .G (clk),
+        .Y (clk_cg)
     );
 
 endmodule

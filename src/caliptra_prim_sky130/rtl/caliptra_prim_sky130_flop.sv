@@ -18,18 +18,20 @@ module caliptra_prim_sky130_flop #(
 
   for (genvar k = 0; k < Width; k++) begin : gen_flops
     if (ResetValue[k] == 1'b0) begin : gen_rst0
-      sky130_fd_sc_hd__dfrtp_1 u__size_only__flop (
-        .CLK(clk_i),
+      DFFRX1 u__size_only__flop (
+        .CK(clk_i),
         .D(d_i[k]),
-        .RESET_B(rst_ni),
-        .Q(q_o[k])
+        .RN(rst_ni),
+        .Q(q_o[k]),
+        .QN() // unused
       );
     end else begin : gen_rst1
-      sky130_fd_sc_hd__dfstp_1 u__size_only__flop (
-        .CLK(clk_i),
+      DFFRX1 u__size_only__flop (
+        .CK(clk_i),
         .D(d_i[k]),
-        .SET_B(rst_ni),
-        .Q(q_o[k])
+        .RN(rst_ni),
+        .Q(q_o[k]),
+        .QN() // unused
       );
     end
   end

@@ -14,10 +14,10 @@ module sky130_rv_icg (
     logic gate;
     assign gate = EN | SE;
 
-    sky130_fd_sc_hd__dlclkp_1 u_icg (
-        .CLK(CK),
-        .GATE(gate),
-        .GCLK(Q)
+    ICGX1 u_icg (
+        .D (CK),
+        .G (gate),
+        .Y (Q)
     );
 
 endmodule
