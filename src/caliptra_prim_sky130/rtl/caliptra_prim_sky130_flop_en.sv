@@ -31,27 +31,31 @@ module caliptra_prim_sky130_flop_en #(
   for (genvar k = 0; k < Width; k++) begin : gen_flops
     logic mux_out;
 
-    // Enable mux: en=1 → d_i (new data), en=0 → q_o (hold)
-    sky130_fd_sc_hd__mux2_1 u__size_only__mux (
-      .A0(q_o[k]),
-      .A1(d_i[k]),
-      .S(en),
-      .X(mux_out)
+    // Enable mux: en=1 -> d_i (new data), en=0 -> q_o (hold)
+    MX2X1 u__size_only__mux (
+      .A(q_o[k]),   // selected when S=0
+      .B(d_i[k]),   // selected when S=1
+      .S0(en),
+      .Y(mux_out)
     );
 
     if (ResetValue[k] == 1'b0) begin : gen_rst0
-      sky130_fd_sc_hd__dfrtp_1 u__size_only__flop (
-        .CLK(clk_i),
+      // reset-to-0
+      DFFRX1 u__size_only__flop (
+        .CK(clk_i),
         .D(mux_out),
-        .RESET_B(rst_ni),
-        .Q(q_o[k])
+        .RN(rst_ni),
+        .Q(q_o[k]),
+        .QN()
       );
     end else begin : gen_rst1
-      sky130_fd_sc_hd__dfstp_1 u__size_only__flop (
-        .CLK(clk_i),
+      // set-to-1
+      DFFSX1 u__size_only__flop (
+        .CK(clk_i),
         .D(mux_out),
-        .SET_B(rst_ni),
-        .Q(q_o[k])
+        .SN(rst_ni),
+        .Q(q_o[k]),
+        .QN()
       );
     end
   end

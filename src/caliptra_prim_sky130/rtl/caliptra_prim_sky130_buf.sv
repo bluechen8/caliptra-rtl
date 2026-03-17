@@ -11,10 +11,15 @@ module caliptra_prim_sky130_buf #(
   output logic [Width-1:0] out_o
 );
 
-  for (genvar k = 0; k < Width; k++) begin : gen_bufs
-    sky130_fd_sc_hd__buf_1 u__size_only__buf (
-      .A(in_i[k]),
-      .X(out_o[k])
+ for (genvar k = 0; k < Width; k++) begin : gen_bufs
+    // The instance name "u__size_only__buf" contains the required tag.
+    // Synthesis tools must be configured to apply "size_only"
+    // constraints to any instance whose name includes "u__size_only__".
+    // This naming convention should be used for all replaced primitives.
+
+    BUFX2 u__size_only__buf (
+      .A (in_i[k]),
+      .Y (out_o[k])
     );
   end
 

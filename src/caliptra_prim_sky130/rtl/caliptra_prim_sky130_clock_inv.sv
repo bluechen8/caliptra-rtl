@@ -28,7 +28,7 @@ module caliptra_prim_sky130_clock_inv #(
   end else begin : gen_noscan
     logic unused_scanmode;
     assign unused_scanmode = scanmode_i;
-    sky130_fd_sc_hd__clkinv_1 u__size_only__clk_inv (
+    CLKINVX1 u__size_only__clk_inv (
       .A(clk_i),
       .Y(clk_no)
     );
