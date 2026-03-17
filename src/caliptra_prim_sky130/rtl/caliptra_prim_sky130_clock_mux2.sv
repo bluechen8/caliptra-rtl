@@ -24,4 +24,4 @@ module caliptra_prim_sky130_clock_mux2 #(
       .Y (clk_o)
     );
 
-endmodule : caliptra_prim_generic_clock_mux2
+endmodule : caliptra_prim_sky130_clock_mux2

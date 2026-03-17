@@ -15,8 +15,8 @@ module sky130_rv_icg (
     assign gate = EN | SE;
 
     ICGX1 u_icg (
-        .D (CK),
-        .G (gate),
+        .D (gate),
+        .G (CK),
         .Y (Q)
     );
 

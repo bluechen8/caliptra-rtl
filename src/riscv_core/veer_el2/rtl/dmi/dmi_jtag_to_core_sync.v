@@ -37,15 +37,30 @@ output      reg_wr_en   // 1 bit  Write enable to Processor
   
 wire        c_rd_en;
 wire        c_wr_en;
-reg [2:0]   rden, wren;
- 
 
 // Outputs
 assign reg_en    = c_wr_en | c_rd_en;
 assign reg_wr_en = c_wr_en;
 
+`ifdef CALIPTRA_SYNTH_SKY130
 
-// synchronizers  
+wire [2:0] rden, wren;
+
+// rd_en synchronizer chain (3 stages)
+DFFRX1 u_rden_ff0 (.CK(clk), .D(rd_en),   .RN(rst_n), .Q(rden[0]), .QN());
+DFFRX1 u_rden_ff1 (.CK(clk), .D(rden[0]), .RN(rst_n), .Q(rden[1]), .QN());
+DFFRX1 u_rden_ff2 (.CK(clk), .D(rden[1]), .RN(rst_n), .Q(rden[2]), .QN());
+
+// wr_en synchronizer chain (3 stages)
+DFFRX1 u_wren_ff0 (.CK(clk), .D(wr_en),   .RN(rst_n), .Q(wren[0]), .QN());
+DFFRX1 u_wren_ff1 (.CK(clk), .D(wren[0]), .RN(rst_n), .Q(wren[1]), .QN());
+DFFRX1 u_wren_ff2 (.CK(clk), .D(wren[1]), .RN(rst_n), .Q(wren[2]), .QN());
+
+`else
+
+reg [2:0]   rden, wren;
+
+// synchronizers
 always @ ( posedge clk or negedge rst_n) begin
     if(!rst_n) begin
         rden <= '0;
@@ -57,8 +72,10 @@ always @ ( posedge clk or negedge rst_n) begin
     end
 end
 
+`endif
+
+// Edge detection
 assign c_rd_en = rden[1] & ~rden[2];
 assign c_wr_en = wren[1] & ~wren[2];
- 
 
 endmodule
