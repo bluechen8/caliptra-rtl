@@ -26,10 +26,10 @@ module caliptra_prim_sky130_flop #(
         .QN() // unused
       );
     end else begin : gen_rst1
-      DFFRX1 u__size_only__flop (
+      DFFSX1 u__size_only__flop (
         .CK(clk_i),
         .D(d_i[k]),
-        .RN(rst_ni),
+        .SN(rst_ni),
         .Q(q_o[k]),
         .QN() // unused
       );

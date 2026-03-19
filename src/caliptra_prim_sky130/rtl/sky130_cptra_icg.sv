@@ -11,9 +11,9 @@ module sky130_cptra_icg (
 );
 
     ICGX1 u_gater_CALIPTRA_ICG (
-        .D (en),
-        .G (clk),
-        .Y (clk_cg)
+        .E  (en),
+        .CK (clk),
+        .ECK(clk_cg)
     );
 
 endmodule
