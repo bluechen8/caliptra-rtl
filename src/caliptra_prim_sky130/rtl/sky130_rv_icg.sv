@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Sky130-specific Integrated Clock Gate for VeeR RISC-V core.
-// Replaces behavioral TEC_RV_ICG with sky130_fd_sc_hd__dlclkp_1.
-// Used when TECH_SPECIFIC_EC_RV_ICG and USER_EC_RV_ICG=sky130_rv_icg are defined.
+// Built from discrete cells: CLKINVX1 + TLATX1 + AND2X1
+// LOW-transparent latch ICG (standard for posedge-clocked designs).
 
 module sky130_rv_icg (
     input  logic SE,
@@ -14,10 +14,15 @@ module sky130_rv_icg (
     logic gate;
     assign gate = EN | SE;
 
-    ICGX1 u_icg (
-        .E  (gate),
-        .CK (CK),
-        .ECK(Q)
-    );
+    wire ck_inv, gate_latched;
+
+    // Invert clock: latch will be transparent when CK=0
+    CLKINVX1 u__size_only__clkinv (.A(CK), .Y(ck_inv));
+
+    // LOW-transparent latch: captures gate when CK=0, holds when CK=1
+    TLATX1 u__size_only__latch (.D(gate), .G(ck_inv), .Q(gate_latched), .QN());
+
+    // Gate clock with latched enable
+    AND2X1 u__size_only__and (.A(CK), .B(gate_latched), .Y(Q));
 
 endmodule
