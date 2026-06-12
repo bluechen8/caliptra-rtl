@@ -1,172 +1,127 @@
-# Caliptra Area Optimization Project
+# CLAUDE.md
 
-## Goal
-Reduce Caliptra core area for tapeout by:
-1. Making Adams Bridge (ABR) removable via a config flag
-2. Making SRAM sizes (ROM, ICCM, DCCM, Mailbox) configurable/reducible
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Repositories & Branches
+## Project Goal
 
-| Repo | Fork | Branch | Base Commit | Path |
-|------|------|--------|-------------|------|
-| caliptra-rtl | bluechen8/caliptra-rtl | `area-optimized` | `611728d0` | `/scratch/boru/chipyard/generators/caliptra-wrapper/src/main/resources/caliptra/vsrc/caliptra` |
-| caliptra-sw | bluechen8/caliptra-sw | `area-optimized` | `8efce033` | `/scratch/boru/caliptra_workspace/caliptra-sw` |
-| caliptra-wrapper | bluechen8/caliptra-wrapper | — | — | `/scratch/boru/chipyard/generators/caliptra-wrapper` |
+Explore adding a **FHE (CKKS) encoding/decoding + encryption/decryption accelerator** to Caliptra, modeled after the existing **Adams Bridge (ABR)** PQC accelerator that lives in `submodules/adams-bridge/`. Adams Bridge implements ML-DSA / ML-KEM and is the cleanest in-tree example of a complex crypto accelerator integrated into the Caliptra core as an AHB-Lite responder with KeyVault hooks and a SystemRDL register file. The new FHE block should follow the same integration pattern.
 
-- caliptra-wrapper `.gitmodules` updated to point caliptra-rtl submodule to `bluechen8/caliptra-rtl` branch `area-optimized`
+Branch for this work: `fhe-ckks-accelerator-exploration` (forked off `area-optimized`).
 
-## Part 1: Adams Bridge Removal
+## Build / Test Commands
 
-### Current State
-- `abr_top` is **unconditionally instantiated** in `src/integration/rtl/caliptra_top.sv` (~line 1099-1127)
-- No existing feature flag or `#ifdef` to disable it
-- ABR interrupt vectors: `VEER_INTR_VEC_ABR_ERROR` (#23), `VEER_INTR_VEC_ABR_NOTIF` (#24)
-- ABR files listed in `src/integration/config/compile.yml`, `caliptra_top.vf`, `caliptra_top_ss_mode.vf`
+This repo is consumed by `caliptra-wrapper` (chipyard generator) above it; the wrapper's `Makefile` drives Verilator builds. The native Caliptra build flow uses `tools/scripts/Makefile`:
 
-### Chipyard/Wrapper Integration (DONE)
-- [x] `CaliptraParams.noAdamsBridge` field added (`CaliptraTile.scala`)
-- [x] `CaliptraCoreBlackbox` accepts `noAdamsBridge` param, passes `CALIPTRA_NO_ADAMS_BRIDGE=1` to make
-- [x] `WithCaliptra(noAdamsBridge = true)` config fragment exposed for chipyard configs
-- [x] `Makefile` adds `+define+CALIPTRA_NO_ADAMS_BRIDGE` to verilator when flag is set
+```bash
+# environment
+export CALIPTRA_ROOT=$PWD                         # repo root (this directory)
+export CALIPTRA_WORKSPACE=$(dirname $PWD)         # parent
+export CALIPTRA_PRIM_ROOT=$CALIPTRA_ROOT/src/caliptra_prim_generic
+export CALIPTRA_PRIM_MODULE_PREFIX=caliptra_prim_generic
 
-### RTL Changes (DONE)
-- [x] Wrap `abr_top` instantiation in `caliptra_top.sv` with `ifndef CALIPTRA_NO_ADAMS_BRIDGE`
-- [x] Tie-off `abr_busy`, `abr_error_intr`, `abr_notif_intr` to 0 when disabled
-- [x] Tie-off AHB responder (MLDSA slave): `hreadyout=1`, `hresp=0`, `hrdata=0`
-- [x] Wrap `abr_mem_top` in `CaliptraCoreBlackbox.sv` with `ifndef CALIPTRA_NO_ADAMS_BRIDGE`
-- [ ] Update AHB address map / decoder if needed (may not be required — bus won't hang)
+# Build & run a test in Verilator (default TESTNAME=iccm_lock)
+make -C <run_dir> -f $CALIPTRA_ROOT/tools/scripts/Makefile TESTNAME=smoke_test_mldsa verilator
 
-### SW Changes (DONE)
-- [x] `no-mldsa` feature flag propagated through `caliptra-rom` -> `caliptra-kat`, `caliptra_common`
-- [x] Build with `make NO_MLDSA=1` (sets `--features no-mldsa`, forces `PQC_KEY_TYPE=3` LMS only)
-- [x] KAT: gated `mldsa87_kat` module and execute_kat call
-- [x] Common: gated `mldsa87` in verifier and debug_unlock
-- [x] ROM: gated MLDSA imports, struct fields, constructors, cert signing, key derivation across all cold_reset flows
-- [x] Standard ROM build with `NO_MLDSA=1` tested — compiles and boots successfully
-- [ ] (deferred) Measure ROM binary size with/without MLDSA to determine IMEM savings
+# VCS
+make -C <run_dir> -f $CALIPTRA_ROOT/tools/scripts/Makefile TESTNAME=smoke_test_mldsa vcs
 
-### Testing Status
-- [x] ABR disable tested end-to-end with **fake ROM** — boots successfully
-- [x] Full test with standard ROM (no-MLDSA) — boots successfully
+# Full L0 regression
+python3 $CALIPTRA_ROOT/tools/scripts/run_verilator_l0_regression.py
+```
 
-## Part 2: Flexible SRAM Sizes
+Useful `make` overrides (defined in `tools/scripts/Makefile`):
+- `CALIPTRA_INTERNAL_TRNG=1` — must match between firmware compile and HW compile.
+- `CALIPTRA_MODE_SUBSYSTEM=1` — switches register set to `src/integration/rtl/caliptra_reg_ss/`.
+- `debug=1` — produce VCD waveform.
 
-### Current Defaults & How to Change
+Firmware-only compile (produces `program.hex`, `iccm.hex`, `dccm.hex`, `mailbox.hex`):
+```bash
+make -f $CALIPTRA_ROOT/tools/scripts/Makefile TESTNAME=smoke_test_mldsa program.hex
+```
+Tests live under `src/integration/test_suites/<TESTNAME>/`. The MLDSA/ABR-touching ones (`smoke_test_mldsa*`, `randomized_mldsa_invalid_verify`, `smoke_test_kv_mldsa`) are the templates to copy when writing CKKS firmware tests.
 
-| Memory | Default | How to Resize | Config Location |
-|--------|---------|---------------|-----------------|
-| ROM (IMEM) | 96 KB | Change `CALIPTRA_IMEM_BYTE_SIZE` define (auto-sizes via `$clog2`) | `src/integration/rtl/config_defines.svh:97` |
-| Mailbox | 256 KB | Change `CPTRA_MBOX_SIZE_KB` param (auto-sizes via `$clog2`) | `src/soc_ifc/rtl/soc_ifc_pkg.sv:39-51` |
-| ICCM | 256 KB | Set `iccmSizeKB` in `WithCaliptra()` — auto-generates VeeR config | `CaliptraTile.scala` / `vsrc/Makefile` |
-| DCCM | 256 KB | Set `dccmSizeKB` in `WithCaliptra()` — auto-generates VeeR config | `CaliptraTile.scala` / `vsrc/Makefile` |
+### Register (RDL) regeneration
 
-**VeeR config integration:** `Cores-VeeR-EL2` is a submodule of caliptra-wrapper (commit `8d9457af`, branch `2.0-patches`). When non-default ICCM/DCCM sizes are used, the Makefile auto-runs `veer.config` to generate a snapshot at `vsrc/snapshots/caliptra_iccm<N>_dccm<M>/`, caches it, and generates a modified `.vf` that overrides VeeR param files. Default sizes (256/256) use the stock caliptra-rtl files with no generation step.
+Whenever you change a `*_reg.rdl`, regenerate the SV register block + UVM model + HTML docs:
+```bash
+bash tools/scripts/reg_gen.sh        # regenerates every block listed in the script
+python3 tools/scripts/reg_gen.py <path/to/your_reg.rdl>   # one block
+bash tools/scripts/reg_doc_gen.sh    # rebuilds top-level address map / HTML
+```
+A new accelerator with its own RDL must be added to `reg_gen.sh`. Required tooling versions are pinned in `README.md` under "RDL Compiler" (peakrdl-regblock 0.21.0, etc.).
 
-### Boot Flow & Memory Usage
+## High-Level Architecture
 
-**Boot:** ROM (in IMEM) → loads FMC+Runtime from **mailbox** into ICCM → launches FMC → FMC hands off to Runtime.
-- **ROM uses DCCM** for stack (62 KB) + exception stacks (2 KB) + persistent data (at fixed offsets from 0x50000400)
-- **Mailbox must be ≥ firmware bundle** (manifest 1KB + FMC image + Runtime image)
-- **Output:** `cprintln!` writes to SOC_IFC generic output wires (no real UART)
+### Top-level integration
 
-### SW Image Sizes (Current Full Firmware)
+`src/integration/rtl/caliptra_top.sv` is the SoC top. Every IP block is instantiated here as an AHB-Lite responder hanging off `responder_inst[`CALIPTRA_SLAVE_SEL_*]`. The AHB fabric (`src/ahb_lite_bus/`) is parameterized by:
+- `CALIPTRA_AHB_SLAVES_NUM` — total responder count (defined in `src/integration/rtl/config_defines.svh`).
+- A flat slave name / base-address / mask-address array (`CALIPTRA_SLAVE_NAMES`, `CALIPTRA_SLAVE_BASE_ADDR`, `CALIPTRA_SLAVE_MASK_ADDR`). The order in those arrays must match the `CALIPTRA_SLAVE_SEL_*` index defines. **Add a new slave by extending all three arrays and the `CALIPTRA_AHB_SLAVES_NUM` count.**
+- A per-slave address-width macro `CALIPTRA_SLAVE_ADDR_WIDTH(n)` is derived automatically from base/mask.
 
-| Component | Text | Rodata | Total | Runs In |
-|-----------|------|--------|-------|---------|
-| ROM | 76.7 KB | 10.0 KB | ~87 KB | IMEM (0x00000000) |
-| FMC | 24.8 KB | 8.6 KB | ~33.5 KB | ICCM (0x40000000) |
-| Runtime | 138.8 KB | 7.2 KB | ~146 KB | ICCM (0x40009000) |
+VeeR-EL2 (RISC-V CPU running ROM/FMC/Runtime) is the only AHB requester. Interrupts route into VeeR via the `intr[VEER_INTR_VEC_*-1]` vector; vector indices are defined in `config_defines.svh`. The existing ABR block uses `VEER_INTR_VEC_ABR_ERROR` (23) and `VEER_INTR_VEC_ABR_NOTIF` (24). **A new FHE block needs two new vectors** appended after `VEER_INTR_VEC_AXI_DMA_NOTIF`, and `VEER_INTR_VEC_MAX_ASSIGNED` updated.
 
-**DCCM layout:** Persistent data starts at 0x50000400 (~110 KB: manifests 34K + datavault 15K + FHT 2K + MLDSA keys/certs 20K + cert buffers + DPE state etc.) + FMC/RT data (93 KB region) + stack (14 KB FMC/RT, 40 KB ROM) + exception stacks (2 KB)
+### Adams Bridge — the template to follow
 
-### Design Points
+Adams Bridge lives in `submodules/adams-bridge/` as a git submodule (`.gitmodules` → `https://github.com/chipsalliance/adams-bridge`). Key files for a new FHE block to mirror:
 
-#### A) Full Firmware (with no-mldsa, current binaries)
-| Memory | Current | Target | Rationale |
-|--------|---------|--------|-----------|
-| ROM | 96 KB | 64 KB | ~15-30K MLDSA savings (needs measurement) |
-| ICCM | 256 KB | 192 KB | FMC 33.5K + RT 146K = 182K, fits in 192K |
-| DCCM | 256 KB | 192 KB | ~169K used, fits in 192K |
-| Mailbox | 256 KB | 192 KB | Bundle ~180K (manifest + FMC + RT) |
-| **Total savings** | | | **~224 KB SRAM** |
+| Adams Bridge file | Purpose | FHE analogue to create |
+|---|---|---|
+| `submodules/adams-bridge/src/abr_top/rtl/abr_top.sv` | Top wrapper: AHB slave interface, KeyVault r/w ports, status/interrupts | `fhe_top.sv` |
+| `…/abr_top/rtl/abr_ctrl.sv` | Command FSM (`MLDSA_CMD_KEYGEN`/`SIGNING`/`VERIFYING`, etc.) | `fhe_ctrl.sv` (CKKS encode/decode/enc/dec) |
+| `…/abr_top/rtl/abr_reg.rdl` | SystemRDL register map (CMD/STATUS/seed/msg/key/sig regs + interrupt block) | `fhe_reg.rdl` |
+| `…/abr_top/rtl/abr_params_pkg.sv` | Modulus, polynomial dimensions, sample widths (ML-DSA: Q=8380417, N=256) | `fhe_params_pkg.sv` (CKKS Q, ring dim N, slot count, scaling factor) |
+| `…/abr_top/rtl/abr_mem_if.sv` + `abr_mem_top.sv` | Memory interface bundle + instantiated SRAMs (banks for polynomials/keys) | `fhe_mem_if.sv` + `fhe_mem_top.sv` |
+| `…/ntt_top/` | Number-Theoretic Transform datapath (butterflies, modular mult) | CKKS uses NTT/INTT over the same kind of ring — heavy reuse opportunity |
+| `…/abr_libs/rtl/abr_ahb_slv_sif.sv` | Stock AHB-Lite slave interface | Reuse as-is or copy |
+| `submodules/adams-bridge/src/abr_top/config/compile.yml` | Playbook fileset declaration | `fhe_top/config/compile.yml` |
 
-#### B) Minimal Demo (FMC prints → jumps to RT → RT prints)
-Custom tiny FMC & RT that just print a banner and hand off:
-- **Minimal FMC:** init + print + jump to RT → ~2-4 KB code
-- **Minimal RT:** init + print + halt → ~2-4 KB code
-- **Mailbox:** manifest (1K) + tiny FMC + tiny RT → **16 KB sufficient**
-- **DCCM:** ROM still uses DCCM for stack + persistent data. Persistent data at fixed offsets spans ~100 KB. ROM stack needs up to 62 KB. → **128 KB minimum** (needs validation: do all persistent data fields get written, or only a subset in fake-ROM flow?)
-- **ICCM:** only holds tiny FMC + RT → **32 KB sufficient**
-- **ROM:** unchanged, use fake ROM (small) → **96 KB** (or could reduce if fake ROM binary is smaller)
+Adams Bridge instantiation in the SoC top is at `src/integration/rtl/caliptra_top.sv:1101-1145`. Around line 1102 you'll see the full port wiring: AHB responder slice, KeyVault read/write indices (`kv_read[7:6]+kv_read[2]`, `kv_write[1]`), `pcr_signing_data`, busy/intr outputs, and the `abr_memory_export` SRAM interface. The area-optimized config wraps the whole instance in `\`ifndef CALIPTRA_NO_ADAMS_BRIDGE` with tie-offs in the `\`else` branch — **mirror this pattern** so the FHE block can be compiled out by integrators who don't need it.
 
-| Memory | Current | Minimal Demo | Savings |
-|--------|---------|--------------|---------|
-| ROM | 96 KB | 96 KB (keep) | 0 KB |
-| ICCM | 256 KB | 32 KB | 224 KB |
-| DCCM | 256 KB | 256 KB (keep, PersistentData ~110K + stack 40K) | 0 KB |
-| Mailbox | 256 KB | 16 KB | 240 KB |
-| **Total savings** | | | **464 KB SRAM** |
+### Memory & KeyVault interfaces
 
-**Resolved:** DCCM cannot be reduced — `PersistentData` struct is ~110K (manifests 34K, cert buffers 24K, DPE 5K, auth manifest metadata 10K, CSR envelopes 18K, etc.) and ROM stack needs ~40K for DICE chain crypto. Reducing PersistentData would require gating MLDSA-related fields (~20K) with `no-mldsa` feature, which is a significant code change.
+- Accelerator SRAMs are *not* instantiated inside the IP — they're declared in a `<block>_mem_top.sv` module that is hoisted up to `CaliptraCoreBlackbox.sv` (in `caliptra-wrapper/src/main/resources/`) for chipyard so the wrapper can swap in real SRAMs. Inside the IP, the `<block>_mem_if` modport exposes per-bank `we/waddr/wdata/re/raddr/rdata` lines. See `abr_mem_top.sv` for the `\`ABR_MEM` macro pattern (mixes plain and byte-enabled banks).
+- **KeyVault** (`src/keyvault/`) is a shared per-IP r/w mailbox used to move secrets without exposing them on the AHB bus. Each consumer is assigned fixed `kv_read[i]` slots and `kv_write[KV_WRITE_IDX_<IP>]` slots in `caliptra_top.sv`. A new FHE block that consumes/produces key material should claim new indices.
+- **PCR signing** (`pcr_signing_data` into ABR): a side-channel for signing PCR digests. Likely not needed for CKKS unless attesting ciphertexts.
 
-### Plan
+### Filelists & build descriptor (Playbook `compile.yml`)
 
-#### Step 1: Build minimal demo FMC & RT (SW) — DONE
-- [x] `minimal-demo` feature added to test-fmc (`Cargo.toml`, `main.rs`): prints banner, reads `data_vault.rt_entry_point()`, jumps via `transfer_control` assembly
-- [x] test-rt already minimal (prints banner, exits)
-- [x] `MINIMAL_DEMO=1` Makefile flag wired to `build-test-fmc` features
-- [x] Verified: `make run DEVICE_LIFECYCLE=manufacturing NO_MLDSA=1 MINIMAL_DEMO=1` — FMC prints → jumps to RT → RT prints Caliptra RT banner → success
-- [x] Binary sizes: test-fmc .text=472 bytes, test-rt .text=1140 bytes (both tiny, ~1.6 KB combined code)
-- [ ] Trace fake-ROM boot to determine which DCCM persistent data offsets are actually written
+Two parallel filelist mechanisms must both stay in sync:
 
-#### Step 2: RTL — Mailbox & ROM size reduction — DONE
-- [x] Override `CPTRA_MBOX_SIZE_KB` in `soc_ifc_pkg.sv` via `ifdef CALIPTRA_MBOX_SIZE_KB` compile define
-- [x] Override `CALIPTRA_IMEM_BYTE_SIZE` in `config_defines.svh` via `ifndef` guard (overrideable via `+define+`)
-- [x] Wire size params through chipyard wrapper: `CaliptraParams.mboxSizeKB/imemSizeKB` → `CaliptraCoreBlackbox` → Makefile → verilator `+define+`
-- [x] Fixed hardcoded `98304` in `CaliptraCoreBlackbox.scala` and `CaliptraTile.scala` (imem_waddr width now derived from `imemSizeKB`)
-- [x] Updated `CaliptraRocketMinimalDemoConfig` with `mboxSizeKB=32`
-- [x] Verified: preprocessed RTL shows `CPTRA_MBOX_SIZE_KB = 32`
+1. **`.vf` files** under `src/integration/config/` — flat absolute-path filelists consumed by Verilator/VCS via `caliptra_top_tb.vf`. Adams Bridge sources are explicitly enumerated at `src/integration/config/caliptra_top.vf` (and `caliptra_top_ss_mode.vf`) starting around line 23 (incdir) and line 288 (source files), ~93 entries. **Adding an FHE block means appending equivalent `+incdir+` and source-file lines** to both `caliptra_top.vf` and `caliptra_top_ss_mode.vf`.
+2. **Playbook `compile.yml`** under each `<block>/config/` and the top-level `src/integration/config/compile.yml`. The top one lists block-level dependencies by `provides:` name (e.g. `abr_top`). The block-level `compile.yml` in `submodules/adams-bridge/src/abr_top/config/compile.yml` is the canonical example — it provides `abr_defines`, `abr_uvm_pkg`, `abr_top`, `abr_top_tb`, `abr_coverage`, declares `requires:` (other Caliptra blocks), and pins SV-LRM options. **A new FHE block needs its own `compile.yml` and an `fhe_top` entry added to `src/integration/config/compile.yml` requires lists for both `caliptra_top` and `caliptra_top_ss_mode`.**
 
-#### Step 3: RTL — ICCM & DCCM reduction via VeeR config tool — DONE
-- [x] Added `Cores-VeeR-EL2` as submodule in caliptra-wrapper (`vsrc/Cores-VeeR-EL2`, pinned to commit `8d9457af`)
-- [x] Integrated VeeR config generation into `vsrc/Makefile`:
-  - `CALIPTRA_ICCM_SIZE_KB` / `CALIPTRA_DCCM_SIZE_KB` params (default 256)
-  - `veer-config` target auto-generates VeeR snapshot at `vsrc/snapshots/caliptra_iccm<N>_dccm<M>/`
-  - Snapshots cached — only regenerated if not present
-  - Generated `.vf` in snapshot dir overrides `el2_param.vh`, `el2_pdef.vh`, `common_defines.sv`
-  - Post-processing: renames `common_defines.vh` → `.sv`, comments out `RV_TOP` define (conflicts with caliptra's `config_defines.svh`)
-- [x] Wired through chipyard: `CaliptraParams.iccmSizeKB/dccmSizeKB` → `CaliptraCoreBlackbox` → make args
-- [x] Added `CaliptraRocketMinimalDemoConfig` (noAdamsBridge=true, iccm=32KB, dccm=256KB, mbox=32KB)
-- [x] Verified: elaboration succeeds, preprocessed RTL has `ICCM_SIZE=14'h0020` (32KB), `DCCM_SIZE=14'h0080` (128KB)
+### Firmware-side drivers
 
-#### Step 4: SW linker script adjustments — DONE
-- [x] Update `memory_layout.rs` with new ICCM/DCCM sizes (ICCM=32K, STACK=40K, ROM_STACK=40K)
-- [x] Update linker scripts (rom.ld, fmc.ld, rt.ld) memory regions and stack positions
-- [x] Update `common/src/lib.rs` FMC_SIZE=8K, RUNTIME_SIZE=24K
-- **Key finding:** DCCM must stay at 256K — `PersistentData` is ~110K, leaving only ~14K for stack at 128K DCCM. ROM DICE chain needs ~40K+ stack. Stack overflow at 128K DCCM corrupts `dot_owner_pk_hash` in PersistentData, causing `IMAGE_VERIFIER_ERR_DOT_OWNER_PUB_KEY_DIGEST_MISMATCH` (0x000B005E).
-- Used `gen_memory_layout.py`: `--iccm-kb 32 --dccm-kb 256 --fmc-kb 8 --rt-kb 24 --total-stack-kb 40 --rom-stack-kb 40 --fmc-rt-stack-kb 14 --lib-fmc-kb 8 --lib-rt-kb 24`
+Per-IP C drivers live under `src/integration/test_suites/libs/<ip>/` and are linked into tests by their `Makefile`. The MLDSA driver pair (`libs/mldsa/mldsa.{c,h}`) is the model: it defines command opcodes (`MLDSA_CMD_KEYGEN=0x1`, etc.), sizes (`MLDSA87_PRIVKEY_SIZE`), and high-level functions (`mldsa_keygen_flow`, `mldsa_signing_flow`) that poke the RDL-generated `CALIPTRA_MLDSA_REG_*` macros from `caliptra_reg.h`. **Create `libs/fhe_ckks/fhe_ckks.{c,h}` with CKKS-shaped commands** (`FHE_CMD_ENCODE`, `FHE_CMD_DECODE`, `FHE_CMD_ENCRYPT`, `FHE_CMD_DECRYPT`, possibly `FHE_CMD_KEYGEN`/`RELIN_KEYGEN`).
 
-#### Step 5: End-to-end verification — DONE
-- [x] Build with all size reductions + ABR disabled
-- [x] Test with fake ROM boot
-- [x] Verify FMC prints → RT prints → success
+### Test suites
 
-## Key Config Files Reference
-- `src/integration/rtl/caliptra_top.sv` — top-level integration (ABR instantiation)
-- `src/integration/rtl/config_defines.svh` — IMEM size, AHB params, interrupt vectors
-- `src/riscv_core/veer_el2/rtl/el2_param.vh` — ICCM/DCCM sizes, VeeR core params
-- `src/soc_ifc/rtl/soc_ifc_pkg.sv` — Mailbox size
-- `src/integration/config/compile.yml` — compilation targets and defines
+Tests live under `src/integration/test_suites/<name>/` (162 currently). Each has at minimum a `.c`, an `.ld` linker fragment, an ISR header, and a `<name>.yml` (sets seed/testname). The Playbook regression runner picks tests up automatically. Copy `smoke_test_mldsa/` as a starting template for CKKS smoke tests.
 
-## Progress Log
-- 2026-03-08: Forked caliptra-rtl and caliptra-sw to bluechen8, created `area-optimized` branches, updated caliptra-wrapper submodule pointer
-- 2026-03-08: Added `CALIPTRA_NO_ADAMS_BRIDGE` plumbing: Makefile define, CaliptraCoreBlackbox param, CaliptraParams field, WithCaliptra config fragment
-- 2026-03-08: RTL ifdef guards added: `caliptra_top.sv` (abr_top + tie-offs), `CaliptraCoreBlackbox.sv` (abr_mem_top)
-- 2026-03-08: SW `no-mldsa` feature flag implemented across caliptra-sw (kat, common, rom/dev) — ABR SW removal complete
-- 2026-03-08: ABR disable tested end-to-end with fake ROM — boots successfully. Standard ROM test deferred.
-- 2026-03-08: Part 2 planning: analyzed SRAM sizes, SW image sizes, VeeR config tool flow. Two design points: full firmware (224 KB savings) vs minimal demo (592 KB savings). Next: build minimal demo FMC/RT, then resize SRAMs.
-- 2026-03-08: Minimal demo FMC/RT working — `minimal-demo` feature in test-fmc jumps to RT via `transfer_control`. Tested with `make run DEVICE_LIFECYCLE=manufacturing NO_MLDSA=1 MINIMAL_DEMO=1`. Next: resize SRAMs in RTL.
-- 2026-03-08: ICCM/DCCM VeeR config integrated into caliptra-wrapper Makefile. Cores-VeeR-EL2 added as submodule (commit `8d9457af`). Snapshot-based caching with auto-generated `.vf`. Fixed `RV_TOP` redefine conflict. `CaliptraRocketMinimalDemoConfig` elaborates successfully with ICCM=32KB, DCCM=128KB.
-- 2026-03-09: SW linker scripts adjusted for ICCM=32K (FMC 8K + RT 24K). Discovered DCCM must stay at 256K: PersistentData ~110K + ROM stack 40K exceeds 128K. Stack overflow at 128K DCCM corrupts PersistentData.dot_owner_pk_hash → fatal error 0x000B005E. Updated memory_layout.rs, rom.ld, fmc.ld, rt.ld, common/src/lib.rs via gen_memory_layout.py.
-- 2026-03-09: Mailbox & ROM size reduction (Step 2) complete. Made `CPTRA_MBOX_SIZE_KB` overrideable via `ifdef` in `soc_ifc_pkg.sv`, `CALIPTRA_IMEM_BYTE_SIZE` via `ifndef` in `config_defines.svh`. Wired `mboxSizeKB`/`imemSizeKB` through CaliptraParams → CaliptraCoreBlackbox → Makefile → verilator +define+. Fixed hardcoded 98304 in Scala. MinimalDemoConfig now: noABR, ICCM=32K, DCCM=256K, mbox=32K. Elaboration verified.
-- 2026-03-09: End-to-end verification (Step 5) passed. MinimalDemoConfig with all size reductions + ABR disabled boots successfully: FMC prints → RT prints → success.
+## Coordinates of the broader project
+
+This `caliptra-rtl` checkout is a submodule under `caliptra-wrapper` (chipyard generator). The wrapper is responsible for:
+- exposing `CaliptraParams` to Scala configs (e.g. `noAdamsBridge`, `mboxSizeKB`, `iccmSizeKB`),
+- threading `+define+CALIPTRA_NO_ADAMS_BRIDGE` / size overrides into the Verilator make,
+- instantiating SRAMs that this RTL exports out of `abr_mem_top` / mailbox / VeeR.
+
+When adding a new FHE block follow the same convention: gate it with `\`ifndef CALIPTRA_NO_FHE` (or symmetric `\`ifdef CALIPTRA_FHE`) so the wrapper can compile it out, and lift any SRAM instantiation into a `fhe_mem_top` that the wrapper can either keep here or hoist into `CaliptraCoreBlackbox.sv`.
+
+## What to read first when starting work
+
+1. `src/integration/rtl/caliptra_top.sv` lines 1101–1145 — the exact ABR instantiation + tie-off pattern.
+2. `src/integration/rtl/config_defines.svh` — slave-select macros, AHB address map arrays, interrupt-vector defines, IMEM sizing. Every new accelerator touches this file.
+3. `submodules/adams-bridge/src/abr_top/rtl/abr_top.sv` — the IP top module's port list and module-level pkg imports.
+4. `submodules/adams-bridge/src/abr_top/rtl/abr_reg.rdl` — what a Caliptra-style register block looks like (CMD/STATUS, KEYGEN/SIGN/VERIFY, KV interface fields, interrupt regblock import).
+5. `submodules/adams-bridge/src/abr_top/config/compile.yml` and `src/integration/config/caliptra_top.vf` — what "register a new IP with the build" actually means.
+6. `src/integration/test_suites/libs/mldsa/mldsa.h` and `src/integration/test_suites/smoke_test_mldsa/smoke_test_mldsa.c` — driver & test-suite shape.
+
+## Existing area-optimization work (still in flight)
+
+The branch this was forked from (`area-optimized`) carries an ABR-removal and SRAM-resizing effort. Relevant artifacts still present:
+- `\`ifndef CALIPTRA_NO_ADAMS_BRIDGE` guards around `abr_top` instantiation and KeyVault tie-offs in `caliptra_top.sv`.
+- Overrideable `CALIPTRA_IMEM_BYTE_SIZE` (`config_defines.svh:97`) and `CPTRA_MBOX_SIZE_KB` (`src/soc_ifc/rtl/soc_ifc_pkg.sv`) via `\`ifdef`/`\`ifndef`.
+- ICCM/DCCM sizing is driven from the wrapper's `Cores-VeeR-EL2` config-tool snapshot, not from this repo.
+
+When adding the FHE block, follow these same conventions (compile-out guard + integrator-overridable sizes) — and remember the wrapper's `CaliptraParams` / `CaliptraCoreBlackbox` / Makefile chain must be extended in parallel.
