@@ -133,6 +133,8 @@ module caliptra_top_tb (
 
     el2_mem_if el2_mem_export ();
     abr_mem_if abr_memory_export();
+    fhe_mem_if fhe_memory_export();
+    fhe_mem_top fhe_mem_top_inst (.clk_i(core_clk), .fhe_memory_export(fhe_memory_export));
 
 `ifndef VERILATOR
     always
@@ -234,6 +236,7 @@ caliptra_top caliptra_top_dut (
 
     .el2_mem_export(el2_mem_export.veer_sram_src),
     .abr_memory_export(abr_memory_export.req),
+    .fhe_memory_export(fhe_memory_export.req),
     
     .ready_for_fuses(ready_for_fuses),
     .ready_for_mb_processing(ready_for_mb_processing),

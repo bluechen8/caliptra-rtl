@@ -63,6 +63,9 @@ module caliptra_top
 `ifndef CALIPTRA_NO_ADAMS_BRIDGE
     abr_mem_if.req                     abr_memory_export,
 `endif
+`ifndef CALIPTRA_NO_FHE
+    fhe_mem_if.req                     fhe_memory_export,
+`endif
 
     //SRAM interface for mbox
     output logic mbox_sram_cs,
@@ -263,6 +266,9 @@ module caliptra_top
     wire sha3_notif_intr;
     wire abr_error_intr;
     wire abr_notif_intr;
+    wire fhe_error_intr;
+    wire fhe_notif_intr;
+    logic fhe_busy;
     wire soc_ifc_error_intr;
     wire soc_ifc_notif_intr;
     wire sha_error_intr;
@@ -458,6 +464,7 @@ end
     always_comb ahb_lite_resp_disable[`CALIPTRA_SLAVE_SEL_MLDSA]    = 1'b0;
     always_comb ahb_lite_resp_disable[`CALIPTRA_SLAVE_SEL_AES]    = 1'b0;
     always_comb ahb_lite_resp_disable[`CALIPTRA_SLAVE_SEL_SHA3]   = 1'b0;
+    always_comb ahb_lite_resp_disable[`CALIPTRA_SLAVE_SEL_FHE]    = 1'b0;
 
    //=========================================================================-
    // RTL instance
@@ -504,6 +511,8 @@ always_comb begin
     intr[`VEER_INTR_VEC_ABR_NOTIF    -1]          = abr_notif_intr;
     intr[`VEER_INTR_VEC_AXI_DMA_ERROR-1]          = dma_error_intr;
     intr[`VEER_INTR_VEC_AXI_DMA_NOTIF-1]          = dma_notif_intr;
+    intr[`VEER_INTR_VEC_FHE_ERROR    -1]          = fhe_error_intr;
+    intr[`VEER_INTR_VEC_FHE_NOTIF    -1]          = fhe_notif_intr;
     intr[NUM_INTR-1:`VEER_INTR_VEC_MAX_ASSIGNED]  = '0;
 end
 
@@ -1142,6 +1151,38 @@ abr_top #(
     assign kv_read[6]  = '0;
     assign kv_read[2]  = '0;
     assign kv_write[1] = '0;
+`endif
+
+`ifndef CALIPTRA_NO_FHE
+fhe_top #(
+    .AHB_DATA_WIDTH(`CALIPTRA_AHB_HDATA_SIZE),
+    .AHB_ADDR_WIDTH(`CALIPTRA_SLAVE_ADDR_WIDTH(`CALIPTRA_SLAVE_SEL_FHE))
+) fhe_inst (
+     .clk               (clk_cg),
+     .rst_b             (cptra_noncore_rst_b),
+     .haddr_i           (responder_inst[`CALIPTRA_SLAVE_SEL_FHE].haddr[`CALIPTRA_SLAVE_ADDR_WIDTH(`CALIPTRA_SLAVE_SEL_FHE)-1:0]),
+     .hwdata_i          (responder_inst[`CALIPTRA_SLAVE_SEL_FHE].hwdata),
+     .hsel_i            (responder_inst[`CALIPTRA_SLAVE_SEL_FHE].hsel),
+     .hwrite_i          (responder_inst[`CALIPTRA_SLAVE_SEL_FHE].hwrite),
+     .hready_i          (responder_inst[`CALIPTRA_SLAVE_SEL_FHE].hready),
+     .htrans_i          (responder_inst[`CALIPTRA_SLAVE_SEL_FHE].htrans),
+     .hsize_i           (responder_inst[`CALIPTRA_SLAVE_SEL_FHE].hsize),
+     .hresp_o           (responder_inst[`CALIPTRA_SLAVE_SEL_FHE].hresp),
+     .hreadyout_o       (responder_inst[`CALIPTRA_SLAVE_SEL_FHE].hreadyout),
+     .hrdata_o          (responder_inst[`CALIPTRA_SLAVE_SEL_FHE].hrdata),
+     .busy_o            (fhe_busy),
+     .error_intr        (fhe_error_intr),
+     .notif_intr        (fhe_notif_intr),
+     .fhe_memory_export (fhe_memory_export)
+);
+`else
+    // FHE accelerator removed — tie off signals
+    assign fhe_busy        = 1'b0;
+    assign fhe_error_intr  = 1'b0;
+    assign fhe_notif_intr  = 1'b0;
+    assign responder_inst[`CALIPTRA_SLAVE_SEL_FHE].hreadyout = 1'b1;
+    assign responder_inst[`CALIPTRA_SLAVE_SEL_FHE].hresp     = 1'b0;
+    assign responder_inst[`CALIPTRA_SLAVE_SEL_FHE].hrdata    = '0;
 `endif
 
 

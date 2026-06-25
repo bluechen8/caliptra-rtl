@@ -2,3 +2,6 @@ src/integration/docs/caliptra_reg_html/
 src/soc_ifc/docs/caliptra_top_reg_html/
 src/integration/test_suites/libs/tcp_server/tcp_server.h.gch
 src/integration/test_suites/libs/jtagdpi/jtagdpi.h.gch
+rundir/
+src/BP063-BU-01000-r0p1-00rel0/
+src/fhe/obj_dir

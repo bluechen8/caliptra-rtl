@@ -1,0 +1,18 @@
+---
+provides: [fhe_top]
+schema_version: 2.4.0
+requires:
+  - libs
+targets:
+  rtl:
+    directories:
+      - $COMPILE_ROOT/rtl
+    files:
+      - $COMPILE_ROOT/rtl/fhe_params_pkg.sv
+      - $COMPILE_ROOT/rtl/fhe_1r1w_ram.sv
+      - $COMPILE_ROOT/rtl/fhe_mem_if.sv
+      - $COMPILE_ROOT/rtl/fhe_mem_top.sv
+      - $COMPILE_ROOT/rtl/fhe_ahb_slv_sif.sv
+      - $COMPILE_ROOT/rtl/fhe_ctrl.sv
+      - $COMPILE_ROOT/rtl/fhe_top.sv
+    tops: [fhe_top]

@@ -1,0 +1,140 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// CKKS FHE accelerator register map. Modeled on abr_reg.rdl.
+//
+// NOTE: The generated fhe_reg.sv / fhe_reg_pkg.sv must be produced with
+//   python3 tools/scripts/reg_gen.py src/fhe/rtl/fhe_reg.rdl
+// in an environment with peakrdl-regblock installed (add this block to
+// tools/scripts/reg_gen.sh). The Stage-0 integration stub (fhe_top.sv)
+// implements an equivalent register block by hand so the build does not
+// depend on the generator; this RDL is the canonical spec to converge on.
+
+addrmap fhe_reg {
+    desc = "address map for the CKKS FHE accelerator register space";
+
+    addressing = regalign;
+    lsb0 = true;
+
+    default hw = na;
+    signal {activelow; async; cpuif_reset; field_reset;} reset_b;
+    signal {activelow; async;} hard_reset_b;
+    signal {} fhe_ready;
+
+    /* ---- FHE Component Name (RO) ---- */
+    reg {
+        name = "FHE component name";
+        default sw = r;
+        default hw = w;
+        field {desc = "Name field";} NAME[32];
+    } FHE_NAME[2];
+
+    /* ---- FHE Component Version (RO) ---- */
+    reg {
+        name = "FHE component version";
+        default sw = r;
+        default hw = w;
+        field {desc = "Version field";} VERSION[32];
+    } FHE_VERSION[2];
+
+    /* ---- FHE Control ---- */
+    reg {
+        name = "FHE control";
+        desc = "Selects the FHE operation. Self-clearing after each SW write.";
+        default sw = w;
+        default hw = r;
+        default resetsignal = reset_b;
+        field {desc = "Command:
+                [br] 000 NONE
+                [br] 001 ENCRYPT  (svc1: encode + encrypt -> fresh L-limb ct @ DST_ADDR)
+                [br] 010 KEYGEN   (svc2: sk -> KeyVault, emit pk + evk @ KEY_DST_ADDR)
+                [br] 011 REENC    (svc3: decrypt @ SRC_ADDR + re-encrypt to TARGET_LEVEL @ DST_ADDR)
+                [br] 100 DECRYPT  (test hook)
+                [br] Hardware erases the field after each write.";
+                swwe = fhe_ready; hwclr;} CTRL[3] = 3'b0;
+        field {desc = "Zeroize all internal registers and memories.";
+                singlepulse;} ZEROIZE = 1'b0;
+    } FHE_CTRL;
+
+    /* ---- FHE Status (RO) ---- */
+    reg {
+        name = "FHE status";
+        desc = "READY: core idle/ready for a command.
+                [br] VALID: last operation complete, result valid.
+                [br] DMA_REQ: core is requesting a DMA transfer (firmware programs soc_ifc AXI DMA).
+                [br] ERROR: operation ended in error (bad param-set / level / KV fault).";
+        default sw = r;
+        default hw = w;
+        default resetsignal = reset_b;
+        field {desc = "Ready";}                 READY   = 1'b0;
+        field {hw = rw; desc = "Valid";}        VALID   = 1'b0;
+        field {hw = rw; desc = "DMA request";}  DMA_REQ = 1'b0;
+        field {hw = rw; desc = "Error";}        ERROR   = 1'b0;
+    } FHE_STATUS;
+
+    /* ---- DRAM source pointer (ciphertext in) ---- */
+    reg {
+        name = "FHE source DRAM address";
+        desc = "64-bit DRAM pointer to the input ciphertext (REENC/DECRYPT).";
+        default sw = w;
+        default hw = r;
+        default resetsignal = reset_b;
+        field {desc = "Address word"; swwe = fhe_ready; hwclr;} ADDR[32] = 32'b0;
+    } FHE_SRC_ADDR[2];
+
+    /* ---- DRAM destination pointer (ciphertext out) ---- */
+    reg {
+        name = "FHE destination DRAM address";
+        desc = "64-bit DRAM pointer for the output ciphertext (ENCRYPT/REENC).";
+        default sw = w;
+        default hw = r;
+        default resetsignal = reset_b;
+        field {desc = "Address word"; swwe = fhe_ready; hwclr;} ADDR[32] = 32'b0;
+    } FHE_DST_ADDR[2];
+
+    /* ---- DRAM destination pointer (public keys out) ---- */
+    reg {
+        name = "FHE key destination DRAM address";
+        desc = "64-bit DRAM pointer where KEYGEN emits the public key + eval keys.";
+        default sw = w;
+        default hw = r;
+        default resetsignal = reset_b;
+        field {desc = "Address word"; swwe = fhe_ready; hwclr;} ADDR[32] = 32'b0;
+    } FHE_KEY_DST_ADDR[2];
+
+    /* ---- Target level + parameter-set selector ---- */
+    reg {
+        name = "FHE operation config";
+        desc = "TARGET_LEVEL: number of RNS limbs to retain for REENC (1..L).
+                [br] PARAM_SET_ID: selects a baked-in (q-set, N); ERROR if unsupported.";
+        default sw = w;
+        default hw = r;
+        default resetsignal = reset_b;
+        field {desc = "Target RNS level"; swwe = fhe_ready; hwclr;} TARGET_LEVEL[4] = 4'b0;
+        field {desc = "Parameter set id"; swwe = fhe_ready; hwclr;} PARAM_SET_ID[8] = 8'b0;
+    } FHE_CONFIG;
+
+    //--- KeyVault control: KEYGEN writes sk; REENC/DECRYPT read sk. ---
+    kv_read_ctrl_reg   kv_fhe_sk_rd_ctrl   @0x8000;
+    kv_status_reg      kv_fhe_sk_rd_status;
+    kv_write_ctrl_reg  kv_fhe_sk_wr_ctrl;
+    kv_status_reg      kv_fhe_sk_wr_status;
+
+    //--- Standard Caliptra interrupt block (error + notif/cmd-done). ---
+    // Before generating, paste the canonical `regfile intr_block_t { ... }`
+    // definition from abr_reg.rdl (the error_internal / notif_cmd_done block)
+    // here verbatim, then instance it below. It is identical across all
+    // Caliptra crypto IPs, so it is not duplicated in this spec file.
+    intr_block_t intr_block_rf @0x8100;
+};

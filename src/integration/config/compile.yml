@@ -53,6 +53,7 @@ requires:
   - hmac_ctrl
   - ecc_top
   - abr_top
+  - fhe_top
   - keyvault
   - pcrvault
   - datavault
@@ -101,6 +102,7 @@ requires:
   - hmac_ctrl
   - ecc_top
   - abr_top
+  - fhe_top
   - keyvault
   - pcrvault
   - datavault

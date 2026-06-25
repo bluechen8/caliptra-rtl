@@ -77,6 +77,7 @@ COMP_LIB_NAMES := aes \
 		  sha512 \
 		  sha3 \
 		  soc_ifc \
+		  fhe_ckks \
 		  caliptra_rtl_lib \
 		  clk_gate \
 		  wdt
@@ -97,8 +98,8 @@ HEADER_FILES := $(INCLUDES_DIR)/caliptra_defines.h \
 TEST_GEN_FILES := $(CALIPTRA_ROOT)/src/ecc/tb/ecc_secp384r1.exe \
 	          $(CALIPTRA_ROOT)/src/doe/tb/doe_test_gen.py \
 	          $(CALIPTRA_ROOT)/src/sha256/tb/sha256_wntz_test_gen.py \
-	          $(CALIPTRA_ROOT)/submodules/adams-bridge/src/mldsa_top/uvmf/Dilithium_ref/dilithium/ref/test/test_dilithium5 \
-	          $(CALIPTRA_ROOT)/submodules/adams-bridge/src/mldsa_top/uvmf/Dilithium_ref/dilithium/ref/test/test_dilithium5_debug
+	          $(CALIPTRA_ROOT)/submodules/adams-bridge/src/abr_top/uvmf/Dilithium_ref/dilithium/ref/test/test_dilithium5 \
+	          $(CALIPTRA_ROOT)/submodules/adams-bridge/src/abr_top/uvmf/Dilithium_ref/dilithium/ref/test/test_dilithium5_debug
 
 # Separate OFILE variable since this is not used to build remote images
 # (i.e. FMC or RunTime)
@@ -245,6 +246,13 @@ endif
 ifdef FORCE_CPU_RESET
     TB_DEFS += +define+CALIPTRA_FORCE_CPU_RESET
 endif
+
+# Extra +define+ flags from the command line (append-only; does not clobber the
+# conditional TB_DEFS above). Use to select block-presence models, e.g.:
+#   EXTRA_DEFS="+define+CALIPTRA_NO_FHE"                          (ABR, no FHE)
+#   EXTRA_DEFS="+define+CALIPTRA_NO_ADAMS_BRIDGE"                 (FHE, no ABR)
+#   EXTRA_DEFS="+define+CALIPTRA_NO_ADAMS_BRIDGE +define+CALIPTRA_NO_FHE"  (neither)
+TB_DEFS += $(EXTRA_DEFS)
 
 # Run time arguments from command line
 VERILATOR_RUN_ARGS ?= ""

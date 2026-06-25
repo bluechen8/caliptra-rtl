@@ -20,6 +20,7 @@
 +incdir+${CALIPTRA_ROOT}/src/hmac/rtl
 +incdir+${CALIPTRA_ROOT}/src/hmac_drbg/rtl
 +incdir+${CALIPTRA_ROOT}/src/ecc/rtl
++incdir+${CALIPTRA_ROOT}/src/fhe/rtl
 +incdir+${CALIPTRA_ROOT}/submodules/adams-bridge/src/abr_top/rtl
 +incdir+${CALIPTRA_ROOT}/submodules/adams-bridge/src/abr_libs/rtl
 +incdir+${CALIPTRA_ROOT}/submodules/adams-bridge/src/abr_sampler_top/rtl
@@ -459,6 +460,13 @@ ${CALIPTRA_ROOT}/submodules/adams-bridge/src/abr_top/rtl/abr_seq.sv
 ${CALIPTRA_ROOT}/submodules/adams-bridge/src/abr_top/rtl/abr_ctrl.sv
 ${CALIPTRA_ROOT}/submodules/adams-bridge/src/abr_top/rtl/abr_top.sv
 ${CALIPTRA_ROOT}/submodules/adams-bridge/src/abr_top/rtl/abr_reg.sv
+${CALIPTRA_ROOT}/src/fhe/rtl/fhe_params_pkg.sv
+${CALIPTRA_ROOT}/src/fhe/rtl/fhe_1r1w_ram.sv
+${CALIPTRA_ROOT}/src/fhe/rtl/fhe_mem_if.sv
+${CALIPTRA_ROOT}/src/fhe/rtl/fhe_mem_top.sv
+${CALIPTRA_ROOT}/src/fhe/rtl/fhe_ahb_slv_sif.sv
+${CALIPTRA_ROOT}/src/fhe/rtl/fhe_ctrl.sv
+${CALIPTRA_ROOT}/src/fhe/rtl/fhe_top.sv
 ${CALIPTRA_ROOT}/src/datavault/rtl/dv_reg_pkg.sv
 ${CALIPTRA_ROOT}/src/datavault/rtl/dv_reg.sv
 ${CALIPTRA_ROOT}/src/datavault/rtl/dv.sv
