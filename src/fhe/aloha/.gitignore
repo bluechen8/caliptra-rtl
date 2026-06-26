@@ -1,0 +1,6 @@
+# Verilator/sim build artifacts from the bring-up ladder harnesses
+sim/obj_dir/
+sim/obj_dir_*/
+sim/*.log
+sim/.run_*/
+sim/testvectors
