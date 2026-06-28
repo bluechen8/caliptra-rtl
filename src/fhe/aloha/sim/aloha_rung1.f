@@ -3,7 +3,7 @@
 // (the working checkout); only the DSP black boxes are replaced by our
 // latency-accurate behavioral models in rtl/aloha_dsp_behav.sv.
 //
-// $ALOHA_SRC defaults to /scratch/boru/Aloha-HE (set by run_rung1_tb_modmul.sh).
+// $ALOHA_SRC defaults to the vendored submodule ($ALOHA_PORT/vendor; set by run_tb.sh).
 // $ALOHA_PORT is this aloha/ dir.
 
 // CommonDefinitions.vh must be processed first: it defines `KEEP_HIERARCHY,

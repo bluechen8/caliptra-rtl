@@ -4,3 +4,9 @@ sim/obj_dir_*/
 sim/*.log
 sim/.run_*/
 sim/testvectors
+
+# small-N reproduction work dirs (run_smalln.sh)
+build/
+
+# Python bytecode caches (tvgen oracles)
+__pycache__/

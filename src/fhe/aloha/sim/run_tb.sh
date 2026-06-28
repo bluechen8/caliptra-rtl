@@ -24,10 +24,11 @@ EXTRA_ARGS=("$@")   # e.g. -GDO_FFT=0 -GFORWARD_TRANSFORM=1
 SIM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export ALOHA_PORT="$(cd "$SIM_DIR/.." && pwd)"
 export ALOHA_SRC="${ALOHA_SRC:-$ALOHA_PORT/vendor}"
-VERILATOR="${VERILATOR:-/scratch/boru/chipyard/.conda-env/bin/verilator}"
+# Prefer verilator on PATH; fall back to the chipyard conda build. Override with VERILATOR=.
+VERILATOR="${VERILATOR:-$(command -v verilator || echo /scratch/boru/chipyard/.conda-env/bin/verilator)}"
 
 [[ -f "$FLIST" ]] || FLIST="$SIM_DIR/$FLIST"
-TV_DIR="$ALOHA_SRC/Aloha-HE_Common/Testbench/tv"
+TV_DIR="${ALOHA_TV_DIR:-$ALOHA_SRC/Aloha-HE_Common/Testbench/tv}"
 OBJ_DIR="$SIM_DIR/obj_dir_$TOP"
 LOG="$SIM_DIR/${TOP}.log"
 
@@ -60,10 +61,11 @@ ln -sfn "$TV_DIR" "$SIM_DIR/testvectors"
 # Convert the upstream .coe ROM-init files to $readmemh hex (one word/line) in
 # the run cwd, so the aloha_rom_sp INIT_FILE names resolve. (.coe = a radix
 # line + a vector line + one hex/line, terminated by ';'.)
-MIF="$ALOHA_SRC/Aloha-HE_Common/MemoryInitializationFiles"
+MIF="${ALOHA_MIF_DIR:-$ALOHA_SRC/Aloha-HE_Common/MemoryInitializationFiles}"
 coe2mem() {  # <src.coe> <dst.mem>
   [[ -f "$1" ]] || return 0
-  [[ -f "$2" && "$2" -nt "$1" ]] && return 0   # up to date, skip regen
+  # Always regenerate: the mtime skip is unsafe across ALOHA_MIF_DIR switches
+  # (a stale small-N .mem could shadow a default-N source, or vice versa).
   sed -e 's/memory_initialization_radix.*//I' \
       -e 's/memory_initialization_vector[[:space:]]*=//I' \
       -e 's/[;,]//g' "$1" | grep -viE '[^0-9a-fx[:space:]]' | grep -vE '^[[:space:]]*$' > "$2"
