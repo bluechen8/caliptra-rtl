@@ -20,6 +20,7 @@ $ALOHA_SRC/Aloha-HE_Common/ModRing/MontRed_Stage.sv
 $ALOHA_SRC/Aloha-HE_Common/ModRing/MontRed.sv
 $ALOHA_SRC/Aloha-HE_Common/ModRing/NTTButterfly.sv
 $ALOHA_SRC/Aloha-HE_Common/ModRing/PWM.sv
+$ALOHA_PORT/rtl/PWMSk.sv
 $ALOHA_SRC/Aloha-HE_Common/ModRing/RNSErrorPolys.sv
 $ALOHA_SRC/Aloha-HE_Common/ModRing/RNS.sv
 $ALOHA_SRC/Aloha-HE_Common/FloatingPoint/ComplexMultiplier.sv

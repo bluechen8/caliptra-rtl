@@ -6,7 +6,7 @@ are two test surfaces:
 | Where | What | How it's tested |
 |---|---|---|
 | `rtl/`, `tb/` | **Stage-0 FHE block** — a behavioral CKKS accelerator integrated into Caliptra as an AHB-Lite responder (the integration shell). | a fast standalone Verilator unit TB + a firmware-driven smoke test on the full SoC |
-| `aloha/` | **Aloha-HE bring-up (Stage A′)** — the real CKKS datapath (vendored `flokrieger/Aloha-HE`), brought up engine-by-engine in standalone Verilator and parameterized over the ring dimension `N`. | 7 self-checking / golden-vector testbenches at `N=8192` and at small `N` |
+| `aloha/` | **Aloha-HE bring-up (Stage A′) + secret-key scheme (Rung 6)** — the real CKKS datapath (vendored `flokrieger/Aloha-HE`), brought up engine-by-engine in standalone Verilator, parameterized over the ring dimension `N`, then composed end-to-end with a real keygen + a dedicated secret-key PWM (`rtl/PWMSk.sv`). | per-engine golden-vector TBs (§A.1–A.2) + a composed-core round-trip / secret-key-scheme TB (§A.3), at `N=8192` and small `N` |
 
 Everything below is runnable from this directory (`src/fhe`).
 
@@ -93,6 +93,45 @@ Under the hood the script just does, per engine: regenerate ROMs (`vendor/Script
 + goldens (`tvgen/`), then `CLEAN=1 ALOHA_MIF_DIR=… ALOHA_TV_DIR=… ./sim/run_tb.sh <TOP> <flist> <-G config> -GN=<N>`.
 `tb_ModMul` / `tb_FFTButterfly` are `N`-independent and run without `-GN`/overrides.
 
+### A.3 Composed-core round-trip & secret-key scheme (Rungs 5–6)
+
+The engine TBs above check each datapath block in isolation. `tb_ckks_roundtrip.sv`
+exercises the **whole composed core** (`ComputeCoreWrapper` → FFT → sample → RNS → NTT →
+PWM → iNTT → I2F → iFFT → PROJECT), driven through the `INS_RAM` microcode sequencer via
+the SDK `send64`/`receive64`/`exeIns` debug-IO protocol. One runner, mode-selected by env var:
+
+```
+aloha/sim/run_roundtrip.sh <golden_dir> [N]      # N defaults to 8192
+```
+
+| Mode (env) | Rung | What it checks | Build |
+|---|---|---|---|
+| *(none)* | 5a | encode+encrypt+decrypt+decode vs **SEAL goldens**, bit-exact @ N=8192 | pk (`SCHEME=0`) |
+| `ROUNDTRIP=1` | 5c | self-contained recovered≈input round-trip (all-HW keypair, `s=1` hack) | pk |
+| `SKSCHEME_HW=1` | 6 | **real ternary keygen + secret-key scheme** on the **dedicated `PWMSk`** (self-contained: HW negate, `c1=a` passthrough) | sk (`+define+FHE_SK_HW`) |
+
+`SKSCHEME_HW=1` additionally runs an **independent NTT-oracle keygen cross-check**
+(dump the sampled ternary `s` + the HW `s_ntt`, recompute `NTT(s)` under q0 with the Go/Lattigo
+oracle, require bit-exact) — this is the real keygen gate, since the round-trip alone can't catch a
+bad key (the encrypt-negate and decrypt MontMuls cancel for any blob). Needs `source aloha/tvgen/env.sh`.
+
+```bash
+cd aloha
+# Rung 5a — composed core vs SEAL goldens @ N=8192 (shipped goldens in build/full8192):
+./sim/run_roundtrip.sh build/full8192 8192
+# Rung 6 — keygen + secret-key scheme on the dedicated PWMSk, at small N (compile-time SCHEME=1):
+SKSCHEME_HW=1 ALOHA_MIF_DIR=$PWD/build/N256/mif ./sim/run_roundtrip.sh build/rt256 256
+# At N=8192 the default (vendor) ROMs are used — omit ALOHA_MIF_DIR:
+SKSCHEME_HW=1 ./sim/run_roundtrip.sh build/rt8192 8192
+```
+
+Validated at **N = 128 / 256 / 8192**. Small-`N` inputs/ROMs are produced like §A.2:
+`GenerateConstantsROM.py <LOGN>` + `GenerateStoredFFTTwiddleFct.py <LOGN>` into `build/N<N>/mif`,
+and `tvgen/gen_roundtrip.py <LOGN> build/rt<N>` for the plaintext + seeds. The **`SCHEME`**
+generator flag selects the encryption datapath: `0` = vendor public-key PWM (the SEAL-golden
+reference, default), `1` = secret-key `PWMSk` (`rtl/PWMSk.sv`, selected by `+define+FHE_SK_HW`).
+The pk path (5a/5c) stays green under the default build; the sk path runs under the `FHE_SK_HW` build.
+
 ### Golden-vector oracles (`aloha/tvgen/`)
 
 Each is independent of the RTL (an external/standalone reference), and each is
@@ -100,7 +139,7 @@ self-gated by reproducing the shipped `N=8192` vectors before being used at smal
 
 | File | Engine(s) | Oracle | CLI |
 |---|---|---|---|
-| `main.go` | NTT | **Lattigo** NTT, root pinned to Aloha's `g` | `./tvgen` (verify @8192) · `./tvgen gen <LOGN> <out> [seed]` |
+| `main.go` | NTT | **Lattigo** NTT, root pinned to Aloha's `g` | `./tvgen` (verify @8192) · `./tvgen gen <LOGN> <out> [seed]` · `./tvgen ntt <LOGN> <q_hex> <in> <out>` (forward NTT of an arbitrary residue poly under modulus `q`; used by the Rung-6 keygen cross-check `check_keygen.py`) |
 | `gen_fft.py` | FFT | **numpy** special-FFT `exp(-iπk/N)·DFT(bitrev(x))` | `gen_fft.py validate <shipped_tv>` · `gen_fft.py gen <LOGN> <out>` |
 | `gen_sampling.py` + `trivium.py` | sampling | **Trivium** port (cipher-gated vs serial eSTREAM Trivium) | `gen_sampling.py <LOGN> <shipped_tv> <out>` |
 | `gen_pointwise.py` | IntToFlp, PWM | per-coefficient transforms computed from the input: IntToFlp `signed(int,q)·2^scale`; PWM `MontMul(a,b)+c` | `gen_pointwise.py validate <shipped_tv>` · `gen_pointwise.py gen <LOGN> <shipped_tv> <out>` |

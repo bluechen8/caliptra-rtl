@@ -183,6 +183,53 @@ func main() {
 		genSmallN(logn, os.Args[3], seed)
 		return
 	}
+	// `ntt <logn> <q_hex> <in_residues.txt> <out.txt>`: forward NTT of an
+	// arbitrary residue poly under an arbitrary Solinas modulus q (Aloha root +
+	// HW bit-reversed output order). Input/output are plain hex, one per line,
+	// no header. Used by the Rung-6 keygen cross-check (verify HW s_ntt == NTT(s)).
+	if len(os.Args) >= 6 && os.Args[1] == "ntt" {
+		var logn int
+		fmt.Sscanf(os.Args[2], "%d", &logn)
+		var q uint64
+		fmt.Sscanf(strings.TrimPrefix(os.Args[3], "0x"), "%x", &q)
+		N := 1 << logn
+		in := make([]uint64, 0, N)
+		f, err := os.Open(os.Args[4])
+		if err != nil {
+			panic(err)
+		}
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 1<<20), 1<<20)
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if line == "" {
+				continue
+			}
+			var v uint64
+			fmt.Sscanf(line, "%x", &v)
+			in = append(in, v)
+		}
+		f.Close()
+		if len(in) != N {
+			panic(fmt.Sprintf("ntt: expected %d residues, got %d", N, len(in)))
+		}
+		sr, g := newAlohaSubRing(N, q)
+		out := make([]uint64, N)
+		sr.NTT(in, out)
+		of, err := os.Create(os.Args[5])
+		if err != nil {
+			panic(err)
+		}
+		w := bufio.NewWriter(of)
+		for _, v := range out {
+			fmt.Fprintf(w, "%x\n", v)
+		}
+		w.Flush()
+		of.Close()
+		fmt.Printf("[ntt] N=%d q=0x%x g=0x%x -> %s\n", N, q, g, os.Args[5])
+		return
+	}
+
 	// `verify [shipped_tv_dir]` (default: ../vendor/...Testbench/tv, i.e. run from tvgen/)
 	tvDir := defaultShippedTV
 	if len(os.Args) >= 3 && os.Args[1] == "verify" {

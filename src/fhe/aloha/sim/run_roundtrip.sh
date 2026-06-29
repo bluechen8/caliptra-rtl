@@ -30,6 +30,8 @@ LOG="$SIM_DIR/${TOP}.log"
 
 NDEF=()
 [[ "$NVAL" != 8192 ]] && NDEF=(-DN_OVERRIDE="$NVAL")
+# Rung 6c: SKSCHEME_HW elaborates the dedicated secret-key PWM (PWMSk).
+[[ -n "${SKSCHEME_HW:-}" ]] && NDEF+=(-DFHE_SK_HW)
 
 echo "=== $TOP (N=$NVAL, goldens=$GOLDEN_ABS) ==="
 [[ -n "${CLEAN:-}" ]] && rm -rf "$OBJ_DIR"
@@ -62,6 +64,7 @@ coe2mem "$MIF/FFTStoredTwiddleFactors.coe" "$RUNDIR/fft_all_twiddle_rom.mem"
 PLUSARGS=(+TVDIR="$GOLDEN_ABS")
 [[ -n "${ROUNDTRIP:-}" ]] && PLUSARGS+=(+ROUNDTRIP)
 [[ -n "${IDENTITY:-}" ]] && PLUSARGS+=(+IDENTITY)
+[[ -n "${SKSCHEME_HW:-}" ]] && PLUSARGS+=(+SKHW)
 
 echo "=== running (cwd=$RUNDIR) ==="
 ( cd "$RUNDIR" && "$OBJ_DIR/V$TOP" "${PLUSARGS[@]}" ) 2>&1 | tee -a "$LOG"
@@ -71,4 +74,16 @@ if grep -qiE "assertion failed|%Error|Failed opening file|TIMEOUT" "$LOG"; then
   echo "$TOP RESULT: FAIL (assertion/error/file-open/timeout -- see $LOG)"; exit 1
 fi
 grep -q "RESULT: PASS" "$LOG" || { echo "$TOP RESULT: FAIL (see $LOG)"; exit 1; }
+
+# Rung 6: independent NTT-oracle cross-check that the HW-derived s_ntt is the
+# genuine forward-NTT of the sampled ternary s (the round-trip alone can't catch
+# a garbage key -- encrypt-negate and decrypt MontMuls cancel for any key blob).
+if [[ -n "${SKSCHEME_HW:-}" && -f "$GOLDEN_ABS/hw_s_tern.txt" ]]; then
+  echo "=== keygen NTT cross-check ==="
+  TVGEN="$ALOHA_PORT/tvgen"
+  ( cd "$TVGEN" && source env.sh && python3 check_keygen.py "$GOLDEN_ABS" ) 2>&1 | tee -a "$LOG"
+  grep -q "keygen NTT cross-check: 0/" "$LOG" \
+    || { echo "$TOP RESULT: FAIL (keygen NTT cross-check -- see $LOG)"; exit 1; }
+fi
+
 echo "$TOP RESULT: PASS"

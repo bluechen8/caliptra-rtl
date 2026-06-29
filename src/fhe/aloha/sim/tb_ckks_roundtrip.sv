@@ -17,6 +17,10 @@ module tb_ckks_roundtrip;
 
   localparam int N    = `ifdef N_OVERRIDE `N_OVERRIDE `else 8192 `endif;
   localparam int LOGN = $clog2(N);
+  // Rung 6c: build with +define+FHE_SK_HW to elaborate the dedicated secret-key
+  // PWM (PWMSk) instead of the vendor pk PWM. Selected at compile time (the
+  // datapath choice is a generator flag, not a runtime bit).
+  localparam int SCHEME = `ifdef FHE_SK_HW 1 `else 0 `endif;
 
   // ---- fullEnc.h modulus-0 parameters ---------------------------------------
   localparam longint ERROR_POLYS_SEED = 64'h2350e17152392f72;
@@ -36,6 +40,7 @@ module tb_ckks_roundtrip;
   // BRAM IDs (match ComputeCore.v / communication.h)
   localparam int FFT_BRAM_ID        = 0;
   localparam int NTT_MSG_BRAM_ID    = 1;
+  localparam int NTT_V_BRAM_ID      = 3;
   localparam int NTT_KEY_BRAM_ID    = 5;
   localparam int FFT_BRAM_EXPAND_ID = 6;
 
@@ -62,7 +67,8 @@ module tb_ckks_roundtrip;
       .FFT_ON_THE_FLY_GENERATION(0),
       .PROVIDE_DEBUG_IO(1),
       .LOGN(LOGN),
-      .N(N)
+      .N(N),
+      .SCHEME(SCHEME)
     ) dut (
       .clk(clk),
       .control_low_word(control_low_word),
@@ -104,6 +110,14 @@ module tb_ckks_roundtrip;
   function automatic longint ins_pwm(input int log_q, input int qm);
     longint q = neg_qm(qm);
     ins_pwm = W40 | (q<<13) | (longint'(log_q)<<5) | 4;          // OPC_PWM
+  endfunction
+  // Rung 6c: PWM with the sk-scheme flags. negate=OP1[0]/bit3 (c0 + MontMul(sk,
+  // q-b)); enc=OP1[1]/bit4 (1 -> b operand from FFT_IM = freshly-sampled a;
+  // 0 -> from NTT_KEY = loaded c1).
+  function automatic longint ins_pwm_sk(input int log_q, input int qm, input bit neg, input bit enc);
+    longint q = neg_qm(qm);
+    ins_pwm_sk = W40 | (q<<13) | (longint'(log_q)<<5) | (longint'(enc)<<4)
+                     | (longint'(neg)<<3) | 4;
   endfunction
   // I2F: log_scale is SIGNED (decrypt passes -scale); scale_high is 4-bit here.
   function automatic longint ins_i2f(input int log_scale, input int log_q, input int qm);
@@ -365,6 +379,164 @@ module tb_ckks_roundtrip;
     check_fft(c1_q, g_input, N, "roundtrip (recovered vs input)", 1.0e-3);
   endtask
 
+  // ====================================================================
+  // Rung 6: real secret-key keygen + secret-key (symmetric) CKKS scheme.
+  //
+  //   KEYGEN (6a): HW ternary-sample s -> RNS-expand -> forward NTT = s_ntt
+  //     (standard domain) -> Montgomery-convert sk_mont = MontMul(s_ntt,R^2)
+  //     = s_ntt*R.  No host crypto: s is the HW sampler's ternary `v` lane,
+  //     read back only for an offline NTT-oracle cross-check.
+  //   ENCRYPT: c0 = -(a*s) + m + e0 ,  c1 = a   (sk-scheme, no pk).
+  //     a = HW uniform sample (the pk1 lane); m+e0 from the encode (RNS gives
+  //     message+e0). Realized on the dedicated PWMSk -- see run_skscheme_hw.
+  //   DECRYPT: m ~= c0 + c1*s  (unchanged path: PWM[sk,c1]+c0 -> iNTT -> I2F
+  //     -> iFFT -> PROJECT).  Validate recovered ~= input.
+  //
+  // Domain bookkeeping (see Rung 5c facts): HW NTT output is *standard*; the
+  // PWM is a MontMul (a*b*R^-1). With sk_mont = s_ntt*R and a/c1 standard,
+  // MontMul(sk_mont,a)=s*a and MontMul(a,-sk_mont)=-(a*s) both land standard.
+  // ====================================================================
+  longint s_ntt_std [];   // HW forward-NTT of ternary s (standard domain)
+  longint sk_mont   [];   // s_ntt*R  (resident secret key, Montgomery domain)
+  longint a_q       [];   // fresh uniform a == c1
+  longint s_tern    [];   // raw ternary s coefficients (-1/0/+1), for the oracle
+  // sk-scheme test seeds (used by run_skscheme_hw).
+  localparam longint KEYGEN_SEED = 64'hA105_BEEF_0006_A001;
+  localparam longint ERR_SEED    = 64'h2350_e171_5239_2f72;  // same CBD error seed as 5a
+  localparam longint A_SEED      = 64'h0006_A002_C0FF_EE77;
+
+  // ====================================================================
+  // Rung 6: real sk keygen + the sk-scheme on the DEDICATED secret-key PWM
+  // (PWMSk, elaborated with +define+FHE_SK_HW), fully SELF-CONTAINED -- no
+  // host-side scaffolding (a vendor PWM would have needed driver moves):
+  //   * NO host negate     -- HW forms (q - b) via the PWM `negate` flag.
+  //   * NO FFT_IM->NTT_V move -- the fresh uniform a stays in FFT_IM; PWMSk reads
+  //                              it directly (the `enc` flag), with sk RESIDENT
+  //                              in NTT_V as the multiplicand for both ops.
+  //   * c1 = a is a HW passthrough (PWMSk result1), checked here == sampled a.
+  //   * single multiply lane (BF0); BF1 unused.
+  // ====================================================================
+  task automatic run_skscheme_hw();
+    int i;
+    longint keygen_seed, err_seed, a_seed, r_mod_q, r2;
+    logic [127:0] rr;
+    if (SCHEME != 1) begin
+      $display("FAIL: +SKSCHEME_HW requires +define+FHE_SK_HW (SCHEME=1)"); errors++; return;
+    end
+    $readmemh({tvdir, "/input.txt"}, g_input);
+    rr = (128'd1 << 72) % q0;  r_mod_q = longint'(rr);
+    rr = (rr * rr) % q0;       r2      = longint'(rr);
+    keygen_seed = KEYGEN_SEED;
+    err_seed    = ERR_SEED;
+    a_seed      = A_SEED;
+
+    // ---------------- KEYGEN (sk_mont), via PWMSk (negate=0) ----------------
+    zero_q = new[N];
+    for (i = 0; i < N; i++) zero_q[i] = 0;
+    send64(zero_q, N, 1'b0, FFT_BRAM_EXPAND_ID);
+    enc_w = '{ ins_fft(1'b1) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0);
+    $display("  [keygen] sample ternary s"); exe_ins(keygen_seed);
+    begin longint eb[]; int npos=0, nneg=0, nz=0;
+      receive64(eb, N, 4 /*ERROR_BRAM_ID*/);
+      s_tern = new[N];
+      for (i = 0; i < N; i++) begin
+        case ((eb[i] >> 12) & 'h3)
+          2'd0: begin s_tern[i] =  0; nz++;   end
+          2'd1: begin s_tern[i] = +1; npos++; end
+          default: begin s_tern[i] = -1; nneg++; end
+        endcase
+      end
+      $display("  [keygen] ternary s: %0d zero, %0d +1, %0d -1 (N=%0d)", nz, npos, nneg, N);
+    end
+    rns_scale = RT_SCALE - 52 - 1023 - LOGN; if (rns_scale < 0) rns_scale += 4096;
+    enc_w = '{ ins_rns(rns_scale, CURRENT_K0, MODSEL0, QM0) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    enc_w = '{ ins_ntt(1'b0, CURRENT_K0, MODSEL0, QM0) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    receive64(s_ntt_std, N, NTT_V_BRAM_ID);
+    begin longint r2_q[]; r2_q = new[N];
+      for (i = 0; i < N; i++) r2_q[i] = r2;
+      send64(s_ntt_std, N, 1'b0, NTT_V_BRAM_ID);
+      send64(r2_q,      N, 1'b0, NTT_KEY_BRAM_ID);
+      send64(zero_q,    N, 1'b0, NTT_MSG_BRAM_ID);
+    end
+    enc_w = '{ ins_pwm_sk(CURRENT_K0, QM0, 1'b0, 1'b0) };  // negate=0,enc=0: MontMul(s_ntt, R2)
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0);
+    $display("  [keygen] Montgomery-convert sk (PWMSk)"); exe_ins(64'd0);
+    receive64(sk_mont, N, NTT_MSG_BRAM_ID);
+    $display("  [keygen] s_ntt[0]=%h sk_mont[0]=%h", s_ntt_std[0], sk_mont[0]);
+    begin int fd;
+      fd = $fopen({tvdir, "/hw_s_tern.txt"}, "w");
+      if (fd) begin for (i=0;i<N;i++) $fdisplay(fd, "%0d", s_tern[i]); $fclose(fd); end
+      fd = $fopen({tvdir, "/hw_s_ntt.txt"}, "w");
+      if (fd) begin for (i=0;i<N;i++) $fdisplay(fd, "%h", s_ntt_std[i]); $fclose(fd); end
+    end
+
+    // ---------------- ENCRYPT via PWMSk: HW negate + c1=a passthrough -------
+    to_q(plain_q, g_input, N);
+    send64(plain_q, N, 1'b0, FFT_BRAM_EXPAND_ID);
+    enc_w = '{ ins_fft(1'b1) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(err_seed);
+    enc_w = '{ ins_rns(rns_scale, CURRENT_K0, MODSEL0, QM0) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    receive64(enc_msg_q, N, NTT_MSG_BRAM_ID);
+    enc_w = '{ ins_ntt(1'b0, CURRENT_K0, MODSEL0, QM0) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0);
+    $display("  [encrypt] encode NTT + sample a"); exe_ins(a_seed);
+    receive64(a_q, N, 7 /*FFT_IM*/);   // read sampled a for the passthrough check ONLY (not moved)
+
+    // a STAYS in FFT_IM; sk_mont is the resident multiplicand in NTT_V. No move.
+    send64(sk_mont, N, 1'b0, NTT_V_BRAM_ID);          // sk resident (multiplicand)
+    enc_w = '{ ins_pwm_sk(CURRENT_K0, QM0, 1'b1, 1'b1) };  // negate=1,enc=1: c0=-(s*a)+(m+e0), b<-FFT_IM
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0);
+    $display("  [encrypt] PWMSk (enc: b<-FFT_IM, HW negate, c1=a passthrough)"); exe_ins(64'd0);
+    receive64(c0_q, N, NTT_MSG_BRAM_ID);                 // c0
+    begin longint c1_pt[]; int nd = 0;                   // verify c1=a passthrough (FFT_IM -> NTT_KEY in HW)
+      receive64(c1_pt, N, NTT_KEY_BRAM_ID);
+      for (i = 0; i < N; i++) if (c1_pt[i] !== a_q[i]) nd++;
+      if (nd) begin $display("FAIL c1=a passthrough: %0d/%0d differ", nd, N); errors++; end
+      else        $display("PASS c1=a passthrough (%0d coeffs)", N);
+    end
+
+    // ---------------- DECRYPT via PWMSk (negate=0) --------------------------
+    send64(c0_q,    N, 1'b0, NTT_MSG_BRAM_ID);
+    send64(a_q,     N, 1'b0, NTT_KEY_BRAM_ID);   // c1 = a (loaded ciphertext)
+    send64(sk_mont, N, 1'b0, NTT_V_BRAM_ID);     // sk resident (multiplicand)
+    enc_w = '{ ins_pwm_sk(CURRENT_K0, QM0, 1'b0, 1'b0) };  // negate=0,enc=0: m = c0 + s*c1, b<-NTT_KEY
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0);
+    $display("  [decrypt] PWMSk"); exe_ins(64'd0);
+    enc_w = '{ ins_ntt(1'b1, CURRENT_K0, MODSEL0, QM0) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0);
+    $display("  [decrypt] inverse NTT"); exe_ins(64'd0);
+    begin longint dec_msg[]; int nd = 0; longint d;
+      receive64(dec_msg, N, NTT_MSG_BRAM_ID);
+      for (int j = 0; j < N; j++) begin
+        d = $signed(dec_msg[j]) - $signed(enc_msg_q[j]);
+        if (d > q0/2) d -= q0; else if (d < -(q0/2)) d += q0;
+        if (d > 1 || d < -1) begin
+          if (nd < 6) $display("  intRT[%0d]: dec=%h exp=%h d=%0d", j, dec_msg[j], enc_msg_q[j], d);
+          nd++;
+        end
+      end
+      if (nd) begin $display("FAIL integer round-trip: %0d/%0d exceed |1|", nd, N); errors++; end
+      else        $display("PASS integer round-trip (decrypted == m+e0, %0d coeffs)", N);
+    end
+    enc_w = '{ ins_i2f(-RT_SCALE, CURRENT_K0, QM0) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0);
+    $display("  [decrypt] I2F"); exe_ins(64'd0);
+    enc_w = '{ ins_fft(1'b0) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0);
+    $display("  [decrypt] inverse FFT"); exe_ins(64'd0);
+    enc_w = '{ ins_project() };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0);
+    $display("  [decrypt] PROJECT"); exe_ins(64'd0);
+    receive64(c0_q, 2*N, FFT_BRAM_ID);
+    c1_q = new[N];
+    for (i = 0; i < N; i++) c1_q[i] = c0_q[i+N];
+    check_fft(c1_q, g_input, N, "sk-scheme-HW roundtrip (recovered vs input)", 1.0e-3);
+  endtask
+
   // inverse-NTT identity probe: fwd-NTT then inv-NTT a random poly should
   // recover it (INTTScale supplies 1/N). Isolates the inverse NTT at small N.
   task automatic identity_probe();
@@ -426,6 +598,14 @@ module tb_ckks_roundtrip;
     if (roundtrip) begin
       $display("== Rung 5c: self-contained round-trip, N=%0d ==", N);
       run_roundtrip();
+      if (errors == 0) $display("RESULT: PASS");
+      else             $display("RESULT: FAIL (%0d mismatches)", errors);
+      $finish;
+    end
+
+    if ($test$plusargs("SKHW")) begin
+      $display("== Rung 6: sk keygen + secret-key scheme on PWMSk, N=%0d (SCHEME=%0d) ==", N, SCHEME);
+      run_skscheme_hw();
       if (errors == 0) $display("RESULT: PASS");
       else             $display("RESULT: FAIL (%0d mismatches)", errors);
       $finish;
