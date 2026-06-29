@@ -6,7 +6,7 @@ are two test surfaces:
 | Where | What | How it's tested |
 |---|---|---|
 | `rtl/`, `tb/` | **Stage-0 FHE block** — a behavioral CKKS accelerator integrated into Caliptra as an AHB-Lite responder (the integration shell). | a fast standalone Verilator unit TB + a firmware-driven smoke test on the full SoC |
-| `aloha/` | **Aloha-HE bring-up (Stage A′) + secret-key scheme (Rung 6) + client↔server cosim (Rung 7)** — the real CKKS datapath (vendored `flokrieger/Aloha-HE`), brought up engine-by-engine in standalone Verilator, parameterized over the ring dimension `N`, composed end-to-end with a real keygen + a dedicated secret-key PWM (`rtl/PWMSk.sv`), then run against **Lattigo as an untrusted homomorphic server**. | per-engine golden-vector TBs (§A.1–A.2) + a composed-core round-trip / secret-key-scheme TB (§A.3) + an Aloha⇄Lattigo cosim (§A.4: ct+ct, pt×ct, pt×ct+rescale), at `N=8192` and small `N` |
+| `aloha/` | **Aloha-HE bring-up (Stage A′) + secret-key scheme (Rung 6) + client↔server cosim (Rung 7)** — the real CKKS datapath (vendored `flokrieger/Aloha-HE`), brought up engine-by-engine in standalone Verilator, parameterized over the ring dimension `N`, composed end-to-end with a real keygen + a dedicated secret-key PWM (`rtl/PWMSk.sv`), then run against **Lattigo as an untrusted homomorphic server**. | per-engine golden-vector TBs (§A.1–A.2) + a composed-core round-trip / secret-key-scheme TB (§A.3) + a single-run **DPI-C** Aloha⇄Lattigo cosim (§A.4: ct+ct, pt×ct, pt×ct+rescale), at `N=8192` and small `N` |
 
 Everything below is runnable from this directory (`src/fhe`).
 
@@ -21,6 +21,9 @@ Everything below is runnable from this directory (`src/fhe`).
   Rung-6 keygen cross-check, and the Rung-7 Lattigo "server" (§A.4). Self-contained toolchain at
   `/scratch/boru/go-toolchain`, module cache at `~/go` (offline-capable). Activate with
   `source aloha/tvgen/env.sh` (the runners do this themselves).
+- **A C/C++ compiler (conda `gcc`/`g++`)** — for the Rung-7 **DPI-C** cosim (§A.4), where cgo builds the
+  Lattigo server into an in-process c-shared `.so` linked into the Verilator binary. (The engine/round-trip
+  TBs and the `go run .` oracle CLI don't need it.)
 
 ---
 
@@ -135,20 +138,23 @@ The pk path (5a/5c) stays green under the default build; the sk path runs under 
 
 ### A.4 Client↔server cosim — Aloha (RTL) ⇄ Lattigo (untrusted server) (Rung 7)
 
-The first test of the actual **FHE-client use case**: the Aloha RTL (trusted client) keygens +
-secret-key-encrypts, an **untrusted Lattigo "server"** runs the homomorphic evaluation on the *public*
-ciphertext, and the RTL decrypts the result — proving Aloha ciphertexts are real CKKS ciphertexts that
-interoperate with a standard library. One driver, op-selected by `COSIM_OP`:
+The first test of the actual **FHE-client use case**, and the strongest correctness statement in the
+ladder: the Aloha RTL (trusted client) keygens + secret-key-encrypts, an **untrusted Lattigo "server"**
+runs the homomorphic evaluation on the *public* ciphertext, and the RTL decrypts the result — proving
+Aloha ciphertexts are real CKKS ciphertexts that interoperate with a standard library.
+
+It runs as a **single `verilator --binary` run via DPI-C**: the testbench calls an `import "DPI-C"`
+function mid-simulation that hands the *public* ciphertext to an **in-process** Lattigo server (built from
+`tvgen/` as a c-shared `.so`) and gets the result back. The secret key `s` **provably never leaves the sim
+process** — no second process, no re-keygen, no ciphertext files on disk; only the public ciphertext
+crosses the DPI boundary. One driver, op-selected by `COSIM_OP`; needs `source aloha/tvgen/env.sh` (Go)
+**and a C compiler** (the conda `gcc`, used by cgo for the `.so`).
 
 ```
-COSIM_OP=add|mul|rescale  aloha/sim/run_cosim.sh [golden_dir] [N] [seed]   # N defaults to 8192
+COSIM_OP=add|mul|rescale  aloha/sim/run_cosim_dpi.sh [golden_dir] [N] [seed]   # N defaults to 8192
 ```
 
-It runs the **same prebuilt PWMSk binary twice** (file handoff between, so the secret `s` never touches
-disk — phase 2 re-derives it from the same `KEYGEN_SEED`): phase 1 encrypts + dumps the *public* operands,
-the Go server runs the homomorphic op, phase 2 decrypts + checks. Needs `source aloha/tvgen/env.sh` (Go).
-
-| `COSIM_OP` | Op | Server (Lattigo) | Phase-2 check |
+| `COSIM_OP` | Op | Server (Lattigo) | Check |
 |---|---|---|---|
 | `add` (default) | `ct(m1) + ct(m2)` | `ring.Add` | recovered ≈ `m1 + m2` |
 | `mul` | `pt(m2) × ct(m1)`, single modulus | `MulCoeffsBarrett` | recovered ≈ **complex** `m1 ⊙ m2` |
@@ -156,22 +162,29 @@ the Go server runs the homomorphic op, phase 2 decrypts + checks. Needs `source 
 
 ```bash
 cd aloha
-# Rung 7a — ct+ct interop (small N regenerates q0 ROMs into build/N<N>/mif automatically):
-COSIM_OP=add     CLEAN=1 ./sim/run_cosim.sh 256
-COSIM_OP=add     CLEAN=1 ./sim/run_cosim.sh 8192
-# Rung 7b — pt*ct multiply interop:
-COSIM_OP=mul     CLEAN=1 ./sim/run_cosim.sh 256
-COSIM_OP=mul     CLEAN=1 ./sim/run_cosim.sh 8192
-# Rung 7b-rescale — 2-limb pt*ct + rescale {q0,q1}->{q0}:
-COSIM_OP=rescale CLEAN=1 ./sim/run_cosim.sh 256
-COSIM_OP=rescale CLEAN=1 ./sim/run_cosim.sh 8192
+COSIM_OP=add     ./sim/run_cosim_dpi.sh 256     # ct+ct interop (small N regenerates q0 ROMs automatically)
+COSIM_OP=mul     ./sim/run_cosim_dpi.sh 256     # pt*ct multiply interop
+COSIM_OP=rescale ./sim/run_cosim_dpi.sh 256     # 2-limb pt*ct + rescale {q0,q1}->{q0}
+COSIM_OP=add     ./sim/run_cosim_dpi.sh 8192    # ...likewise at the production size
 ```
 
-PASS = `tb_ckks_roundtrip cosim RESULT: PASS` (both phases pass + the phase-2 recovered check + the
-keygen NTT cross-check). Validated at **N = 256 / 8192**. The Lattigo server lives in `tvgen/main.go`
-(`server_add` / `server_mul` / `server_mul_rescale`); `newAlohaRing` pins every modulus's NTT root to
-Aloha's `g` (required for the rescale's internal INTT/NTT). Plaintexts `m1`,`m2` come from
-`tvgen/gen_cosim.py` (run by the driver). All artifacts land in `build/cosim<N>/`.
+PASS = `tb_ckks_roundtrip DPI cosim RESULT: PASS` (the recovered-vs-expected check). Validated at
+**N = 256 / 8192**, all three ops. Plaintexts `m1`,`m2` come from `tvgen/gen_cosim.py` (run by the driver);
+all artifacts land in `build/cosimdpi<N>/`. How it's wired:
+
+- `tvgen/main.go` holds the homomorphic-eval cores `coreAdd` / `coreMul` / `coreMulRescale` (Lattigo
+  `ring.Add` / `MulCoeffsBarrett` / `DivRoundByLastModulusNTT`); `newAlohaRing` pins every modulus's NTT
+  root to Aloha's `g` (required for the rescale's internal INTT/NTT).
+- `tvgen/cosim_dpi.go` (`//go:build dpi`) exports those cores via cgo (`//export AlohaServer{Add,Mul,MulRescale}`);
+  built with `go build -tags dpi -buildmode=c-shared -o libfhecosim.so` (excluded from the plain `go run .`
+  oracle CLI, which therefore needs no C toolchain).
+- `sim/fhe_cosim_dpi.cpp` is the Verilator DPI-C shim (gathers the SV open-array polys → calls the cores →
+  scatters results back).
+- `sim/tb_ckks_roundtrip.sv` provides the `+DPICOSIM` mode (`+DPIOP=add|mul|rescale`) behind
+  `` `ifdef FHE_DPI_COSIM `` — so the default (Rung 5/6) build never references the DPI symbols. It composes
+  the validated `cosim_{keygen,encrypt,decrypt,encode_pt,…}` tasks: keygen → encrypt → `fhe_dpi_*` → decrypt.
+- `sim/run_cosim_dpi.sh` builds the `.so`, builds the Verilator binary (`+define+FHE_SK_HW +FHE_DPI_COSIM`,
+  links `-lfhecosim`), and runs once.
 
 ### Golden-vector oracles (`aloha/tvgen/`)
 
@@ -181,7 +194,7 @@ self-gated by reproducing the shipped `N=8192` vectors before being used at smal
 | File | Engine(s) | Oracle | CLI |
 |---|---|---|---|
 | `main.go` | NTT | **Lattigo** NTT, root pinned to Aloha's `g` | `./tvgen` (verify @8192) · `./tvgen gen <LOGN> <out> [seed]` · `./tvgen ntt <LOGN> <q_hex> <in> <out>` (forward NTT of an arbitrary residue poly under modulus `q`; used by the Rung-6 keygen cross-check `check_keygen.py`) |
-| `main.go` (Rung-7 server) | — | **Lattigo** homomorphic eval on imported Aloha cts | `./tvgen server_add <LOGN> <q_hex> <dir>` (ct+ct) · `./tvgen server_mul <LOGN> <q_hex> <dir>` (pt×ct) · `./tvgen server_mul_rescale <LOGN> <q0_hex> <q1_hex> <dir>` (2-limb pt×ct + rescale). Driven by `run_cosim.sh`; reads/writes the ciphertext poly files in `<dir>`. |
+| `main.go` (cores) + `cosim_dpi.go` (`//go:build dpi`) | — | **Lattigo** homomorphic eval (`coreAdd`/`coreMul`/`coreMulRescale`), exported for **in-process** DPI-C (Rung 7) | not a CLI — `go build -tags dpi -buildmode=c-shared -o libfhecosim.so .` emits the `.so`+header that `sim/fhe_cosim_dpi.cpp` links. Driven by `run_cosim_dpi.sh`. |
 | `gen_fft.py` | FFT | **numpy** special-FFT `exp(-iπk/N)·DFT(bitrev(x))` | `gen_fft.py validate <shipped_tv>` · `gen_fft.py gen <LOGN> <out>` |
 | `gen_sampling.py` + `trivium.py` | sampling | **Trivium** port (cipher-gated vs serial eSTREAM Trivium) | `gen_sampling.py <LOGN> <shipped_tv> <out>` |
 | `gen_pointwise.py` | IntToFlp, PWM | per-coefficient transforms computed from the input: IntToFlp `signed(int,q)·2^scale`; PWM `MontMul(a,b)+c` | `gen_pointwise.py validate <shipped_tv>` · `gen_pointwise.py gen <LOGN> <shipped_tv> <out>` |
@@ -241,6 +254,13 @@ instructions are in `design-review/fhe-ckks-implementation-progress.md` (§"How 
   branch `caliptra-fhe`). The `N`-parameterization edits to the Aloha-HE RTL/TBs/scripts
   are made in-place there and tracked as commits on that branch.
 - **Verilator 5.022 `-j 0`** occasionally throws a transient internal error
-  (`attempted to destroy locked Thread Pool`) — just re-run.
+  (`attempted to destroy locked Thread Pool`) — just re-run. It can also print this with a
+  nonzero exit *after* successfully producing the binary; `run_cosim_dpi.sh` therefore gates on the
+  binary's existence, not the exit code.
+- **DPI-C plumbing (Rung 7c):** Verilator `--binary` compiles only **`.cpp`** DPI files (a `.c` is
+  silently dropped → "undefined reference"); use `extern "C"` in a `.cpp`. Open-array DPI imports map to
+  `const svOpenArrayHandle` (read with `svGetArrElemPtr1`) — a **dynamic** SV array can't be the actual,
+  so the TB stages through fixed `[N]` buffers. And don't begin a comment with `// Verilator …` — it's
+  parsed as a lint metacomment.
 - `run_tb.sh` always regenerates the `.coe`→`.mem` conversion, so switching
   `ALOHA_MIF_DIR` between default-`N` and small-`N` is safe.

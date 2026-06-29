@@ -96,6 +96,35 @@ module tb_ckks_roundtrip;
       .dma_bram_en(dma_en)
     );
 
+`ifdef FHE_DPI_COSIM
+  // ---- Rung 7c: in-process Lattigo "server" via DPI-C ------------------------
+  // Bound to fhe_cosim_dpi.cpp -> libfhecosim.so (cgo). Public ciphertext polys
+  // cross as NTT/eval-domain standard residues (open arrays); nothing secret
+  // crosses. Only compiled into the DPI build (driver passes +define+FHE_DPI_COSIM
+  // + the shim + -lfhecosim); the file-based path never sees these symbols.
+  import "DPI-C" function void fhe_dpi_add(
+      input int n, input longint q,
+      input  longint c0a[], input longint c1a[],
+      input  longint c0b[], input longint c1b[],
+      output longint outc0[], output longint outc1[]);
+  import "DPI-C" function void fhe_dpi_mul(
+      input int n, input longint q,
+      input  longint c0[], input longint c1[], input longint pt[],
+      output longint outc0[], output longint outc1[]);
+  import "DPI-C" function void fhe_dpi_mul_rescale(
+      input int n, input longint q0, input longint q1,
+      input  longint c0q0[], input longint c0q1[],
+      input  longint c1q0[], input longint c1q1[],
+      input  longint ptq0[], input longint ptq1[],
+      output longint outc0[], output longint outc1[]);
+  // Note: a dynamic array can't be passed to a DPI open array in this sim, so
+  // the cosim tasks' dynamic outputs are staged through fixed [N] buffers.
+  longint fa0[N], fa1[N], fb0[N], fb1[N], fp0[N], fp1[N];  // fixed DPI inputs
+  longint fo0[N], fo1[N];                                  // fixed DPI outputs
+  longint d_pt[];                                          // 7c-mul: encoded pt(m2)
+  longint d_o0[], d_o1[];                                  // server result ct (dynamic, for decrypt)
+`endif
+
   // ---- instruction-word builders (port of instruction.c) --------------------
   function automatic longint neg_qm(input int qm);
     neg_qm = (-qm) & ((1<<17)-1);
@@ -431,10 +460,8 @@ module tb_ckks_roundtrip;
 
   // ---- Rung 7 cosim (client<->server) state ---------------------------------
   longint g_input2  [0:N];   // second plaintext m2 (input2.txt)
-  longint g_sum_c0  [0:N];   // server-returned sum ciphertext c0 (sum_c0.txt)
-  longint g_sum_c1  [0:N];   // server-returned sum ciphertext c1 (sum_c1.txt)
-  longint g_sum_exp [0:N];   // expected recovered slots = m1 + m2 (doubles)
-  int     cosim_net;         // encode net-scale exponent (2^cosim_net); 7a add=RT_SCALE-LOGN
+  longint g_sum_exp [0:N];   // expected recovered slots (m1+m2, or complex m1(.)m2)
+  int     cosim_net;         // encode net-scale exponent (2^cosim_net); add=RT_SCALE-LOGN
   longint ck_sk_mont [];     // resident sk (Montgomery), from cosim_keygen
   longint ck_s_tern  [];     // sampled ternary s (for the keygen cross-check)
   longint ck_s_ntt   [];     // HW forward-NTT of s (standard domain)
@@ -580,19 +607,13 @@ module tb_ckks_roundtrip;
   endtask
 
   // ====================================================================
-  // Rung 7 cosim: streamlined sk-scheme helpers (PWMSk path, SCHEME=1).
-  // Extracted from run_skscheme_hw so phase 1 (+ENCRYPT) and phase 2
-  // (+DECRYPT) can keygen/encrypt/decrypt across two separate sim runs.
-  // sk (the secret) NEVER touches disk -- phase 2 re-derives it from the
-  // same KEYGEN_SEED; only the *public* ciphertext polys are dumped.
+  // Rung 7 cosim: streamlined sk-scheme helpers (PWMSk path, SCHEME=1),
+  // extracted from run_skscheme_hw. The Rung-7c +DPICOSIM mode composes
+  // these in a single sim run: keygen -> encrypt -> (in-process Lattigo
+  // server, via the DPI shim) -> decrypt. sk (the secret) stays resident
+  // in the sim the whole time -- it never touches disk and is never even
+  // re-derived; only the *public* ciphertext crosses the DPI boundary.
   // ====================================================================
-  task automatic dump_hex(input string fname, input longint p[], input int num);
-    int fd, i;
-    fd = $fopen({tvdir, "/", fname}, "w");
-    if (fd == 0) begin $display("FAIL: cannot open %s for write", fname); errors++; return; end
-    for (i = 0; i < num; i++) $fdisplay(fd, "%h", p[i]);
-    $fclose(fd);
-  endtask
 
   // KEYGEN: ternary s -> RNS-expand -> fwd NTT (s_ntt, standard) ->
   // Montgomery-convert sk_mont = MontMul(s_ntt, R^2). Leaves ck_sk_mont set.
@@ -893,181 +914,82 @@ module tb_ckks_roundtrip;
       $finish;
     end
 
-    // ---- Rung 7a cosim phase 1: keygen + encrypt m1, m2 (dump public cts) ----
-    if ($test$plusargs("ENCRYPT")) begin
-      $display("== Rung 7a phase 1: keygen + encrypt m1,m2, N=%0d (SCHEME=%0d) ==", N, SCHEME);
+`ifdef FHE_DPI_COSIM
+    // ==== Rung 7c: single-run client<->server cosim via DPI-C ================
+    // ONE RTL run: Aloha keygens+encrypts, the in-process Lattigo server (via the
+    // DPI shim) evaluates on the PUBLIC ciphertext, Aloha decrypts. s stays
+    // resident -- no re-keygen, no second process, no ciphertext files.
+    // +DPIOP=add|mul|rescale selects the homomorphic op (default add).
+    if ($test$plusargs("DPICOSIM")) begin
+      string dpiop;
+      int i, i2f; real ar, ai, br, bi;
+      if (!$value$plusargs("DPIOP=%s", dpiop)) dpiop = "add";
+      $display("== Rung 7c: single-run DPI-C cosim, op=%s, N=%0d (SCHEME=%0d) ==", dpiop, N, SCHEME);
       if (SCHEME != 1) begin
-        $display("FAIL: +ENCRYPT requires +define+FHE_SK_HW (SCHEME=1)"); errors++;
+        $display("FAIL: +DPICOSIM requires +define+FHE_SK_HW (SCHEME=1)"); errors++;
       end else begin
-        cosim_net = RT_SCALE - LOGN;   // 7a add: scale Delta (round-trip value)
         $readmemh({tvdir, "/input.txt"},  g_input);
         $readmemh({tvdir, "/input2.txt"}, g_input2);
-        cosim_keygen(KEYGEN_SEED);
-        // dump the keygen cross-check material (s never leaves as the resident key;
-        // these are only for the offline NTT-oracle check, identical to Rung 6).
-        // hw_s_tern is DECIMAL (-1/0/+1) per check_keygen.py; hw_s_ntt is hex.
-        begin int fd;
-          fd = $fopen({tvdir, "/hw_s_tern.txt"}, "w");
-          if (fd) begin for (int j = 0; j < N; j++) $fdisplay(fd, "%0d", ck_s_tern[j]); $fclose(fd); end
+        d_o0 = new[N]; d_o1 = new[N];
+        if (dpiop == "mul") begin
+          cosim_net = MUL_NET;                                  // pt*ct: low scale, product fits q0
+          cosim_keygen(KEYGEN_SEED);
+          cosim_encrypt(g_input, A_SEED, ERR_SEED, c0_q, c1_q); // ct = Enc(m1)
+          cosim_encode_pt(g_input2, ERR_SEED2, d_pt);           // pt = Encode(m2)
+          for (i = 0; i < N; i++) begin fa0[i]=c0_q[i]; fa1[i]=c1_q[i]; fp0[i]=d_pt[i]; end
+          fhe_dpi_mul(N, q0, fa0, fa1, fp0, fo0, fo1);          // in-process Lattigo pt*ct
+          for (i = 0; i < N; i++) begin d_o0[i]=fo0[i]; d_o1[i]=fo1[i]; end
+          i2f = -2*(MUL_NET + LOGN);
+          cosim_decrypt(d_o0, d_o1, i2f, reco_q);
+          for (i = 0; i < N/2; i++) begin
+            ar = $bitstoreal(g_input [2*i]); ai = $bitstoreal(g_input [2*i+1]);
+            br = $bitstoreal(g_input2[2*i]); bi = $bitstoreal(g_input2[2*i+1]);
+            g_sum_exp[2*i]   = $realtobits(ar*br - ai*bi);
+            g_sum_exp[2*i+1] = $realtobits(ar*bi + ai*br);
+          end
+          fft_abs_floor = 2.0e-3;
+          check_fft(reco_q, g_sum_exp, N, "cosim pt*ct (recovered vs m1(.)m2)", 1.0e-2);
+        end else if (dpiop == "rescale") begin
+          cosim_keygen2(KEYGEN_SEED);                           // sets cosim_net=RESC_NET
+          cosim_encrypt2(g_input, A_SEED, ERR_SEED);            // c0_q/c1_q@q0, c0_l1/c1_l1@q1
+          cosim_encode_pt2(g_input2, ERR_SEED2);                // pt_q0, pt_q1
+          for (i = 0; i < N; i++) begin
+            fa0[i]=c0_q[i];  fa1[i]=c0_l1[i];   // c0 @q0,@q1
+            fb0[i]=c1_q[i];  fb1[i]=c1_l1[i];   // c1 @q0,@q1
+            fp0[i]=pt_q0[i]; fp1[i]=pt_q1[i];   // pt @q0,@q1
+          end
+          fhe_dpi_mul_rescale(N, q0, q1v, fa0, fa1, fb0, fb1, fp0, fp1, fo0, fo1);
+          for (i = 0; i < N; i++) begin d_o0[i]=fo0[i]; d_o1[i]=fo1[i]; end
+          i2f = -(2*(RESC_NET + LOGN) - LOG2_Q1);
+          cosim_decrypt(d_o0, d_o1, i2f, reco_q);               // decrypt single q0 limb
+          for (i = 0; i < N/2; i++) begin
+            ar = $bitstoreal(g_input [2*i]); ai = $bitstoreal(g_input [2*i+1]);
+            br = $bitstoreal(g_input2[2*i]); bi = $bitstoreal(g_input2[2*i+1]);
+            g_sum_exp[2*i]   = $realtobits(ar*br - ai*bi);
+            g_sum_exp[2*i+1] = $realtobits(ar*bi + ai*br);
+          end
+          fft_abs_floor = 2.0e-3;
+          check_fft(reco_q, g_sum_exp, N, "cosim pt*ct+rescale (recovered vs m1(.)m2)", 1.0e-2);
+        end else begin // "add"
+          cosim_net = RT_SCALE - LOGN;                          // ct+ct stays at scale Delta
+          cosim_keygen(KEYGEN_SEED);
+          cosim_encrypt(g_input,  A_SEED,  ERR_SEED,  c0_q, c1_q);   // ct1 = Enc(m1)
+          for (i = 0; i < N; i++) begin fa0[i]=c0_q[i]; fa1[i]=c1_q[i]; end
+          cosim_encrypt(g_input2, A_SEED2, ERR_SEED2, c0_q, c1_q);   // ct2 = Enc(m2)
+          for (i = 0; i < N; i++) begin fb0[i]=c0_q[i]; fb1[i]=c1_q[i]; end
+          fhe_dpi_add(N, q0, fa0, fa1, fb0, fb1, fo0, fo1);
+          for (i = 0; i < N; i++) begin d_o0[i]=fo0[i]; d_o1[i]=fo1[i]; end
+          cosim_decrypt(d_o0, d_o1, -RT_SCALE, reco_q);
+          for (i = 0; i < N; i++)
+            g_sum_exp[i] = $realtobits($bitstoreal(g_input[i]) + $bitstoreal(g_input2[i]));
+          check_fft(reco_q, g_sum_exp, N, "cosim ct+ct (recovered vs m1+m2)", 1.0e-3);
         end
-        dump_hex("hw_s_ntt.txt", ck_s_ntt, N);
-        cosim_encrypt(g_input,  A_SEED,  ERR_SEED,  c0_q, c1_q);
-        dump_hex("ct1_c0.txt", c0_q, N); dump_hex("ct1_c1.txt", c1_q, N);
-        cosim_encrypt(g_input2, A_SEED2, ERR_SEED2, c0_q, c1_q);
-        dump_hex("ct2_c0.txt", c0_q, N); dump_hex("ct2_c1.txt", c1_q, N);
-        $display("  [phase1] dumped ct1_{c0,c1}.txt, ct2_{c0,c1}.txt to %s", tvdir);
       end
       if (errors == 0) $display("RESULT: PASS");
       else             $display("RESULT: FAIL (%0d mismatches)", errors);
       $finish;
     end
-
-    // ---- Rung 7a cosim phase 2: load server sum ct, decrypt, check ~ m1+m2 ----
-    if ($test$plusargs("DECRYPT")) begin
-      $display("== Rung 7a phase 2: decrypt server sum ct, N=%0d (SCHEME=%0d) ==", N, SCHEME);
-      if (SCHEME != 1) begin
-        $display("FAIL: +DECRYPT requires +define+FHE_SK_HW (SCHEME=1)"); errors++;
-      end else begin
-        int i;
-        cosim_net = RT_SCALE - LOGN;   // 7a add: scale Delta (round-trip value)
-        $readmemh({tvdir, "/input.txt"},  g_input);
-        $readmemh({tvdir, "/input2.txt"}, g_input2);
-        $readmemh({tvdir, "/sum_c0.txt"}, g_sum_c0);
-        $readmemh({tvdir, "/sum_c1.txt"}, g_sum_c1);
-        cosim_keygen(KEYGEN_SEED);                 // re-derive sk (same seed; never on disk)
-        to_q(c0_q, g_sum_c0, N); to_q(c1_q, g_sum_c1, N);
-        cosim_decrypt(c0_q, c1_q, -RT_SCALE, reco_q);  // ct+ct stays at scale Delta
-        for (i = 0; i < N; i++)
-          g_sum_exp[i] = $realtobits($bitstoreal(g_input[i]) + $bitstoreal(g_input2[i]));
-        check_fft(reco_q, g_sum_exp, N, "cosim ct+ct (recovered vs m1+m2)", 1.0e-3);
-      end
-      if (errors == 0) $display("RESULT: PASS");
-      else             $display("RESULT: FAIL (%0d mismatches)", errors);
-      $finish;
-    end
-
-    // ---- Rung 7b cosim phase 1: keygen + encrypt m1 + encode m2->pt ----------
-    if ($test$plusargs("PMULENC")) begin
-      $display("== Rung 7b phase 1: keygen + encrypt m1 + encode pt(m2), N=%0d (SCHEME=%0d) ==", N, SCHEME);
-      if (SCHEME != 1) begin
-        $display("FAIL: +PMULENC requires +define+FHE_SK_HW (SCHEME=1)"); errors++;
-      end else begin
-        cosim_net = MUL_NET;           // 7b pt*ct: lower scale so the product fits q0
-        $readmemh({tvdir, "/input.txt"},  g_input);
-        $readmemh({tvdir, "/input2.txt"}, g_input2);
-        cosim_keygen(KEYGEN_SEED);
-        begin int fd;
-          fd = $fopen({tvdir, "/hw_s_tern.txt"}, "w");
-          if (fd) begin for (int j = 0; j < N; j++) $fdisplay(fd, "%0d", ck_s_tern[j]); $fclose(fd); end
-        end
-        dump_hex("hw_s_ntt.txt", ck_s_ntt, N);
-        cosim_encrypt(g_input, A_SEED, ERR_SEED, c0_q, c1_q);  // ct = Enc(m1)
-        dump_hex("ct_c0.txt", c0_q, N); dump_hex("ct_c1.txt", c1_q, N);
-        cosim_encode_pt(g_input2, ERR_SEED2, reco_q);          // pt = Encode(m2)
-        dump_hex("pt.txt", reco_q, N);
-        $display("  [phase1] dumped ct_{c0,c1}.txt + pt.txt to %s", tvdir);
-      end
-      if (errors == 0) $display("RESULT: PASS");
-      else             $display("RESULT: FAIL (%0d mismatches)", errors);
-      $finish;
-    end
-
-    // ---- Rung 7b cosim phase 2: load pt*ct product, decrypt, check ~ m1(.)m2 -
-    if ($test$plusargs("PMULDEC")) begin
-      $display("== Rung 7b phase 2: decrypt pt*ct product, N=%0d (SCHEME=%0d) ==", N, SCHEME);
-      if (SCHEME != 1) begin
-        $display("FAIL: +PMULDEC requires +define+FHE_SK_HW (SCHEME=1)"); errors++;
-      end else begin
-        int i, i2f; real ar, ai, br, bi;
-        cosim_net = MUL_NET;
-        $readmemh({tvdir, "/input.txt"},  g_input);
-        $readmemh({tvdir, "/input2.txt"}, g_input2);
-        $readmemh({tvdir, "/prod_c0.txt"}, g_sum_c0);
-        $readmemh({tvdir, "/prod_c1.txt"}, g_sum_c1);
-        // pt*ct doubles the scale (Delta -> Delta^2): the decode divides by twice
-        // the single-message exponent. Single recovers at -(net+LOGN) (=-RT_SCALE);
-        // the product recovers at exactly 2x that (empirically confirmed: a -(2net+LOGN)
-        // guess left a clean residual factor of 2^LOGN). Overridable with +I2FSCALE.
-        i2f = -2*(MUL_NET + LOGN);
-        void'($value$plusargs("I2FSCALE=%d", i2f));
-        cosim_keygen(KEYGEN_SEED);
-        to_q(c0_q, g_sum_c0, N); to_q(c1_q, g_sum_c1, N);
-        cosim_decrypt(c0_q, c1_q, i2f, reco_q);
-        // expected = complex slotwise product (slots are re/im interleaved)
-        for (i = 0; i < N/2; i++) begin
-          ar = $bitstoreal(g_input [2*i]); ai = $bitstoreal(g_input [2*i+1]);
-          br = $bitstoreal(g_input2[2*i]); bi = $bitstoreal(g_input2[2*i+1]);
-          g_sum_exp[2*i]   = $realtobits(ar*br - ai*bi);
-          g_sum_exp[2*i+1] = $realtobits(ar*bi + ai*br);
-        end
-        $display("  [phase2] I2F decode scale = %0d", i2f);
-        fft_abs_floor = 2.0e-3;   // product of two O(1) operands: looser abs floor on cancellation slots
-        check_fft(reco_q, g_sum_exp, N, "cosim pt*ct (recovered vs m1(.)m2)", 1.0e-2);
-      end
-      if (errors == 0) $display("RESULT: PASS");
-      else             $display("RESULT: FAIL (%0d mismatches)", errors);
-      $finish;
-    end
-
-    // ---- Rung 7b-rescale phase 1: 2-limb keygen + encrypt m1 + encode pt(m2) --
-    if ($test$plusargs("RESCENC")) begin
-      $display("== Rung 7b-rescale phase 1: 2-limb keygen+encrypt+encode, N=%0d (SCHEME=%0d) ==", N, SCHEME);
-      if (SCHEME != 1) begin
-        $display("FAIL: +RESCENC requires +define+FHE_SK_HW (SCHEME=1)"); errors++;
-      end else begin
-        $readmemh({tvdir, "/input.txt"},  g_input);
-        $readmemh({tvdir, "/input2.txt"}, g_input2);
-        cosim_keygen2(KEYGEN_SEED);
-        begin int fd;
-          fd = $fopen({tvdir, "/hw_s_tern.txt"}, "w");
-          if (fd) begin for (int j = 0; j < N; j++) $fdisplay(fd, "%0d", ck_s_tern[j]); $fclose(fd); end
-        end
-        dump_hex("hw_s_ntt.txt",    ck_s_ntt,  N);   // q0 keygen cross-check
-        dump_hex("hw_s_ntt_q1.txt", ck_s_ntt1, N);   // q1 keygen cross-check
-        cosim_encrypt2(g_input, A_SEED, ERR_SEED);
-        dump_hex("ct_c0_q0.txt", c0_q,  N); dump_hex("ct_c1_q0.txt", c1_q,  N);
-        dump_hex("ct_c0_q1.txt", c0_l1, N); dump_hex("ct_c1_q1.txt", c1_l1, N);
-        cosim_encode_pt2(g_input2, ERR_SEED2);
-        dump_hex("pt_q0.txt", pt_q0, N); dump_hex("pt_q1.txt", pt_q1, N);
-        $display("  [phase1] dumped 2-limb ct + pt to %s", tvdir);
-      end
-      if (errors == 0) $display("RESULT: PASS");
-      else             $display("RESULT: FAIL (%0d mismatches)", errors);
-      $finish;
-    end
-
-    // ---- Rung 7b-rescale phase 2: decrypt the rescaled product @q0 -----------
-    if ($test$plusargs("RESCDEC")) begin
-      $display("== Rung 7b-rescale phase 2: decrypt rescaled pt*ct @q0, N=%0d (SCHEME=%0d) ==", N, SCHEME);
-      if (SCHEME != 1) begin
-        $display("FAIL: +RESCDEC requires +define+FHE_SK_HW (SCHEME=1)"); errors++;
-      end else begin
-        int i, i2f; real ar, ai, br, bi;
-        $readmemh({tvdir, "/input.txt"},  g_input);
-        $readmemh({tvdir, "/input2.txt"}, g_input2);
-        $readmemh({tvdir, "/prod_c0.txt"}, g_sum_c0);   // rescaled product @q0
-        $readmemh({tvdir, "/prod_c1.txt"}, g_sum_c1);
-        // After rescale the q0 scale is Delta^2/q1; the decode divides by twice the
-        // single-message exponent minus log2(q1). Residual 2^47/q1 ~ 1+1e-7.
-        i2f = -(2*(RESC_NET + LOGN) - LOG2_Q1);
-        void'($value$plusargs("I2FSCALE=%d", i2f));
-        cosim_keygen2(KEYGEN_SEED);                  // re-derive sk_mont@q0 (s never on disk)
-        to_q(c0_q, g_sum_c0, N); to_q(c1_q, g_sum_c1, N);
-        cosim_decrypt(c0_q, c1_q, i2f, reco_q);      // decrypt at q0 with ck_sk_mont (=q0)
-        for (i = 0; i < N/2; i++) begin
-          ar = $bitstoreal(g_input [2*i]); ai = $bitstoreal(g_input [2*i+1]);
-          br = $bitstoreal(g_input2[2*i]); bi = $bitstoreal(g_input2[2*i+1]);
-          g_sum_exp[2*i]   = $realtobits(ar*br - ai*bi);
-          g_sum_exp[2*i+1] = $realtobits(ar*bi + ai*br);
-        end
-        $display("  [phase2] I2F decode scale = %0d", i2f);
-        fft_abs_floor = 2.0e-3;
-        check_fft(reco_q, g_sum_exp, N, "cosim pt*ct+rescale (recovered vs m1(.)m2)", 1.0e-2);
-      end
-      if (errors == 0) $display("RESULT: PASS");
-      else             $display("RESULT: FAIL (%0d mismatches)", errors);
-      $finish;
-    end
+`endif
 
     $readmemh({tvdir, "/input.txt"},            g_input);
     $readmemh({tvdir, "/pk_0_mod0.txt"},        g_pk0);
