@@ -34,6 +34,17 @@ module tb_ckks_roundtrip;
   localparam int     QM0              = 'h9;        // q0 = 2^46 - 9*2^24 + 1
   localparam int     CURRENT_K0       = 0;          // log_q index (0 -> 46-bit)
   localparam int     MODSEL0          = 0;          // ROM modulus offset
+  // Rung 7b-rescale: the second RNS limb q1 = 2^47 - 1*2^24 + 1 = 0x7fffff000001
+  // (moduli[1] in GenerateConstantsROM.py; k=1, qm=1, ROM offset 1).
+  localparam int     QM1              = 'h1;
+  localparam int     CURRENT_K1       = 1;
+  localparam int     MODSEL1          = 1;
+  longint q1v;                                      // q1 value (set in initial)
+  // 2-limb pt*ct uses a LARGER net scale than single-modulus: the product lives
+  // in {q0,q1} (~2^93), so net 2^34 is fine, and after rescale (/q1) the q0 scale
+  // is ~2^(2*34-47)=2^21 -- ample precision at both N.
+  localparam int     RESC_NET         = 34;
+  localparam int     LOG2_Q1          = 47;         // round(log2(q1)); rescale residual 2^47/q1 ~ 1+1e-7
   // pk1 seed for modulus 0 (pk1_seeds.txt[0]); errors use ERROR_POLYS_SEED.
   longint PK1_SEED0;
 
@@ -247,13 +258,16 @@ module tb_ckks_roundtrip;
       $display("PASS %s (%0d words, |delta|<=%0d)", name, N, dmax);
   endtask
 
+  // absolute-error floor for close() on tiny slots; raised for pt*ct products
+  // (combined per-operand noise on a degree-1 product). Default = round-trip value.
+  real fft_abs_floor = 1.0e-4;
   // double comparison with relative tolerance (port of compareDouble)
   function automatic bit close(input longint ab, input longint bb, input real eps);
     real a = $bitstoreal(ab);
     real b = $bitstoreal(bb);
     real t, d;
     d = a - b; if (d < 0.0) d = -d;
-    if (d < 1.0e-4) close = 1;              // absolute floor (CKKS noise on tiny slots)
+    if (d < fft_abs_floor) close = 1;       // absolute floor (CKKS noise on tiny slots)
     else if (a == 0.0 || b == 0.0) close = (d < eps);
     else begin t = b/a - 1.0; if (t < 0.0) t = -t; close = (t < eps); end
   endfunction
@@ -404,6 +418,34 @@ module tb_ckks_roundtrip;
   localparam longint KEYGEN_SEED = 64'hA105_BEEF_0006_A001;
   localparam longint ERR_SEED    = 64'h2350_e171_5239_2f72;  // same CBD error seed as 5a
   localparam longint A_SEED      = 64'h0006_A002_C0FF_EE77;
+  // Rung 7 cosim: a second ciphertext needs an independent fresh (a, e0).
+  localparam longint A_SEED2     = 64'h0006_A003_FEED_FACE;
+  localparam longint ERR_SEED2   = 64'h7331_2350_e171_5239;
+  // Rung 7b pt*ct uses a LOWER encode net-scale: the product doubles the scale
+  // (Delta -> Delta^2) and the unnormalized encode-FFT inflates coeffs by ~sqrt(N),
+  // so net 2^17 (the round-trip value) overflows q0. net=12 fits @N=256 but the
+  // MAX of N=8192 product coeffs still grazes q0/2 (extreme-value ~4 sigma above
+  // typical -> a few wrap -> corrupts the decode). net=10 gives ~4 bits margin at
+  // both N; decode noise ~ err/(2^net*sqrt(N)) stays ~1e-4 (the 1/sqrt(N) helps).
+  localparam int     MUL_NET     = 10;
+
+  // ---- Rung 7 cosim (client<->server) state ---------------------------------
+  longint g_input2  [0:N];   // second plaintext m2 (input2.txt)
+  longint g_sum_c0  [0:N];   // server-returned sum ciphertext c0 (sum_c0.txt)
+  longint g_sum_c1  [0:N];   // server-returned sum ciphertext c1 (sum_c1.txt)
+  longint g_sum_exp [0:N];   // expected recovered slots = m1 + m2 (doubles)
+  int     cosim_net;         // encode net-scale exponent (2^cosim_net); 7a add=RT_SCALE-LOGN
+  longint ck_sk_mont [];     // resident sk (Montgomery), from cosim_keygen
+  longint ck_s_tern  [];     // sampled ternary s (for the keygen cross-check)
+  longint ck_s_ntt   [];     // HW forward-NTT of s (standard domain)
+  longint reco_q     [];     // recovered slots out of cosim_decrypt
+  // Rung 7b-rescale 2-limb state (limb0=q0, limb1=q1)
+  longint ck_sk_mont1[];     // sk_mont @ q1
+  longint ck_s_ntt1  [];     // HW forward-NTT of s @ q1
+  longint c0_l1 [];          // ciphertext c0 @ q1
+  longint c1_l1 [];          // ciphertext c1 @ q1
+  longint pt_q0 [];          // plaintext pt(m2) @ q0
+  longint pt_q1 [];          // plaintext pt(m2) @ q1
 
   // ====================================================================
   // Rung 6: real sk keygen + the sk-scheme on the DEDICATED secret-key PWM
@@ -537,6 +579,245 @@ module tb_ckks_roundtrip;
     check_fft(c1_q, g_input, N, "sk-scheme-HW roundtrip (recovered vs input)", 1.0e-3);
   endtask
 
+  // ====================================================================
+  // Rung 7 cosim: streamlined sk-scheme helpers (PWMSk path, SCHEME=1).
+  // Extracted from run_skscheme_hw so phase 1 (+ENCRYPT) and phase 2
+  // (+DECRYPT) can keygen/encrypt/decrypt across two separate sim runs.
+  // sk (the secret) NEVER touches disk -- phase 2 re-derives it from the
+  // same KEYGEN_SEED; only the *public* ciphertext polys are dumped.
+  // ====================================================================
+  task automatic dump_hex(input string fname, input longint p[], input int num);
+    int fd, i;
+    fd = $fopen({tvdir, "/", fname}, "w");
+    if (fd == 0) begin $display("FAIL: cannot open %s for write", fname); errors++; return; end
+    for (i = 0; i < num; i++) $fdisplay(fd, "%h", p[i]);
+    $fclose(fd);
+  endtask
+
+  // KEYGEN: ternary s -> RNS-expand -> fwd NTT (s_ntt, standard) ->
+  // Montgomery-convert sk_mont = MontMul(s_ntt, R^2). Leaves ck_sk_mont set.
+  task automatic cosim_keygen(input longint keygen_seed);
+    int i; longint r2; logic [127:0] rr;
+    rr = (128'd1 << 72) % q0; rr = (rr * rr) % q0; r2 = longint'(rr);
+    rns_scale = RT_SCALE - 52 - 1023 - LOGN; if (rns_scale < 0) rns_scale += 4096;
+    zero_q = new[N]; for (i = 0; i < N; i++) zero_q[i] = 0;
+    send64(zero_q, N, 1'b0, FFT_BRAM_EXPAND_ID);
+    enc_w = '{ ins_fft(1'b1) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0);
+    exe_ins(keygen_seed);                       // sample ternary s into the v lane
+    begin longint eb[]; int npos=0, nneg=0, nz=0;
+      receive64(eb, N, 4 /*ERROR_BRAM_ID*/);
+      ck_s_tern = new[N];
+      for (i = 0; i < N; i++) case ((eb[i] >> 12) & 'h3)
+        2'd0: begin ck_s_tern[i] =  0; nz++;   end
+        2'd1: begin ck_s_tern[i] = +1; npos++; end
+        default: begin ck_s_tern[i] = -1; nneg++; end
+      endcase
+      $display("  [keygen] ternary s: %0d zero, %0d +1, %0d -1 (N=%0d)", nz, npos, nneg, N);
+    end
+    enc_w = '{ ins_rns(rns_scale, CURRENT_K0, MODSEL0, QM0) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    enc_w = '{ ins_ntt(1'b0, CURRENT_K0, MODSEL0, QM0) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    receive64(ck_s_ntt, N, NTT_V_BRAM_ID);
+    begin longint r2_q[]; r2_q = new[N];
+      for (i = 0; i < N; i++) r2_q[i] = r2;
+      send64(ck_s_ntt, N, 1'b0, NTT_V_BRAM_ID);
+      send64(r2_q,     N, 1'b0, NTT_KEY_BRAM_ID);
+      send64(zero_q,   N, 1'b0, NTT_MSG_BRAM_ID);
+    end
+    enc_w = '{ ins_pwm_sk(CURRENT_K0, QM0, 1'b0, 1'b0) };  // sk_mont = MontMul(s_ntt, R^2)
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    receive64(ck_sk_mont, N, NTT_MSG_BRAM_ID);
+    $display("  [keygen] s_ntt[0]=%h sk_mont[0]=%h", ck_s_ntt[0], ck_sk_mont[0]);
+  endtask
+
+  // ENCRYPT (sk-scheme): c0 = -(a*s) + m + e0, c1 = a.  ck_sk_mont must be set.
+  task automatic cosim_encrypt(input longint msg[0:N], input longint a_seed,
+                               input longint err_seed, output longint c0o[], output longint c1o[]);
+    int i; longint a_chk[];
+    rns_scale = cosim_net - 52 - 1023; if (rns_scale < 0) rns_scale += 4096;
+    to_q(plain_q, msg, N);
+    send64(plain_q, N, 1'b0, FFT_BRAM_EXPAND_ID);
+    enc_w = '{ ins_fft(1'b1) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(err_seed);
+    enc_w = '{ ins_rns(rns_scale, CURRENT_K0, MODSEL0, QM0) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    enc_w = '{ ins_ntt(1'b0, CURRENT_K0, MODSEL0, QM0) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0);
+    exe_ins(a_seed);                            // sample fresh uniform a into FFT_IM
+    receive64(a_chk, N, 7 /*FFT_IM*/);          // for the c1=a passthrough check only
+    send64(ck_sk_mont, N, 1'b0, NTT_V_BRAM_ID); // sk resident multiplicand
+    enc_w = '{ ins_pwm_sk(CURRENT_K0, QM0, 1'b1, 1'b1) };  // negate=1, enc=1: b <- FFT_IM(a)
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    receive64(c0o, N, NTT_MSG_BRAM_ID);
+    receive64(c1o, N, NTT_KEY_BRAM_ID);
+    begin int nd = 0;
+      for (i = 0; i < N; i++) if (c1o[i] !== a_chk[i]) nd++;
+      if (nd) begin $display("FAIL c1=a passthrough: %0d/%0d differ", nd, N); errors++; end
+      else        $display("PASS c1=a passthrough (%0d coeffs)", N);
+    end
+  endtask
+
+  // DECRYPT (sk-scheme): m ~= c0 + c1*s -> iNTT -> I2F -> iFFT -> PROJECT.
+  // i2f_scale is the (negative) log2 decode scale: -RT_SCALE for a fresh ct
+  // (scale Delta), a larger magnitude for a pt*ct product (scale Delta^2).
+  task automatic cosim_decrypt(input longint c0i[], input longint c1i[], input int i2f_scale,
+                               output longint reco[]);
+    int i;
+    send64(c0i, N, 1'b0, NTT_MSG_BRAM_ID);
+    send64(c1i, N, 1'b0, NTT_KEY_BRAM_ID);      // c1 = a (loaded ciphertext)
+    send64(ck_sk_mont, N, 1'b0, NTT_V_BRAM_ID); // sk resident multiplicand
+    enc_w = '{ ins_pwm_sk(CURRENT_K0, QM0, 1'b0, 1'b0) };  // negate=0, enc=0: m = c0 + s*c1
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    enc_w = '{ ins_ntt(1'b1, CURRENT_K0, MODSEL0, QM0) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    enc_w = '{ ins_i2f(i2f_scale, CURRENT_K0, QM0) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    enc_w = '{ ins_fft(1'b0) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    enc_w = '{ ins_project() };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    begin longint tmp[]; receive64(tmp, 2*N, FFT_BRAM_ID);
+      reco = new[N]; for (i = 0; i < N; i++) reco[i] = tmp[i+N];
+    end
+  endtask
+
+  // ENCODE-only: m2 -> pt(m2) in the NTT/eval domain (standard, mod q0), the
+  // *plaintext* the server multiplies the ciphertext by. Same FFT->RNS->NTT as
+  // encrypt's message path, but stops before the key/PWM (so no -(a*s) term).
+  // A tiny e0 rides along (sampled during the FFT) -- negligible vs Delta.
+  task automatic cosim_encode_pt(input longint msg[0:N], input longint seed, output longint pt[]);
+    rns_scale = cosim_net - 52 - 1023; if (rns_scale < 0) rns_scale += 4096;
+    to_q(plain_q, msg, N);
+    send64(plain_q, N, 1'b0, FFT_BRAM_EXPAND_ID);
+    enc_w = '{ ins_fft(1'b1) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(seed);
+    enc_w = '{ ins_rns(rns_scale, CURRENT_K0, MODSEL0, QM0) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    enc_w = '{ ins_ntt(1'b0, CURRENT_K0, MODSEL0, QM0) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    receive64(pt, N, NTT_MSG_BRAM_ID);          // eval-domain encoded m2
+  endtask
+
+  // ====================================================================
+  // Rung 7b-rescale: 2-limb (q0,q1) keygen / encrypt / encode for a genuine
+  // RNS ciphertext the server can pt*ct + RESCALE. The SAME integer polys
+  // (s, a, e0, m) are reduced to both moduli: s sampled once -> NTT@q0 & @q1;
+  // a/e0/m from a single FFT, RNS'd to each limb (the FFT + error banks persist
+  // across the two limb passes, so e0/m are identical integers). a's RNS
+  // consistency (a<q0<q1 => a@q1==a@q0) is checked, not assumed.
+  // ====================================================================
+  // One keygen limb: ternary v (already sampled, resident in the error bank) ->
+  // RNS@qi -> fwd NTT@qi = s_ntt (standard) -> Montgomery-convert sk_mont.
+  task automatic kg_limb(input int ck, input int ms, input int qm, input longint qv,
+                         output longint skm[], output longint sntt[]);
+    int i; longint r2; logic [127:0] rr;
+    rr = (128'd1 << 72) % qv; rr = (rr*rr) % qv; r2 = longint'(rr);
+    enc_w = '{ ins_rns(rns_scale, ck, ms, qm) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    enc_w = '{ ins_ntt(1'b0, ck, ms, qm) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    receive64(sntt, N, NTT_V_BRAM_ID);
+    begin longint r2_q[]; r2_q = new[N];
+      for (i = 0; i < N; i++) r2_q[i] = r2;
+      send64(sntt,  N, 1'b0, NTT_V_BRAM_ID);
+      send64(r2_q,  N, 1'b0, NTT_KEY_BRAM_ID);
+      send64(zero_q, N, 1'b0, NTT_MSG_BRAM_ID);
+    end
+    enc_w = '{ ins_pwm_sk(ck, qm, 1'b0, 1'b0) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    receive64(skm, N, NTT_MSG_BRAM_ID);
+  endtask
+
+  task automatic cosim_keygen2(input longint keygen_seed);
+    int i;
+    cosim_net = RESC_NET;
+    rns_scale = cosim_net - 52 - 1023; if (rns_scale < 0) rns_scale += 4096;
+    zero_q = new[N]; for (i = 0; i < N; i++) zero_q[i] = 0;
+    send64(zero_q, N, 1'b0, FFT_BRAM_EXPAND_ID);
+    enc_w = '{ ins_fft(1'b1) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0);
+    $display("  [keygen2] sample ternary s"); exe_ins(keygen_seed);
+    begin longint eb[]; int npos=0, nneg=0, nz=0;
+      receive64(eb, N, 4 /*ERROR_BRAM_ID*/);
+      ck_s_tern = new[N];
+      for (i = 0; i < N; i++) case ((eb[i] >> 12) & 'h3)
+        2'd0: begin ck_s_tern[i] =  0; nz++;   end
+        2'd1: begin ck_s_tern[i] = +1; npos++; end
+        default: begin ck_s_tern[i] = -1; nneg++; end
+      endcase
+      $display("  [keygen2] ternary s: %0d zero, %0d +1, %0d -1", nz, npos, nneg);
+    end
+    kg_limb(CURRENT_K0, MODSEL0, QM0, q0,  ck_sk_mont,  ck_s_ntt);   // limb0 @q0
+    kg_limb(CURRENT_K1, MODSEL1, QM1, q1v, ck_sk_mont1, ck_s_ntt1);  // limb1 @q1
+    $display("  [keygen2] sk_mont@q0[0]=%h  sk_mont@q1[0]=%h", ck_sk_mont[0], ck_sk_mont1[0]);
+  endtask
+
+  // 2-limb sk-encrypt: c0 = -(a*s)+m+e0, c1 = a, at both q0 and q1. FFT once
+  // (samples e0); per-limb RNS/NTT/PWM. a is sampled at each limb with the SAME
+  // seed -- checked equal (a<q0<q1 => RNS-consistent) so the ct is a valid 2-limb
+  // RNS object. Outputs c0_q/c1_q (@q0) + c0_l1/c1_l1 (@q1).
+  task automatic cosim_encrypt2(input longint msg[0:N], input longint a_seed, input longint err_seed);
+    int i; longint a0[], a1[];
+    cosim_net = RESC_NET;
+    rns_scale = cosim_net - 52 - 1023; if (rns_scale < 0) rns_scale += 4096;
+    to_q(plain_q, msg, N);
+    send64(plain_q, N, 1'b0, FFT_BRAM_EXPAND_ID);
+    enc_w = '{ ins_fft(1'b1) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(err_seed);
+    // ---- limb 0 @q0 ----
+    enc_w = '{ ins_rns(rns_scale, CURRENT_K0, MODSEL0, QM0) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    enc_w = '{ ins_ntt(1'b0, CURRENT_K0, MODSEL0, QM0) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(a_seed);
+    receive64(a0, N, 7 /*FFT_IM*/);
+    send64(ck_sk_mont, N, 1'b0, NTT_V_BRAM_ID);
+    enc_w = '{ ins_pwm_sk(CURRENT_K0, QM0, 1'b1, 1'b1) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    receive64(c0_q, N, NTT_MSG_BRAM_ID);
+    receive64(c1_q, N, NTT_KEY_BRAM_ID);
+    // ---- limb 1 @q1 (reuse the FFT + e0 banks; same a_seed) ----
+    enc_w = '{ ins_rns(rns_scale, CURRENT_K1, MODSEL1, QM1) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    enc_w = '{ ins_ntt(1'b0, CURRENT_K1, MODSEL1, QM1) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(a_seed);
+    receive64(a1, N, 7 /*FFT_IM*/);
+    send64(ck_sk_mont1, N, 1'b0, NTT_V_BRAM_ID);
+    enc_w = '{ ins_pwm_sk(CURRENT_K1, QM1, 1'b1, 1'b1) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    receive64(c0_l1, N, NTT_MSG_BRAM_ID);
+    receive64(c1_l1, N, NTT_KEY_BRAM_ID);
+    // INFO: a@q1 vs a@q0 (same seed). They need NOT match -- a per-limb `a` is
+    // fine because `a` CANCELS in decryption (c0@qi + s*c1@qi = m+e0 holds at each
+    // limb independently, since m/e0/s ARE RNS-consistent), and rescale is linear
+    // so rescale(c0)+s*rescale(c1) ~ rescale(c0+s*c1) = rescale(pt*m). Only the
+    // *message* must be RNS-consistent across limbs, not the ciphertext randomness.
+    begin int nd = 0; for (i = 0; i < N; i++) if (c1_l1[i] !== c1_q[i]) nd++;
+      $display("  [enc2] a@q1 vs a@q0 (same seed): %0d/%0d differ (benign -- a cancels in decrypt)", nd, N);
+    end
+  endtask
+
+  // 2-limb encode of pt(m2): same FFT once, RNS/NTT per limb -> pt_q0, pt_q1.
+  task automatic cosim_encode_pt2(input longint msg[0:N], input longint seed);
+    cosim_net = RESC_NET;
+    rns_scale = cosim_net - 52 - 1023; if (rns_scale < 0) rns_scale += 4096;
+    to_q(plain_q, msg, N);
+    send64(plain_q, N, 1'b0, FFT_BRAM_EXPAND_ID);
+    enc_w = '{ ins_fft(1'b1) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(seed);
+    enc_w = '{ ins_rns(rns_scale, CURRENT_K0, MODSEL0, QM0) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    enc_w = '{ ins_ntt(1'b0, CURRENT_K0, MODSEL0, QM0) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    receive64(pt_q0, N, NTT_MSG_BRAM_ID);
+    enc_w = '{ ins_rns(rns_scale, CURRENT_K1, MODSEL1, QM1) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    enc_w = '{ ins_ntt(1'b0, CURRENT_K1, MODSEL1, QM1) };
+    build_ins_buf(enc_w); send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0); exe_ins(64'd0);
+    receive64(pt_q1, N, NTT_MSG_BRAM_ID);
+  endtask
+
   // inverse-NTT identity probe: fwd-NTT then inv-NTT a random poly should
   // recover it (INTTScale supplies 1/N). Isolates the inverse NTT at small N.
   task automatic identity_probe();
@@ -580,6 +861,7 @@ module tb_ckks_roundtrip;
   initial begin
     roundtrip = $test$plusargs("ROUNDTRIP");
     q0 = (64'd1 << 46) - (QM0 << 24) + 1;
+    q1v = (64'd1 << 47) - (QM1 << 24) + 1;   // 0x7fffff000001
     if ($test$plusargs("IDENTITY")) begin
       if (!$value$plusargs("TVDIR=%s", tvdir)) tvdir = ".";
       control_high_word = 1; repeat (5) @(posedge clk);
@@ -606,6 +888,182 @@ module tb_ckks_roundtrip;
     if ($test$plusargs("SKHW")) begin
       $display("== Rung 6: sk keygen + secret-key scheme on PWMSk, N=%0d (SCHEME=%0d) ==", N, SCHEME);
       run_skscheme_hw();
+      if (errors == 0) $display("RESULT: PASS");
+      else             $display("RESULT: FAIL (%0d mismatches)", errors);
+      $finish;
+    end
+
+    // ---- Rung 7a cosim phase 1: keygen + encrypt m1, m2 (dump public cts) ----
+    if ($test$plusargs("ENCRYPT")) begin
+      $display("== Rung 7a phase 1: keygen + encrypt m1,m2, N=%0d (SCHEME=%0d) ==", N, SCHEME);
+      if (SCHEME != 1) begin
+        $display("FAIL: +ENCRYPT requires +define+FHE_SK_HW (SCHEME=1)"); errors++;
+      end else begin
+        cosim_net = RT_SCALE - LOGN;   // 7a add: scale Delta (round-trip value)
+        $readmemh({tvdir, "/input.txt"},  g_input);
+        $readmemh({tvdir, "/input2.txt"}, g_input2);
+        cosim_keygen(KEYGEN_SEED);
+        // dump the keygen cross-check material (s never leaves as the resident key;
+        // these are only for the offline NTT-oracle check, identical to Rung 6).
+        // hw_s_tern is DECIMAL (-1/0/+1) per check_keygen.py; hw_s_ntt is hex.
+        begin int fd;
+          fd = $fopen({tvdir, "/hw_s_tern.txt"}, "w");
+          if (fd) begin for (int j = 0; j < N; j++) $fdisplay(fd, "%0d", ck_s_tern[j]); $fclose(fd); end
+        end
+        dump_hex("hw_s_ntt.txt", ck_s_ntt, N);
+        cosim_encrypt(g_input,  A_SEED,  ERR_SEED,  c0_q, c1_q);
+        dump_hex("ct1_c0.txt", c0_q, N); dump_hex("ct1_c1.txt", c1_q, N);
+        cosim_encrypt(g_input2, A_SEED2, ERR_SEED2, c0_q, c1_q);
+        dump_hex("ct2_c0.txt", c0_q, N); dump_hex("ct2_c1.txt", c1_q, N);
+        $display("  [phase1] dumped ct1_{c0,c1}.txt, ct2_{c0,c1}.txt to %s", tvdir);
+      end
+      if (errors == 0) $display("RESULT: PASS");
+      else             $display("RESULT: FAIL (%0d mismatches)", errors);
+      $finish;
+    end
+
+    // ---- Rung 7a cosim phase 2: load server sum ct, decrypt, check ~ m1+m2 ----
+    if ($test$plusargs("DECRYPT")) begin
+      $display("== Rung 7a phase 2: decrypt server sum ct, N=%0d (SCHEME=%0d) ==", N, SCHEME);
+      if (SCHEME != 1) begin
+        $display("FAIL: +DECRYPT requires +define+FHE_SK_HW (SCHEME=1)"); errors++;
+      end else begin
+        int i;
+        cosim_net = RT_SCALE - LOGN;   // 7a add: scale Delta (round-trip value)
+        $readmemh({tvdir, "/input.txt"},  g_input);
+        $readmemh({tvdir, "/input2.txt"}, g_input2);
+        $readmemh({tvdir, "/sum_c0.txt"}, g_sum_c0);
+        $readmemh({tvdir, "/sum_c1.txt"}, g_sum_c1);
+        cosim_keygen(KEYGEN_SEED);                 // re-derive sk (same seed; never on disk)
+        to_q(c0_q, g_sum_c0, N); to_q(c1_q, g_sum_c1, N);
+        cosim_decrypt(c0_q, c1_q, -RT_SCALE, reco_q);  // ct+ct stays at scale Delta
+        for (i = 0; i < N; i++)
+          g_sum_exp[i] = $realtobits($bitstoreal(g_input[i]) + $bitstoreal(g_input2[i]));
+        check_fft(reco_q, g_sum_exp, N, "cosim ct+ct (recovered vs m1+m2)", 1.0e-3);
+      end
+      if (errors == 0) $display("RESULT: PASS");
+      else             $display("RESULT: FAIL (%0d mismatches)", errors);
+      $finish;
+    end
+
+    // ---- Rung 7b cosim phase 1: keygen + encrypt m1 + encode m2->pt ----------
+    if ($test$plusargs("PMULENC")) begin
+      $display("== Rung 7b phase 1: keygen + encrypt m1 + encode pt(m2), N=%0d (SCHEME=%0d) ==", N, SCHEME);
+      if (SCHEME != 1) begin
+        $display("FAIL: +PMULENC requires +define+FHE_SK_HW (SCHEME=1)"); errors++;
+      end else begin
+        cosim_net = MUL_NET;           // 7b pt*ct: lower scale so the product fits q0
+        $readmemh({tvdir, "/input.txt"},  g_input);
+        $readmemh({tvdir, "/input2.txt"}, g_input2);
+        cosim_keygen(KEYGEN_SEED);
+        begin int fd;
+          fd = $fopen({tvdir, "/hw_s_tern.txt"}, "w");
+          if (fd) begin for (int j = 0; j < N; j++) $fdisplay(fd, "%0d", ck_s_tern[j]); $fclose(fd); end
+        end
+        dump_hex("hw_s_ntt.txt", ck_s_ntt, N);
+        cosim_encrypt(g_input, A_SEED, ERR_SEED, c0_q, c1_q);  // ct = Enc(m1)
+        dump_hex("ct_c0.txt", c0_q, N); dump_hex("ct_c1.txt", c1_q, N);
+        cosim_encode_pt(g_input2, ERR_SEED2, reco_q);          // pt = Encode(m2)
+        dump_hex("pt.txt", reco_q, N);
+        $display("  [phase1] dumped ct_{c0,c1}.txt + pt.txt to %s", tvdir);
+      end
+      if (errors == 0) $display("RESULT: PASS");
+      else             $display("RESULT: FAIL (%0d mismatches)", errors);
+      $finish;
+    end
+
+    // ---- Rung 7b cosim phase 2: load pt*ct product, decrypt, check ~ m1(.)m2 -
+    if ($test$plusargs("PMULDEC")) begin
+      $display("== Rung 7b phase 2: decrypt pt*ct product, N=%0d (SCHEME=%0d) ==", N, SCHEME);
+      if (SCHEME != 1) begin
+        $display("FAIL: +PMULDEC requires +define+FHE_SK_HW (SCHEME=1)"); errors++;
+      end else begin
+        int i, i2f; real ar, ai, br, bi;
+        cosim_net = MUL_NET;
+        $readmemh({tvdir, "/input.txt"},  g_input);
+        $readmemh({tvdir, "/input2.txt"}, g_input2);
+        $readmemh({tvdir, "/prod_c0.txt"}, g_sum_c0);
+        $readmemh({tvdir, "/prod_c1.txt"}, g_sum_c1);
+        // pt*ct doubles the scale (Delta -> Delta^2): the decode divides by twice
+        // the single-message exponent. Single recovers at -(net+LOGN) (=-RT_SCALE);
+        // the product recovers at exactly 2x that (empirically confirmed: a -(2net+LOGN)
+        // guess left a clean residual factor of 2^LOGN). Overridable with +I2FSCALE.
+        i2f = -2*(MUL_NET + LOGN);
+        void'($value$plusargs("I2FSCALE=%d", i2f));
+        cosim_keygen(KEYGEN_SEED);
+        to_q(c0_q, g_sum_c0, N); to_q(c1_q, g_sum_c1, N);
+        cosim_decrypt(c0_q, c1_q, i2f, reco_q);
+        // expected = complex slotwise product (slots are re/im interleaved)
+        for (i = 0; i < N/2; i++) begin
+          ar = $bitstoreal(g_input [2*i]); ai = $bitstoreal(g_input [2*i+1]);
+          br = $bitstoreal(g_input2[2*i]); bi = $bitstoreal(g_input2[2*i+1]);
+          g_sum_exp[2*i]   = $realtobits(ar*br - ai*bi);
+          g_sum_exp[2*i+1] = $realtobits(ar*bi + ai*br);
+        end
+        $display("  [phase2] I2F decode scale = %0d", i2f);
+        fft_abs_floor = 2.0e-3;   // product of two O(1) operands: looser abs floor on cancellation slots
+        check_fft(reco_q, g_sum_exp, N, "cosim pt*ct (recovered vs m1(.)m2)", 1.0e-2);
+      end
+      if (errors == 0) $display("RESULT: PASS");
+      else             $display("RESULT: FAIL (%0d mismatches)", errors);
+      $finish;
+    end
+
+    // ---- Rung 7b-rescale phase 1: 2-limb keygen + encrypt m1 + encode pt(m2) --
+    if ($test$plusargs("RESCENC")) begin
+      $display("== Rung 7b-rescale phase 1: 2-limb keygen+encrypt+encode, N=%0d (SCHEME=%0d) ==", N, SCHEME);
+      if (SCHEME != 1) begin
+        $display("FAIL: +RESCENC requires +define+FHE_SK_HW (SCHEME=1)"); errors++;
+      end else begin
+        $readmemh({tvdir, "/input.txt"},  g_input);
+        $readmemh({tvdir, "/input2.txt"}, g_input2);
+        cosim_keygen2(KEYGEN_SEED);
+        begin int fd;
+          fd = $fopen({tvdir, "/hw_s_tern.txt"}, "w");
+          if (fd) begin for (int j = 0; j < N; j++) $fdisplay(fd, "%0d", ck_s_tern[j]); $fclose(fd); end
+        end
+        dump_hex("hw_s_ntt.txt",    ck_s_ntt,  N);   // q0 keygen cross-check
+        dump_hex("hw_s_ntt_q1.txt", ck_s_ntt1, N);   // q1 keygen cross-check
+        cosim_encrypt2(g_input, A_SEED, ERR_SEED);
+        dump_hex("ct_c0_q0.txt", c0_q,  N); dump_hex("ct_c1_q0.txt", c1_q,  N);
+        dump_hex("ct_c0_q1.txt", c0_l1, N); dump_hex("ct_c1_q1.txt", c1_l1, N);
+        cosim_encode_pt2(g_input2, ERR_SEED2);
+        dump_hex("pt_q0.txt", pt_q0, N); dump_hex("pt_q1.txt", pt_q1, N);
+        $display("  [phase1] dumped 2-limb ct + pt to %s", tvdir);
+      end
+      if (errors == 0) $display("RESULT: PASS");
+      else             $display("RESULT: FAIL (%0d mismatches)", errors);
+      $finish;
+    end
+
+    // ---- Rung 7b-rescale phase 2: decrypt the rescaled product @q0 -----------
+    if ($test$plusargs("RESCDEC")) begin
+      $display("== Rung 7b-rescale phase 2: decrypt rescaled pt*ct @q0, N=%0d (SCHEME=%0d) ==", N, SCHEME);
+      if (SCHEME != 1) begin
+        $display("FAIL: +RESCDEC requires +define+FHE_SK_HW (SCHEME=1)"); errors++;
+      end else begin
+        int i, i2f; real ar, ai, br, bi;
+        $readmemh({tvdir, "/input.txt"},  g_input);
+        $readmemh({tvdir, "/input2.txt"}, g_input2);
+        $readmemh({tvdir, "/prod_c0.txt"}, g_sum_c0);   // rescaled product @q0
+        $readmemh({tvdir, "/prod_c1.txt"}, g_sum_c1);
+        // After rescale the q0 scale is Delta^2/q1; the decode divides by twice the
+        // single-message exponent minus log2(q1). Residual 2^47/q1 ~ 1+1e-7.
+        i2f = -(2*(RESC_NET + LOGN) - LOG2_Q1);
+        void'($value$plusargs("I2FSCALE=%d", i2f));
+        cosim_keygen2(KEYGEN_SEED);                  // re-derive sk_mont@q0 (s never on disk)
+        to_q(c0_q, g_sum_c0, N); to_q(c1_q, g_sum_c1, N);
+        cosim_decrypt(c0_q, c1_q, i2f, reco_q);      // decrypt at q0 with ck_sk_mont (=q0)
+        for (i = 0; i < N/2; i++) begin
+          ar = $bitstoreal(g_input [2*i]); ai = $bitstoreal(g_input [2*i+1]);
+          br = $bitstoreal(g_input2[2*i]); bi = $bitstoreal(g_input2[2*i+1]);
+          g_sum_exp[2*i]   = $realtobits(ar*br - ai*bi);
+          g_sum_exp[2*i+1] = $realtobits(ar*bi + ai*br);
+        end
+        $display("  [phase2] I2F decode scale = %0d", i2f);
+        fft_abs_floor = 2.0e-3;
+        check_fft(reco_q, g_sum_exp, N, "cosim pt*ct+rescale (recovered vs m1(.)m2)", 1.0e-2);
+      end
       if (errors == 0) $display("RESULT: PASS");
       else             $display("RESULT: FAIL (%0d mismatches)", errors);
       $finish;

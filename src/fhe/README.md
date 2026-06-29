@@ -6,7 +6,7 @@ are two test surfaces:
 | Where | What | How it's tested |
 |---|---|---|
 | `rtl/`, `tb/` | **Stage-0 FHE block** — a behavioral CKKS accelerator integrated into Caliptra as an AHB-Lite responder (the integration shell). | a fast standalone Verilator unit TB + a firmware-driven smoke test on the full SoC |
-| `aloha/` | **Aloha-HE bring-up (Stage A′) + secret-key scheme (Rung 6)** — the real CKKS datapath (vendored `flokrieger/Aloha-HE`), brought up engine-by-engine in standalone Verilator, parameterized over the ring dimension `N`, then composed end-to-end with a real keygen + a dedicated secret-key PWM (`rtl/PWMSk.sv`). | per-engine golden-vector TBs (§A.1–A.2) + a composed-core round-trip / secret-key-scheme TB (§A.3), at `N=8192` and small `N` |
+| `aloha/` | **Aloha-HE bring-up (Stage A′) + secret-key scheme (Rung 6) + client↔server cosim (Rung 7)** — the real CKKS datapath (vendored `flokrieger/Aloha-HE`), brought up engine-by-engine in standalone Verilator, parameterized over the ring dimension `N`, composed end-to-end with a real keygen + a dedicated secret-key PWM (`rtl/PWMSk.sv`), then run against **Lattigo as an untrusted homomorphic server**. | per-engine golden-vector TBs (§A.1–A.2) + a composed-core round-trip / secret-key-scheme TB (§A.3) + an Aloha⇄Lattigo cosim (§A.4: ct+ct, pt×ct, pt×ct+rescale), at `N=8192` and small `N` |
 
 Everything below is runnable from this directory (`src/fhe`).
 
@@ -17,9 +17,10 @@ Everything below is runnable from this directory (`src/fhe`).
 - **Verilator 5.022** — the chipyard conda build at `/scratch/boru/chipyard/.conda-env/bin/verilator`.
   `aloha/sim/run_tb.sh` defaults `VERILATOR` to it; override with `VERILATOR=<path>`.
 - **Python 3 + numpy** — for the FFT golden-vector generator.
-- **Go 1.26.4 + Lattigo v6.1.1** — only needed to (re)generate the NTT golden vectors at small `N`.
-  Self-contained toolchain at `/scratch/boru/go-toolchain`, module cache at `~/go` (offline-capable).
-  Activate with `source aloha/tvgen/env.sh`.
+- **Go 1.26.4 + Lattigo v6.1.1** — needed to (re)generate the NTT golden vectors at small `N`, the
+  Rung-6 keygen cross-check, and the Rung-7 Lattigo "server" (§A.4). Self-contained toolchain at
+  `/scratch/boru/go-toolchain`, module cache at `~/go` (offline-capable). Activate with
+  `source aloha/tvgen/env.sh` (the runners do this themselves).
 
 ---
 
@@ -132,6 +133,46 @@ generator flag selects the encryption datapath: `0` = vendor public-key PWM (the
 reference, default), `1` = secret-key `PWMSk` (`rtl/PWMSk.sv`, selected by `+define+FHE_SK_HW`).
 The pk path (5a/5c) stays green under the default build; the sk path runs under the `FHE_SK_HW` build.
 
+### A.4 Client↔server cosim — Aloha (RTL) ⇄ Lattigo (untrusted server) (Rung 7)
+
+The first test of the actual **FHE-client use case**: the Aloha RTL (trusted client) keygens +
+secret-key-encrypts, an **untrusted Lattigo "server"** runs the homomorphic evaluation on the *public*
+ciphertext, and the RTL decrypts the result — proving Aloha ciphertexts are real CKKS ciphertexts that
+interoperate with a standard library. One driver, op-selected by `COSIM_OP`:
+
+```
+COSIM_OP=add|mul|rescale  aloha/sim/run_cosim.sh [golden_dir] [N] [seed]   # N defaults to 8192
+```
+
+It runs the **same prebuilt PWMSk binary twice** (file handoff between, so the secret `s` never touches
+disk — phase 2 re-derives it from the same `KEYGEN_SEED`): phase 1 encrypts + dumps the *public* operands,
+the Go server runs the homomorphic op, phase 2 decrypts + checks. Needs `source aloha/tvgen/env.sh` (Go).
+
+| `COSIM_OP` | Op | Server (Lattigo) | Phase-2 check |
+|---|---|---|---|
+| `add` (default) | `ct(m1) + ct(m2)` | `ring.Add` | recovered ≈ `m1 + m2` |
+| `mul` | `pt(m2) × ct(m1)`, single modulus | `MulCoeffsBarrett` | recovered ≈ **complex** `m1 ⊙ m2` |
+| `rescale` | **2-limb** `pt(m2) × ct(m1)` + CKKS **rescale** `{q0,q1}→{q0}` | per-limb mul + `DivRoundByLastModulusNTT` | recovered ≈ `m1 ⊙ m2` |
+
+```bash
+cd aloha
+# Rung 7a — ct+ct interop (small N regenerates q0 ROMs into build/N<N>/mif automatically):
+COSIM_OP=add     CLEAN=1 ./sim/run_cosim.sh 256
+COSIM_OP=add     CLEAN=1 ./sim/run_cosim.sh 8192
+# Rung 7b — pt*ct multiply interop:
+COSIM_OP=mul     CLEAN=1 ./sim/run_cosim.sh 256
+COSIM_OP=mul     CLEAN=1 ./sim/run_cosim.sh 8192
+# Rung 7b-rescale — 2-limb pt*ct + rescale {q0,q1}->{q0}:
+COSIM_OP=rescale CLEAN=1 ./sim/run_cosim.sh 256
+COSIM_OP=rescale CLEAN=1 ./sim/run_cosim.sh 8192
+```
+
+PASS = `tb_ckks_roundtrip cosim RESULT: PASS` (both phases pass + the phase-2 recovered check + the
+keygen NTT cross-check). Validated at **N = 256 / 8192**. The Lattigo server lives in `tvgen/main.go`
+(`server_add` / `server_mul` / `server_mul_rescale`); `newAlohaRing` pins every modulus's NTT root to
+Aloha's `g` (required for the rescale's internal INTT/NTT). Plaintexts `m1`,`m2` come from
+`tvgen/gen_cosim.py` (run by the driver). All artifacts land in `build/cosim<N>/`.
+
 ### Golden-vector oracles (`aloha/tvgen/`)
 
 Each is independent of the RTL (an external/standalone reference), and each is
@@ -140,6 +181,7 @@ self-gated by reproducing the shipped `N=8192` vectors before being used at smal
 | File | Engine(s) | Oracle | CLI |
 |---|---|---|---|
 | `main.go` | NTT | **Lattigo** NTT, root pinned to Aloha's `g` | `./tvgen` (verify @8192) · `./tvgen gen <LOGN> <out> [seed]` · `./tvgen ntt <LOGN> <q_hex> <in> <out>` (forward NTT of an arbitrary residue poly under modulus `q`; used by the Rung-6 keygen cross-check `check_keygen.py`) |
+| `main.go` (Rung-7 server) | — | **Lattigo** homomorphic eval on imported Aloha cts | `./tvgen server_add <LOGN> <q_hex> <dir>` (ct+ct) · `./tvgen server_mul <LOGN> <q_hex> <dir>` (pt×ct) · `./tvgen server_mul_rescale <LOGN> <q0_hex> <q1_hex> <dir>` (2-limb pt×ct + rescale). Driven by `run_cosim.sh`; reads/writes the ciphertext poly files in `<dir>`. |
 | `gen_fft.py` | FFT | **numpy** special-FFT `exp(-iπk/N)·DFT(bitrev(x))` | `gen_fft.py validate <shipped_tv>` · `gen_fft.py gen <LOGN> <out>` |
 | `gen_sampling.py` + `trivium.py` | sampling | **Trivium** port (cipher-gated vs serial eSTREAM Trivium) | `gen_sampling.py <LOGN> <shipped_tv> <out>` |
 | `gen_pointwise.py` | IntToFlp, PWM | per-coefficient transforms computed from the input: IntToFlp `signed(int,q)·2^scale`; PWM `MontMul(a,b)+c` | `gen_pointwise.py validate <shipped_tv>` · `gen_pointwise.py gen <LOGN> <shipped_tv> <out>` |
