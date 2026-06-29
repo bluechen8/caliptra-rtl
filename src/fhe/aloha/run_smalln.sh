@@ -54,5 +54,16 @@ run NTT            y tb_UnifiedTransformation tb_unifiedtransformation.f -GDO_FF
 run FFT_stored     y tb_UnifiedTransformation tb_unifiedtransformation.f -GDO_FFT=1 -GON_THE_FLY_GENERATION=0 -GFORWARD_TRANSFORM=1
 run FFT_onthefly   y tb_UnifiedTransformation tb_unifiedtransformation.f -GDO_FFT=1 -GON_THE_FLY_GENERATION=1 -GFORWARD_TRANSFORM=1
 
+# Rung 5: the full composed-core CKKS round-trip (encode+encrypt -> decrypt+decode,
+# all engines sequenced via the INS_RAM microcode controller; recovered ~= input).
+echo "== [N=$N] composed-core round-trip (Rung 5) =="
+python3 tvgen/gen_roundtrip.py "$LOGN" "$WORK" >/dev/null 2>&1
+rt_log="$WORK/Roundtrip.log"
+if ROUNDTRIP=1 ALOHA_MIF_DIR="$MIF" "$SIM/run_roundtrip.sh" "$WORK" "$N" >"$rt_log" 2>&1; then
+  echo "  PASS  Roundtrip"; pass=$((pass + 1))
+else
+  echo "  FAIL  Roundtrip  (see $rt_log)"; fail=$((fail + 1))
+fi
+
 echo "== [N=$N] $pass passed, $fail failed =="
 exit $((fail > 0))
