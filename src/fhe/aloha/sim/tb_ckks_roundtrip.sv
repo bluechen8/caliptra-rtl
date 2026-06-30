@@ -14,6 +14,7 @@
 `timescale 1ns/1ps
 
 module tb_ckks_roundtrip;
+  import fhe_params_pkg::*;   // Stage-B' 2b: fhe_cmd_e / FHE_L for the walker
 
   localparam int N    = `ifdef N_OVERRIDE `N_OVERRIDE `else 8192 `endif;
   localparam int LOGN = $clog2(N);
@@ -82,10 +83,10 @@ module tb_ckks_roundtrip;
       .SCHEME(SCHEME)
     ) dut (
       .clk(clk),
-      .control_low_word(control_low_word),
-      .control_high_word(control_high_word),
-      .dina_ext_low_word(dina_low),
-      .dina_ext_high_word(dina_high),
+      .control_low_word(core_cl),
+      .control_high_word(core_ch),
+      .dina_ext_low_word(core_dl),
+      .dina_ext_high_word(core_dh),
       .dout_ext_low_word(dout_low),
       .dout_ext_high_word(dout_high),
       .status(status),
@@ -95,6 +96,55 @@ module tb_ckks_roundtrip;
       .dma_bram_doutb(dma_doutb),
       .dma_bram_en(dma_en)
     );
+
+  // ====================================================================
+  // Stage-B' 2b: the walker (fhe_microseq) muxed onto the SAME core pins.
+  // In +WALKER mode the walker drives control_low/high + dina; otherwise the
+  // existing TB tasks do (walker_mode=0 preserves every other mode unchanged).
+  // The TB plays "firmware + DMA": a small DRAM model feeds DMA_IN and captures
+  // DMA_OUT, and hands ct pointers from encrypt to decrypt.
+  // ====================================================================
+  logic        walker_mode = 1'b0;
+  wire  [31:0] w_cl, w_ch, w_dl, w_dh;
+  wire  [2:0]  w_sel;  wire [LOGN:0] w_idx;
+  wire         w_dout_we, w_busy, w_done, w_error;
+  wire  [63:0] w_dout;
+  logic        w_rst_b = 1'b0, w_cmd_valid = 1'b0;
+  fhe_cmd_e    w_cmd = FHE_NONE;
+  logic [31:0] w_rns_kg, w_rns_enc, w_i2f;
+  logic [63:0] w_kg_seed, w_a_seed, w_err_seed;
+  logic [63:0] w_r2 [0:FHE_L-1];
+
+  // TB DRAM model, split into single-writer halves to avoid multidriven memory:
+  //   dram_src[ptr] — written by the task (preload/copy), read by DMA_IN
+  //   dram_cap[ptr] — written ONLY by the clocked DMA_OUT capture below
+  longint      dram_src [0:3][0:2*N];
+  longint      dram_cap [0:3][0:2*N];
+  wire  [63:0] w_din = dram_src[w_sel][w_idx];
+  logic [2:0]  w_sel_d; logic [LOGN:0] w_idx_d;
+  always @(posedge clk) begin
+    w_sel_d <= w_sel; w_idx_d <= w_idx;           // align with the 1-cycle-late dout strobe
+    if (walker_mode && w_dout_we) dram_cap[w_sel_d][w_idx_d] <= w_dout;
+  end
+
+  // core control mux
+  wire [31:0] core_cl = walker_mode ? w_cl : control_low_word;
+  wire [31:0] core_ch = walker_mode ? w_ch : control_high_word;
+  wire [31:0] core_dl = walker_mode ? w_dl : dina_low;
+  wire [31:0] core_dh = walker_mode ? w_dh : dina_high;
+
+  fhe_microseq #(.LOGN(LOGN), .N(N)) walker (
+    .clk(clk), .rst_b(w_rst_b), .zeroize(1'b0),
+    .cmd_valid(w_cmd_valid), .cmd(w_cmd),
+    .keygen_seed(w_kg_seed), .a_seed(w_a_seed), .err_seed(w_err_seed),
+    .rns_scale_kg(w_rns_kg), .rns_scale_enc(w_rns_enc), .i2f_scale_dec(w_i2f),
+    .num_limbs(4'd1), .r2modq(w_r2),
+    .control_low_word(w_cl), .control_high_word(w_ch), .dina_low(w_dl), .dina_high(w_dh),
+    .dout_low(dout_low), .dout_high(dout_high), .status(status),
+    .ext_sel(w_sel), .ext_idx(w_idx), .ext_din(w_din),
+    .ext_dout_we(w_dout_we), .ext_dout(w_dout),
+    .busy(w_busy), .done(w_done), .error(w_error)
+  );
 
 `ifdef FHE_DPI_COSIM
   // ---- Rung 7c: in-process Lattigo "server" via DPI-C ------------------------
@@ -485,6 +535,57 @@ module tb_ckks_roundtrip;
   //   * c1 = a is a HW passthrough (PWMSk result1), checked here == sampled a.
   //   * single multiply lane (BF0); BF1 unused.
   // ====================================================================
+  // ---- Stage-B' 2b: walker-driven round-trip on the real core --------------
+  // Pulse one command into the walker and wait for its done. sk_mem persists in
+  // the walker across keygen->encrypt->decrypt (one run, never reset between).
+  task automatic fire_cmd(input fhe_cmd_e c, input string nm);
+    int t;
+    @(negedge clk); w_cmd = c; w_cmd_valid = 1'b1;
+    @(negedge clk); w_cmd_valid = 1'b0; w_cmd = FHE_NONE;
+    t = 0;
+    while (!w_done) begin
+      @(posedge clk); t++;
+      if (t > 50_000_000) begin $display("WALKER TIMEOUT in %s", nm); errors++; return; end
+    end
+    $display("  [walker] %s done (%0d cyc)", nm, t);
+    @(negedge clk);
+  endtask
+
+  // Reproduces run_skscheme_hw's keygen->encrypt->decrypt, but driven entirely
+  // by the walker FSM through the muxed core pins, then the SAME recovery check.
+  task automatic run_walker_rt();
+    int i, s; longint r2; logic [127:0] rr;
+    if (SCHEME != 1) begin
+      $display("FAIL: +WALKER requires +define+FHE_SK_HW (SCHEME=1)"); errors++; return;
+    end
+    $readmemh({tvdir, "/input.txt"}, g_input);
+    rr = (128'd1 << 72) % q0; rr = (rr * rr) % q0; r2 = longint'(rr);
+    for (i = 0; i < FHE_L; i++) w_r2[i] = 64'd0;
+    w_r2[0]    = r2;
+    w_kg_seed  = KEYGEN_SEED; w_a_seed = A_SEED; w_err_seed = ERR_SEED;
+    s = RT_SCALE - 52 - 1023 - LOGN; if (s < 0) s += 4096;
+    w_rns_kg = s; w_rns_enc = s;             // run_skscheme_hw uses this scale for both
+    w_i2f    = -RT_SCALE;                     // signed decode scale
+    // preload the plaintext into ptr0 (encrypt's DMA_IN msg source)
+    to_q(plain_q, g_input, N);
+    for (i = 0; i < N; i++) dram_src[0][i] = plain_q[i];
+
+    walker_mode = 1'b1;
+    w_rst_b = 1'b0; repeat (4) @(negedge clk); w_rst_b = 1'b1; repeat (2) @(negedge clk);
+
+    fire_cmd(FHE_KEYGEN,  "KEYGEN");
+    fire_cmd(FHE_ENCRYPT, "ENCRYPT");
+    // firmware hands the ct pointers to decrypt: enc wrote c0->ptr2, c1->ptr3;
+    // dec reads c0<-ptr0, c1<-ptr1.
+    for (i = 0; i < N; i++) begin dram_src[0][i] = dram_cap[2][i]; dram_src[1][i] = dram_cap[3][i]; end
+    fire_cmd(FHE_DECRYPT, "DECRYPT");
+
+    begin longint reco[]; reco = new[N];
+      for (i = 0; i < N; i++) reco[i] = dram_cap[2][i];   // recovered slots (upper N of FFT)
+      check_fft(reco, g_input, N, "WALKER-driven sk round-trip (recovered vs input)", 1.0e-3);
+    end
+  endtask
+
   task automatic run_skscheme_hw();
     int i;
     longint keygen_seed, err_seed, a_seed, r_mod_q, r2;
@@ -909,6 +1010,15 @@ module tb_ckks_roundtrip;
     if ($test$plusargs("SKHW")) begin
       $display("== Rung 6: sk keygen + secret-key scheme on PWMSk, N=%0d (SCHEME=%0d) ==", N, SCHEME);
       run_skscheme_hw();
+      if (errors == 0) $display("RESULT: PASS");
+      else             $display("RESULT: FAIL (%0d mismatches)", errors);
+      $finish;
+    end
+
+    // Stage-B' 2b: same round-trip, but driven by the walker FSM on the real core.
+    if ($test$plusargs("WALKER")) begin
+      $display("== Stage-B' 2b: WALKER-driven sk round-trip on real ComputeCore, N=%0d ==", N);
+      run_walker_rt();
       if (errors == 0) $display("RESULT: PASS");
       else             $display("RESULT: FAIL (%0d mismatches)", errors);
       $finish;

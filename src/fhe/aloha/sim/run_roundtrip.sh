@@ -32,6 +32,8 @@ NDEF=()
 [[ "$NVAL" != 8192 ]] && NDEF=(-DN_OVERRIDE="$NVAL")
 # Rung 6c: SKSCHEME_HW elaborates the dedicated secret-key PWM (PWMSk).
 [[ -n "${SKSCHEME_HW:-}" ]] && NDEF+=(-DFHE_SK_HW)
+# Stage-B' 2b: WALKER drives the real core via the fhe_microseq FSM (needs PWMSk).
+[[ -n "${WALKER:-}" ]] && NDEF+=(-DFHE_SK_HW)
 
 echo "=== $TOP (N=$NVAL, goldens=$GOLDEN_ABS) ==="
 [[ -n "${CLEAN:-}" ]] && rm -rf "$OBJ_DIR"
@@ -65,6 +67,7 @@ PLUSARGS=(+TVDIR="$GOLDEN_ABS")
 [[ -n "${ROUNDTRIP:-}" ]] && PLUSARGS+=(+ROUNDTRIP)
 [[ -n "${IDENTITY:-}" ]] && PLUSARGS+=(+IDENTITY)
 [[ -n "${SKSCHEME_HW:-}" ]] && PLUSARGS+=(+SKHW)
+[[ -n "${WALKER:-}" ]] && PLUSARGS+=(+WALKER)
 
 echo "=== running (cwd=$RUNDIR) ==="
 ( cd "$RUNDIR" && "$OBJ_DIR/V$TOP" "${PLUSARGS[@]}" ) 2>&1 | tee -a "$LOG"
