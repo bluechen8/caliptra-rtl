@@ -1173,7 +1173,15 @@ fhe_top #(
      .busy_o            (fhe_busy),
      .error_intr        (fhe_error_intr),
      .notif_intr        (fhe_notif_intr),
-     .fhe_memory_export (fhe_memory_export)
+     .fhe_memory_export (fhe_memory_export),
+     // Stage-B' 2c microsequencer DMA word-stream: idle on the SoC build (stub
+     // path, `FHE_WALKER` undefined). 2c-step-2 wires these to the soc_ifc AXI
+     // DMA / FBUS master; for now the inputs are tied off and outputs left open.
+     .fhe_dma_sel       (/* unconnected */),
+     .fhe_dma_idx       (/* unconnected */),
+     .fhe_dma_din       (64'd0),
+     .fhe_dma_dout_we   (/* unconnected */),
+     .fhe_dma_dout      (/* unconnected */)
 );
 `else
     // FHE accelerator removed — tie off signals

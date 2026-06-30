@@ -28,7 +28,12 @@ module fhe_top
   import fhe_params_pkg::*;
 #(
   parameter AHB_DATA_WIDTH = 64,
-  parameter AHB_ADDR_WIDTH = 32
+  parameter AHB_ADDR_WIDTH = 32,
+  // FHE DMA AXI manager geometry (B' 2c-step-2). AW is overridable so a unit TB
+  // can back the manager with a small caliptra_axi_sram DRAM model.
+  parameter FHE_AXI_AW     = 32,
+  parameter FHE_AXI_UW     = 32,
+  parameter FHE_AXI_IW     = 1
 )(
   input  logic clk,
   input  logic rst_b,
@@ -52,6 +57,23 @@ module fhe_top
 
   // SRAM banks (storage instantiated in fhe_mem_top / CaliptraCoreBlackbox)
   fhe_mem_if.req fhe_memory_export
+`ifdef FHE_WALKER
+  // ---- Stage-B' 2c-step-2: dedicated FHE DMA AXI4 manager port ----
+  //   fhe_dma resolves the walker's ptr-indexed poly stream to DRAM bursts on
+  //   this manager. Wired to FBUS by the (deferred) Chisel TLClientNode; a unit
+  //   TB backs it with caliptra_axi_sram. Only present in the FHE_WALKER build.
+  ,
+  axi_if.r_mgr fhe_axi_r_if,
+  axi_if.w_mgr fhe_axi_w_if
+`else
+  // ---- Stage-0/SoC stub: transitional ptr-indexed word-stream, tied idle ----
+  ,
+  output logic [2:0]          fhe_dma_sel,
+  output logic [FHE_LOGN:0]   fhe_dma_idx,
+  input  logic [63:0]         fhe_dma_din,
+  output logic                fhe_dma_dout_we,
+  output logic [63:0]         fhe_dma_dout
+`endif
 );
 
   //----------------------------------------------------------------
@@ -111,6 +133,29 @@ module fhe_top
   localparam logic [5:0] OFF_KEYDST0  = 6'd10; // 0x28
   localparam logic [5:0] OFF_KEYDST1  = 6'd11; // 0x2C
   localparam logic [5:0] OFF_CONFIG   = 6'd12; // 0x30
+  // Stage-B' 2c: microsequencer runtime inputs. Seeds are program-level entropy
+  // (CSRNG/Trivium in C'); scales are firmware-computed (it knows Delta / level /
+  // whether the ct is fresh, a product, or rescaled -- see microseq doc 5.1).
+  localparam logic [5:0] OFF_KGSEED0  = 6'd13; // 0x34  keygen seed [31:0]
+  localparam logic [5:0] OFF_KGSEED1  = 6'd14; // 0x38  keygen seed [63:32]
+  localparam logic [5:0] OFF_ASEED0   = 6'd15; // 0x3C  a (uniform) seed [31:0]
+  localparam logic [5:0] OFF_ASEED1   = 6'd16; // 0x40  a seed [63:32]
+  localparam logic [5:0] OFF_ESEED0   = 6'd17; // 0x44  e0 (CBD) seed [31:0]
+  localparam logic [5:0] OFF_ESEED1   = 6'd18; // 0x48  e0 seed [63:32]
+  localparam logic [5:0] OFF_KGSCALE  = 6'd19; // 0x4C  keygen RNS scale (internal)
+  localparam logic [5:0] OFF_ENCSCALE = 6'd20; // 0x50  encode RNS scale (ENCRYPT)
+  localparam logic [5:0] OFF_I2FSCALE = 6'd21; // 0x54  signed decode I2F scale (DECRYPT)
+  // B' 2c-step-2: four DMA base-pointer registers, indexed by the walker's PTR
+  // index (0..3). Firmware writes the DRAM byte addresses of the poly buffers
+  // (plaintext / ciphertext c0,c1 / output) per command.
+  localparam logic [5:0] OFF_PTR0_LO  = 6'd22; // 0x58
+  localparam logic [5:0] OFF_PTR0_HI  = 6'd23; // 0x5C
+  localparam logic [5:0] OFF_PTR1_LO  = 6'd24; // 0x60
+  localparam logic [5:0] OFF_PTR1_HI  = 6'd25; // 0x64
+  localparam logic [5:0] OFF_PTR2_LO  = 6'd26; // 0x68
+  localparam logic [5:0] OFF_PTR2_HI  = 6'd27; // 0x6C
+  localparam logic [5:0] OFF_PTR3_LO  = 6'd28; // 0x70
+  localparam logic [5:0] OFF_PTR3_HI  = 6'd29; // 0x74
 
   logic [5:0] word_sel;
   assign word_sel = cif_addr[7:2];
@@ -125,6 +170,11 @@ module fhe_top
   logic [63:0] src_addr, dst_addr, key_dst_addr;
   logic [3:0]  target_level;
   logic [7:0]  param_set_id;
+
+  // Stage-B' 2c microsequencer inputs (see OFF_* above)
+  logic [63:0] kg_seed, a_seed, err_seed;
+  logic [31:0] kg_scale, enc_scale, i2f_scale;
+  logic [63:0] dma_ptr [0:3];   // DMA base pointers, indexed by walker PTR index
 
   fhe_cmd_e cmd_q;
   logic     cmd_valid;
@@ -153,6 +203,13 @@ module fhe_top
       key_dst_addr <= '0;
       target_level <= '0;
       param_set_id <= '0;
+      kg_seed      <= '0;
+      a_seed       <= '0;
+      err_seed     <= '0;
+      kg_scale     <= '0;
+      enc_scale    <= '0;
+      i2f_scale    <= '0;
+      for (int p = 0; p < 4; p++) dma_ptr[p] <= '0;
       cmd_q        <= FHE_NONE;
       cmd_valid    <= 1'b0;
     end else if (zeroize) begin
@@ -161,6 +218,13 @@ module fhe_top
       key_dst_addr <= '0;
       target_level <= '0;
       param_set_id <= '0;
+      kg_seed      <= '0;
+      a_seed       <= '0;
+      err_seed     <= '0;
+      kg_scale     <= '0;
+      enc_scale    <= '0;
+      i2f_scale    <= '0;
+      for (int p = 0; p < 4; p++) dma_ptr[p] <= '0;
       cmd_q        <= FHE_NONE;
       cmd_valid    <= 1'b0;
     end else begin
@@ -178,6 +242,23 @@ module fhe_top
             target_level <= cif_wdata[3:0];
             param_set_id <= cif_wdata[11:4];
           end
+          OFF_KGSEED0:  kg_seed[31:0]   <= cif_wdata;
+          OFF_KGSEED1:  kg_seed[63:32]  <= cif_wdata;
+          OFF_ASEED0:   a_seed[31:0]    <= cif_wdata;
+          OFF_ASEED1:   a_seed[63:32]   <= cif_wdata;
+          OFF_ESEED0:   err_seed[31:0]  <= cif_wdata;
+          OFF_ESEED1:   err_seed[63:32] <= cif_wdata;
+          OFF_KGSCALE:  kg_scale        <= cif_wdata;
+          OFF_ENCSCALE: enc_scale       <= cif_wdata;
+          OFF_I2FSCALE: i2f_scale       <= cif_wdata;
+          OFF_PTR0_LO:  dma_ptr[0][31:0]  <= cif_wdata;
+          OFF_PTR0_HI:  dma_ptr[0][63:32] <= cif_wdata;
+          OFF_PTR1_LO:  dma_ptr[1][31:0]  <= cif_wdata;
+          OFF_PTR1_HI:  dma_ptr[1][63:32] <= cif_wdata;
+          OFF_PTR2_LO:  dma_ptr[2][31:0]  <= cif_wdata;
+          OFF_PTR2_HI:  dma_ptr[2][63:32] <= cif_wdata;
+          OFF_PTR3_LO:  dma_ptr[3][31:0]  <= cif_wdata;
+          OFF_PTR3_HI:  dma_ptr[3][63:32] <= cif_wdata;
           default: ;
         endcase
       end
@@ -204,8 +285,147 @@ module fhe_top
   end
 
   //----------------------------------------------------------------
-  // Behavioral command FSM (replaced by real datapath in Stages A-E)
+  // Command engine
   //----------------------------------------------------------------
+`ifdef FHE_WALKER
+  //--------------------------------------------------------------------------
+  // Stage-B' 2c: the REAL datapath -- the ROM-microcoded walker (fhe_microseq)
+  // driving the Aloha-HE ComputeCore over its native debug-IO pins. This is the
+  // green Stage-B' 2b wiring lifted out of the TB into fhe_top proper: the
+  // register block plays "firmware" (CMD selects the program entry; the seed/scale
+  // registers feed the EXE seeds + INS scale-field patches), and the walker's
+  // ptr-indexed poly stream is moved to/from Rocket DRAM by the dedicated fhe_dma
+  // engine (2c-step-2) over the AXI4 manager port. Gated by `FHE_WALKER` because
+  // the SoC build does not yet compile the Aloha sources; the stub path below keeps
+  // that build (and the firmware smoke test) green until the SoC-build flip lands
+  // the Aloha filelist + FBUS glue. SCHEME=1 selects the secret-key PWMSk lane.
+  //--------------------------------------------------------------------------
+  // Per-modulus R^2 mod q_i for keygen's Montgomery-convert (CONST R2MODQ; R=2^72).
+  // Frozen 2-prime Rung-7 chain: q0 = 2^46-9*2^24+1, q1 = 2^47-2^24+1. (microseq
+  // doc 5.2/8.2 -- the tiny per-modulus ROM that sits beside the limb-param table.)
+  localparam logic [63:0] R2MODQ [0:FHE_L-1] =
+      '{0: 64'h00000f47_3d9a6eb2, 1: 64'h00007fff_f7000009, default: 64'd0};
+
+  // walker <-> core debug-IO
+  logic [31:0] w_cl, w_ch, w_dl, w_dh;
+  logic [31:0] core_dout_lo, core_dout_hi, core_status;
+  logic        w_busy, w_done, w_error;
+
+  // walker <-> fhe_dma (descriptor + word stream). ext_sel/ext_idx are unused by
+  // the streaming DMA (fhe_dma resolves base from the descriptor + PTR regs).
+  logic [2:0]   w_ext_sel;
+  logic [FHE_LOGN:0] w_ext_idx;
+  logic [63:0]  w_rd_data, w_wr_data;
+  logic         w_wr_push;
+  logic         w_desc_valid, w_desc_wr;
+  logic [2:0]   w_desc_ptr;
+  logic [3:0]   w_desc_limb;
+  logic         w_dma_ready, w_rd_valid, w_rd_pop, w_wr_ready;
+
+  fhe_microseq #(.LOGN(FHE_LOGN), .N(FHE_N)) walker (
+    .clk            (clk),
+    .rst_b          (rst_b),
+    .zeroize        (zeroize),
+    .cmd_valid      (cmd_valid),
+    .cmd            (cmd_q),
+    .keygen_seed    (kg_seed),
+    .a_seed         (a_seed),
+    .err_seed       (err_seed),
+    .rns_scale_kg   (kg_scale),
+    .rns_scale_enc  (enc_scale),
+    .i2f_scale_dec  (i2f_scale),
+    .num_limbs      (target_level),    // CONFIG.L (encrypt); walker forces 1 for decrypt
+    .r2modq         (R2MODQ),
+    // ComputeCore debug-IO master
+    .control_low_word  (w_cl),
+    .control_high_word (w_ch),
+    .dina_low          (w_dl),
+    .dina_high         (w_dh),
+    .dout_low          (core_dout_lo),
+    .dout_high         (core_dout_hi),
+    .status            (core_status),
+    // poly word-stream + DMA descriptor/handshake -> fhe_dma
+    .ext_sel        (w_ext_sel),
+    .ext_idx        (w_ext_idx),
+    .ext_din        (w_rd_data),
+    .ext_dout_we    (w_wr_push),
+    .ext_dout       (w_wr_data),
+    .dma_desc_valid (w_desc_valid),
+    .dma_desc_wr    (w_desc_wr),
+    .dma_desc_ptr   (w_desc_ptr),
+    .dma_desc_limb  (w_desc_limb),
+    .dma_ready      (w_dma_ready),
+    .dma_rd_valid   (w_rd_valid),
+    .dma_rd_pop     (w_rd_pop),
+    .dma_wr_ready   (w_wr_ready),
+    .busy           (w_busy),
+    .done           (w_done),
+    .error          (w_error)
+  );
+
+  ComputeCoreWrapper #(
+    .FFT_ON_THE_FLY_GENERATION (0),
+    .PROVIDE_DEBUG_IO          (1),
+    .LOGN                      (FHE_LOGN),
+    .N                         (FHE_N),
+    .SCHEME                    (1)
+  ) core (
+    .clk                (clk),
+    .control_low_word   (w_cl),
+    .control_high_word  (w_ch),
+    .dina_ext_low_word  (w_dl),
+    .dina_ext_high_word (w_dh),
+    .dout_ext_low_word  (core_dout_lo),
+    .dout_ext_high_word (core_dout_hi),
+    .status             (core_status),
+    // ComputeCore's own DMA-into-BRAM port is unused here (the walker moves poly
+    // data over the debug-IO send64/receive64 path, exactly as in 2b).
+    .dma_bram_byte_wea  (8'd0),
+    .dma_bram_abs_addr  (18'd0),
+    .dma_bram_dina      (64'd0),
+    .dma_bram_doutb     (),
+    .dma_bram_en        (1'b0)
+  );
+
+  // Dedicated FHE DMA: reuses Caliptra's axi_mgr_rd/axi_mgr_wr; resolves the
+  // walker descriptor + PTR regs to chunked AXI bursts on the manager port.
+  fhe_dma #(
+    .AW   (FHE_AXI_AW),
+    .DW   (64),
+    .UW   (FHE_AXI_UW),
+    .IW   (FHE_AXI_IW),
+    .LOGN (FHE_LOGN),
+    .N    (FHE_N)
+  ) i_fhe_dma (
+    .clk        (clk),
+    .rst_n      (rst_b),
+    .desc_valid (w_desc_valid),
+    .desc_wr    (w_desc_wr),
+    .desc_ptr   (w_desc_ptr),
+    .desc_limb  (w_desc_limb),
+    .dma_ready  (w_dma_ready),
+    .rd_valid   (w_rd_valid),
+    .rd_data    (w_rd_data),
+    .rd_ready   (w_rd_pop),
+    .wr_valid   (w_wr_push),
+    .wr_data    (w_wr_data),
+    .wr_ready   (w_wr_ready),
+    .ptr_base   (dma_ptr),
+    .axuser     ((FHE_AXI_UW)'(1)),       // Caliptra PAUSER (canonical 0x1)
+    .m_axi_r_if (fhe_axi_r_if),
+    .m_axi_w_if (fhe_axi_w_if)
+  );
+
+  assign ctrl_busy  = w_busy;
+  assign ctrl_done  = w_done;
+  assign ctrl_error = w_error;
+
+`else
+  //--------------------------------------------------------------------------
+  // STAGE-0 behavioral stub (the SoC-build default): fixed-latency completion,
+  // no datapath. Keeps the firmware smoke path green before the Aloha sources +
+  // FBUS DMA are wired into the SoC build (2c-step-2).
+  //--------------------------------------------------------------------------
   fhe_ctrl #(.STUB_LATENCY(16)) ctrl_inst (
     .clk       (clk),
     .rst_b     (rst_b),
@@ -216,6 +436,13 @@ module fhe_top
     .done      (ctrl_done),
     .error     (ctrl_error)
   );
+
+  // No datapath -> the DMA word-stream is idle.
+  assign fhe_dma_sel     = 3'd0;
+  assign fhe_dma_idx     = '0;
+  assign fhe_dma_dout_we = 1'b0;
+  assign fhe_dma_dout    = 64'd0;
+`endif
 
   // Interrupt outputs (1-cycle pulses; PIC programmed edge-sensitive).
   assign notif_intr = ctrl_done;
@@ -239,6 +466,23 @@ module fhe_top
       OFF_KEYDST0: cif_rdata = key_dst_addr[31:0];
       OFF_KEYDST1: cif_rdata = key_dst_addr[63:32];
       OFF_CONFIG:  cif_rdata = {20'b0, param_set_id, target_level};
+      OFF_KGSEED0: cif_rdata = kg_seed[31:0];
+      OFF_KGSEED1: cif_rdata = kg_seed[63:32];
+      OFF_ASEED0:  cif_rdata = a_seed[31:0];
+      OFF_ASEED1:  cif_rdata = a_seed[63:32];
+      OFF_ESEED0:  cif_rdata = err_seed[31:0];
+      OFF_ESEED1:  cif_rdata = err_seed[63:32];
+      OFF_KGSCALE: cif_rdata = kg_scale;
+      OFF_ENCSCALE:cif_rdata = enc_scale;
+      OFF_I2FSCALE:cif_rdata = i2f_scale;
+      OFF_PTR0_LO: cif_rdata = dma_ptr[0][31:0];
+      OFF_PTR0_HI: cif_rdata = dma_ptr[0][63:32];
+      OFF_PTR1_LO: cif_rdata = dma_ptr[1][31:0];
+      OFF_PTR1_HI: cif_rdata = dma_ptr[1][63:32];
+      OFF_PTR2_LO: cif_rdata = dma_ptr[2][31:0];
+      OFF_PTR2_HI: cif_rdata = dma_ptr[2][63:32];
+      OFF_PTR3_LO: cif_rdata = dma_ptr[3][31:0];
+      OFF_PTR3_HI: cif_rdata = dma_ptr[3][63:32];
       default:     cif_rdata = 32'b0;
     endcase
   end

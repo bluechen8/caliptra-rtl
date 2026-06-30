@@ -143,6 +143,10 @@ module tb_ckks_roundtrip;
     .dout_low(dout_low), .dout_high(dout_high), .status(status),
     .ext_sel(w_sel), .ext_idx(w_idx), .ext_din(w_din),
     .ext_dout_we(w_dout_we), .ext_dout(w_dout),
+    // B' 2c-step-2 DMA handshake: tie idle/ready high (the 2b round-trip uses the
+    // zero-latency split dram_src/dram_cap array model, no DMA engine).
+    .dma_desc_valid(), .dma_desc_wr(), .dma_desc_ptr(), .dma_desc_limb(),
+    .dma_ready(1'b1), .dma_rd_valid(1'b1), .dma_rd_pop(), .dma_wr_ready(1'b1),
     .busy(w_busy), .done(w_done), .error(w_error)
   );
 

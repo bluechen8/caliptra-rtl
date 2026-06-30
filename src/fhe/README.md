@@ -232,6 +232,29 @@ self-gated by reproducing the shipped `N=8192` vectors before being used at smal
 Exercises the AHB register block + the behavioral control FSM (NAME/VERSION, idle
 status, register R/W, ENCRYPT→VALID, KEYGEN→VALID, busy-rejection, ZEROIZE).
 
+### B′ 2c — real datapath + dedicated FHE DMA (AHB-driven round-trip, Verilator)
+
+`fhe_top` built with `+define+FHE_WALKER` instantiates the **real** datapath — the
+microsequencer (`fhe_microseq`) driving the Aloha `ComputeCore`, plus the dedicated
+**`fhe_dma`** engine (reuses Caliptra's `axi_mgr_rd`/`axi_mgr_wr` + `caliptra_prim_fifo_sync`)
+on an AXI4 manager port. The TB plays firmware over AHB (seeds / scales / `CONFIG.L`
++ the 4 DMA pointer registers + `CMD`) and backs the manager with a behavioral AXI
+subordinate DRAM model; keygen → encrypt → decrypt round-trips the ciphertext through
+**real AXI bursts** and checks recovered ≈ input.
+
+```bash
+# from src/fhe/ — default LOGN=8 (N=256); pass 13 for N=8192. CLEAN=1 forces a rebuild.
+CLEAN=1 ./tb/run_fhe_top_dma_tb.sh 8      # N=256  (regenerates small-N ROMs + plaintext)
+CLEAN=1 ./tb/run_fhe_top_dma_tb.sh 13     # N=8192 (uses the shipped vendor ROMs)
+# -> "fhe_top_dma_tb RESULT: PASS"  (recovered vs input, rel<2^-30)
+```
+
+All build/run artifacts (Verilator `obj_dir`, the depth-5 ROM rundir, the generated
+small-N ROMs + `input.txt`, the log) go under `src/fhe/build/` — gitignored, never
+under `tb/`. The walker's instruction/seed trace alone (no core, no DMA) is checked by
+`./tb/run_fhe_microseq.sh`; the walker driving the real core (no DMA, TB array model)
+is the `+WALKER` mode of `aloha/sim/run_roundtrip.sh` (see §A.3).
+
 ### Firmware-driven smoke test on the full SoC
 
 `smoke_test_fhe` boots the SoC (`caliptra_top_tb`), reaches `main()`, drives the FHE

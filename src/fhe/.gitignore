@@ -1,0 +1,11 @@
+# Verilator / sim build + reproduction artifacts.
+# The run_fhe_*.sh harnesses route all build output under build/ (gitignored).
+build/
+
+# Belt-and-suspenders: never commit build dirs/logs even if a harness writes
+# them next to the sources (e.g. the Stage-0 run_fhe_top_tb.sh obj_dir).
+obj_dir/
+obj_dir_*/
+tb/obj_dir*/
+tb/.run_*/
+tb/*.log

@@ -64,6 +64,10 @@ module tb_fhe_microseq;
     .dout_low(dout_low), .dout_high(dout_high), .status(status),
     .ext_sel(ext_sel), .ext_idx(ext_idx), .ext_din(ext_din),
     .ext_dout_we(ext_dout_we), .ext_dout(ext_dout),
+    // B' 2c-step-2 DMA handshake: tie idle/ready high for the legacy zero-latency
+    // array model (this trace test has no DMA engine).
+    .dma_desc_valid(), .dma_desc_wr(), .dma_desc_ptr(), .dma_desc_limb(),
+    .dma_ready(1'b1), .dma_rd_valid(1'b1), .dma_rd_pop(), .dma_wr_ready(1'b1),
     .busy(busy), .done(done), .error(error)
   );
 

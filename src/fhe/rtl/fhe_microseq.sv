@@ -78,6 +78,20 @@ module fhe_microseq
   output logic        ext_dout_we,    // DMA_OUT word strobe
   output logic [63:0] ext_dout,       // DMA_OUT word
 
+  // ----- B' 2c-step-2: DMA engine handshake (latency-tolerant streaming) -----
+  // Additive over the 2a/2b ext_* word stream. A descriptor pulse starts a poly
+  // transfer; the word stream then flows with valid/ready backpressure. Drive
+  // dma_ready/dma_rd_valid/dma_wr_ready all 1 (and ignore the descriptor) to get
+  // the legacy zero-latency behaviour the 2a/2b array-model TBs rely on.
+  output logic        dma_desc_valid, // 1-cycle pulse at a DMA op start
+  output logic        dma_desc_wr,    // 1 = DMA_OUT (write), 0 = DMA_IN (read)
+  output logic [2:0]  dma_desc_ptr,   // PTR-register select for the transfer
+  output logic [3:0]  dma_desc_limb,  // limb index (DRAM stride)
+  input  logic        dma_ready,      // DMA idle: may start a transfer / it has completed
+  input  logic        dma_rd_valid,   // a DMA_IN word is available on ext_din
+  output logic        dma_rd_pop,     // walker consumed a DMA_IN word this cycle
+  input  logic        dma_wr_ready,   // DMA_OUT FIFO can accept a word
+
   output logic        busy,
   output logic        done,           // 1-cycle pulse
   output logic        error
@@ -269,6 +283,7 @@ module fhe_microseq
   // =====================================================================
   typedef enum logic [4:0] {
     S_IDLE, S_FETCH, S_DECODE,
+    S_DMA_REQ,
     S_WR, S_WR_LO,
     S_RD,
     S_EXE_DINA, S_EXE_RST, S_EXE_START, S_EXE_POLL, S_EXE_CLR1, S_EXE_CLR0,
@@ -303,6 +318,18 @@ module fhe_microseq
 
   // exe
   logic [2:0]    exe_rstc;
+
+  // DMA descriptor (B' 2c-step-2): captured at a DMA op decode, presented to the
+  // DMA engine in S_DMA_REQ. The word stream then flows with valid/ready.
+  logic          desc_wr_r;
+  logic [2:0]    desc_ptr_r;
+  logic [3:0]    desc_limb_r;
+  assign dma_desc_valid = (st == S_DMA_REQ) && dma_ready;
+  assign dma_desc_wr    = desc_wr_r;
+  assign dma_desc_ptr   = desc_ptr_r;
+  assign dma_desc_limb  = desc_limb_r;
+  // pop a DMA_IN word the cycle the walker consumes it (S_WR, not stalled)
+  assign dma_rd_pop     = (st == S_WR) && !cur_ins && !cur_sk && (cur_cid == C_DIN) && dma_rd_valid;
 
   // sk-bank: the walker's resident +sk_ntt store (an SRAM macro in fhe_mem_top
   // for real N; a reg array here). NOT addressed over the 3-bit Aloha bram_sel
@@ -470,7 +497,8 @@ module fhe_microseq
               cur_bank <= f_bank(op_w); cur_ins <= 1'b0; cur_sk <= 1'b0;
               cur_cid  <= C_DIN;        cur_ptr <= f_ptr(op_w);
               widx <= '0; wn <= (LOGN+1)'(N);
-              st <= S_WR;
+              desc_wr_r <= 1'b0; desc_ptr_r <= f_ptr(op_w); desc_limb_r <= limb_idx;
+              st <= S_DMA_REQ;          // kick the DMA read, then stream into the core
             end
             OP_LDINS: begin
               cur_bank <= 4'd0; cur_ins <= 1'b1; cur_sk <= 1'b0;
@@ -485,7 +513,8 @@ module fhe_microseq
               widx <= '0; wn <= (LOGN+1)'(N); rd_wait <= 3'd0;
               control_low_word <= mk_ctrl(f_bank(op_w), 1'b1, 1'b0, 1'b0,
                                           f_off(op_w) ? (LOGN+1)'(N) : '0);
-              st <= S_RD;
+              desc_wr_r <= 1'b1; desc_ptr_r <= f_ptr(op_w); desc_limb_r <= limb_idx;
+              st <= S_DMA_REQ;          // kick the DMA write, then drain the core into it
             end
             OP_MOVE: begin
               // one side is B_SK (the walker's local sk store), the other a
@@ -511,13 +540,26 @@ module fhe_microseq
             end
           endcase
         end
+        // ------------ DMA descriptor handoff (B' 2c-step-2) -----------
+        // Wait for the DMA engine idle, pulse the descriptor (combinational
+        // dma_desc_valid), then enter the word loop. For a read, hold the core
+        // idle; for a write, the core-read grant set at decode persists.
+        S_DMA_REQ: begin
+          if (!desc_wr_r) control_low_word <= 32'd0;
+          if (dma_ready) st <= desc_wr_r ? S_RD : S_WR;
+        end
         // ------------ send64 word loop (wea=1 cycle) ------------------
         S_WR: begin
-          wdata = cur_wr_data();
-          dina_low  <= wdata[31:0];
-          dina_high <= wdata[63:32];
-          control_low_word <= mk_ctrl(cur_bank, !cur_ins, cur_ins, 1'b1, widx);
-          st <= S_WR_LO;
+          // DMA_IN read stall: hold until the DMA engine presents the next word.
+          if ((cur_cid == C_DIN) && !cur_ins && !cur_sk && !dma_rd_valid) begin
+            control_low_word <= 32'd0;
+          end else begin
+            wdata = cur_wr_data();
+            dina_low  <= wdata[31:0];
+            dina_high <= wdata[63:32];
+            control_low_word <= mk_ctrl(cur_bank, !cur_ins, cur_ins, 1'b1, widx);
+            st <= S_WR_LO;
+          end
         end
         S_WR_LO: begin
           control_low_word <= mk_ctrl(cur_bank, !cur_ins, cur_ins, 1'b0, widx);
@@ -535,9 +577,12 @@ module fhe_microseq
         S_RD: begin
           if (rd_wait < 3'd2) begin
             rd_wait <= rd_wait + 1'b1;
+          end else if (!cur_sk && !dma_wr_ready) begin
+            // DMA_OUT write stall: the DMA FIFO is full; hold this beat (rd_wait
+            // stays at 2, core read address held) until it can accept the word.
           end else begin
             if (cur_sk) sk_mem[mv_limb*N + widx] <= dout;  // SK-store
-            else begin ext_dout <= dout; ext_dout_we <= 1'b1; end // DMA_OUT
+            else begin ext_dout <= dout; ext_dout_we <= 1'b1; end // DMA_OUT push
             if (widx == wn - 1) begin
               control_low_word <= 32'd0;
               pc <= pc + 8'd1;
@@ -578,10 +623,14 @@ module fhe_microseq
         end
         // -------------------------------------------------------------
         S_DONE: begin
-          busy        <= 1'b0;
-          done        <= 1'b1;
-          limb_active <= 1'b0;
-          st          <= S_IDLE;
+          // Wait for any in-flight DMA write burst to commit before signalling
+          // completion, so a following command reads coherent DRAM.
+          if (dma_ready) begin
+            busy        <= 1'b0;
+            done        <= 1'b1;
+            limb_active <= 1'b0;
+            st          <= S_IDLE;
+          end
         end
         default: st <= S_IDLE;
       endcase
