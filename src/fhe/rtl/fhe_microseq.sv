@@ -324,19 +324,22 @@ module fhe_microseq
   logic          desc_wr_r;
   logic [2:0]    desc_ptr_r;
   logic [3:0]    desc_limb_r;
+
+  // sk-bank: the walker's resident +sk_ntt store (an SRAM macro in fhe_mem_top
+  // for real N; a reg array here). NOT addressed over the 3-bit Aloha bram_sel
+  // -- MOVE moves between this local store and a core bank via send64/receive64.
+  // (Declared before the assigns below, which reference cur_sk -- required under
+  // `default_nettype none in the full Caliptra build.)
+  logic [63:0]   sk_mem [0:N*FHE_L-1];
+  logic          cur_sk;          // current op touches sk_mem
+  logic [3:0]    mv_limb;         // limb whose sk slice this MOVE uses
+
   assign dma_desc_valid = (st == S_DMA_REQ) && dma_ready;
   assign dma_desc_wr    = desc_wr_r;
   assign dma_desc_ptr   = desc_ptr_r;
   assign dma_desc_limb  = desc_limb_r;
   // pop a DMA_IN word the cycle the walker consumes it (S_WR, not stalled)
   assign dma_rd_pop     = (st == S_WR) && !cur_ins && !cur_sk && (cur_cid == C_DIN) && dma_rd_valid;
-
-  // sk-bank: the walker's resident +sk_ntt store (an SRAM macro in fhe_mem_top
-  // for real N; a reg array here). NOT addressed over the 3-bit Aloha bram_sel
-  // -- MOVE moves between this local store and a core bank via send64/receive64.
-  logic [63:0]   sk_mem [0:N*FHE_L-1];
-  logic          cur_sk;          // current op touches sk_mem
-  logic [3:0]    mv_limb;         // limb whose sk slice this MOVE uses
 
   // ---- scale patch (replicates ins_rns / ins_i2f bit math) ----
   // replicate ins_rns / ins_i2f scale-field packing exactly. RNS: sh masked

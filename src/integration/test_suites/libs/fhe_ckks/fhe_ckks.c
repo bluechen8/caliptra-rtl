@@ -54,3 +54,31 @@ uint32_t fhe_run_poll(uint32_t cmd) {
     } while ((st & FHE_STATUS_VALID) == 0);
     return st;
 }
+
+void fhe_set_kg_seed(uint64_t seed) {
+    lsu_write_32(FHE_REG_KGSEED0, (uint32_t)(seed & 0xFFFFFFFF));
+    lsu_write_32(FHE_REG_KGSEED1, (uint32_t)(seed >> 32));
+}
+
+void fhe_set_a_seed(uint64_t seed) {
+    lsu_write_32(FHE_REG_ASEED0, (uint32_t)(seed & 0xFFFFFFFF));
+    lsu_write_32(FHE_REG_ASEED1, (uint32_t)(seed >> 32));
+}
+
+void fhe_set_err_seed(uint64_t seed) {
+    lsu_write_32(FHE_REG_ESEED0, (uint32_t)(seed & 0xFFFFFFFF));
+    lsu_write_32(FHE_REG_ESEED1, (uint32_t)(seed >> 32));
+}
+
+void fhe_set_scales(uint32_t kg_scale, uint32_t enc_scale, uint32_t i2f_scale) {
+    lsu_write_32(FHE_REG_KGSCALE,  kg_scale);
+    lsu_write_32(FHE_REG_ENCSCALE, enc_scale);
+    lsu_write_32(FHE_REG_I2FSCALE, i2f_scale);
+}
+
+void fhe_set_ptr(uint32_t idx, uint64_t addr) {
+    // PTR0..3 are at base+0x58, each 8 bytes (lo,hi).
+    uintptr_t lo = (uintptr_t)FHE_REG_PTR0_LO + (uintptr_t)idx * 8u;
+    lsu_write_32(lo,     (uint32_t)(addr & 0xFFFFFFFF));
+    lsu_write_32(lo + 4, (uint32_t)(addr >> 32));
+}

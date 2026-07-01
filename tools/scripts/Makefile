@@ -149,7 +149,15 @@ endif
 AUX_LIB_DIR ?=
 VPATH = $(TEST_DIR) $(BUILD_DIR) $(TBDIR) $(RISCV_HW_IF_DIR) $(ISR_DIR) $(PRINTF_DIR) $(COMP_LIBS) $(AUX_LIB_DIR)
 
-# Use eval to expand env variables in the .vf file
+# Top-level testbench filelist. Overridable so the FHE_WALKER build can select
+# caliptra_top_tb_fhe.vf (base tb.vf + Aloha core + fhe_microseq/fhe_dma):
+#   make ... TB_VF=$CALIPTRA_ROOT/src/integration/config/caliptra_top_tb_fhe.vf \
+#            EXTRA_DEFS="+define+FHE_WALKER +define+CALIPTRA_NO_ADAMS_BRIDGE +define+FHE_N=256"
+TB_VF ?= $(TBDIR)/../config/caliptra_top_tb.vf
+
+# Use eval to expand env variables in the .vf file. (TBFILES is only the make
+# dependency list; keep it on the base tb.vf -- a nested '-f' line in TB_VF would
+# inject bogus prerequisites.)
 $(eval TBFILES = $(shell cat $(TBDIR)/../config/caliptra_top_tb.vf | grep -v '+incdir+'))
 
 #defines  = $(BUILD_DIR)/common_defines.vh
@@ -274,14 +282,14 @@ clean_fw:
 
 ############ Model Builds ###############################
 
-verilator-build: $(TBFILES) $(INCLUDES_DIR)/defines.h $(TB_VERILATOR_SRCS) $(TBDIR)/../config/caliptra_top_tb.vf
+verilator-build: $(TBFILES) $(INCLUDES_DIR)/defines.h $(TB_VERILATOR_SRCS) $(TB_VF)
 	set -eo pipefail; $(VERILATOR) $(TB_VERILATOR_SRCS) --cc -CFLAGS "$(CFLAGS)" \
 	  +libext+.v+.sv +define+RV_OPENSOURCE \
 	  --timescale 1ns/100ps \
 	  --timing \
 	  $(includes) \
 	  $(suppress) \
-	  -f $(TBDIR)/../config/caliptra_top_tb.vf --top-module caliptra_top_tb \
+	  -f $(TB_VF) --top-module caliptra_top_tb \
 	  -f $(TBDIR)/../config/caliptra_top_tb.vlt \
 	  -exe test_caliptra_top_tb.cpp --autoflush $(VERILATOR_DEBUG) \
 	  $(TB_DEFS) 2>&1 | tee verilator_build.log
@@ -291,7 +299,7 @@ verilator-build: $(TBFILES) $(INCLUDES_DIR)/defines.h $(TB_VERILATOR_SRCS) $(TBD
 vcs-build: $(TBFILES) $(INCLUDES_DIR)/defines.h $(TB_DPI_SRCS)
 	vlogan -full64 -sverilog -kdb -incr_vlogan +lint=IA_CHECKFAIL -assert svaext \
 	  +define+CLP_ASSERT_ON $(TB_DEFS) -noinherit_timescale=1ns/1ps \
-	  -f $(TBDIR)/../config/caliptra_top_tb.vf
+	  -f $(TB_VF)
 	vcs -full64 -kdb -lca -debug_access+all -j8 +vcs+lic+wait -partcomp -fastpartcomp=j8 \
 	  -assert enable_hier caliptra_top_tb -o simv.caliptra_top_tb +dpi -cflags "$(TB_DPI_INCS)" $(TB_DPI_SRCS)
 
@@ -302,7 +310,7 @@ verilator: program.hex verilator-build
 
 vcs: program.hex vcs-build
 	cp $(TEST_GEN_FILES) $(BUILD_DIR)
-	./simv.caliptra_top_tb
+	./simv.caliptra_top_tb $(VERILATOR_RUN_ARGS)
 
 ############ TEST build ###############################
 

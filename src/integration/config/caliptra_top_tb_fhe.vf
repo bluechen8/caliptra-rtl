@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Stage-B' 2c-step-3b: the FHE_WALKER caliptra_top_tb filelist.
+//
+// This is the base caliptra_top_tb.vf PLUS the Aloha-HE composed CKKS core and
+// the FHE microsequencer/DMA, which are only compiled when fhe_top instantiates
+// the real datapath (+define+FHE_WALKER). The base build (caliptra_top_tb.vf)
+// keeps the lean Stage-0 stub path and does NOT parse the (large) Aloha core.
+//
+// Build with the native Makefile, e.g. (N=256):
+//   export ALOHA_PORT=$CALIPTRA_ROOT/src/fhe/aloha
+//   export ALOHA_SRC=$ALOHA_PORT/vendor
+//   make -C <rundir> -f $CALIPTRA_ROOT/tools/scripts/Makefile \
+//     TESTNAME=smoke_test_fhe \
+//     TB_VF=$CALIPTRA_ROOT/src/integration/config/caliptra_top_tb_fhe.vf \
+//     EXTRA_DEFS="+define+FHE_WALKER +define+CALIPTRA_NO_ADAMS_BRIDGE +define+FHE_N=256" \
+//     verilator
+//
+// The Aloha core $readmemh's its FFT/RNS twiddle ROMs from the run cwd; generate
+// the matching N=256 .mem files into <rundir> before the run (see run_smoke_fhe.sh).
+
+// 1) The full caliptra_top_tb (VeeR + soc_ifc + crypto + the FHE stub block).
+-f ${CALIPTRA_ROOT}/src/integration/config/caliptra_top_tb.vf
+
+// 2) The Aloha-HE composed core (ComputeCoreWrapper -> ComputeCore -> engines +
+//    INS_RAM microcode). Needs $ALOHA_PORT / $ALOHA_SRC exported in the env.
+//    The vendored Aloha RTL predates the Caliptra `default_nettype none
+//    convention (it has a few implicit 1-bit nets), so relax to default-wire
+//    around it, then restore strict nets for our own FHE RTL. (Verilator is
+//    lenient about implicit nets; VCS/Xcelium under nettype-none are not.)
+${CALIPTRA_ROOT}/src/fhe/rtl/fhe_nettype_wire.v
+-f ${CALIPTRA_ROOT}/src/fhe/aloha/sim/aloha_core.f
+${CALIPTRA_ROOT}/src/fhe/rtl/fhe_nettype_none.v
+
+// 3) The FHE outer sequencer + dedicated DMA engine (instantiated by fhe_top
+//    under `ifdef FHE_WALKER). Both reuse only in-tree prims/AXI already in the
+//    base filelist, plus the Aloha core above.
+${CALIPTRA_ROOT}/src/fhe/rtl/fhe_microseq.sv
+${CALIPTRA_ROOT}/src/fhe/rtl/fhe_dma.sv
+
+// 4) TB-only: behavioral AXI DRAM model + round-trip checker that backs the FHE
+//    DMA manager (instantiated by caliptra_top_tb.sv under `ifdef FHE_WALKER).
+${CALIPTRA_ROOT}/src/integration/tb/fhe_axi_dram_model.sv

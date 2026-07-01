@@ -39,6 +39,27 @@
 #define FHE_REG_KEY_DST_ADDR0     (CLP_FHE_REG_BASE_ADDR + 0x28)
 #define FHE_REG_KEY_DST_ADDR1     (CLP_FHE_REG_BASE_ADDR + 0x2C)
 #define FHE_REG_CONFIG            (CLP_FHE_REG_BASE_ADDR + 0x30)
+// Stage-B' 2c microsequencer inputs: program-level seeds (EXE sampling) +
+// firmware-computed scales (INS scale-field patches). See microseq doc 5.1.
+#define FHE_REG_KGSEED0           (CLP_FHE_REG_BASE_ADDR + 0x34)
+#define FHE_REG_KGSEED1           (CLP_FHE_REG_BASE_ADDR + 0x38)
+#define FHE_REG_ASEED0            (CLP_FHE_REG_BASE_ADDR + 0x3C)
+#define FHE_REG_ASEED1            (CLP_FHE_REG_BASE_ADDR + 0x40)
+#define FHE_REG_ESEED0            (CLP_FHE_REG_BASE_ADDR + 0x44)
+#define FHE_REG_ESEED1            (CLP_FHE_REG_BASE_ADDR + 0x48)
+#define FHE_REG_KGSCALE           (CLP_FHE_REG_BASE_ADDR + 0x4C)
+#define FHE_REG_ENCSCALE          (CLP_FHE_REG_BASE_ADDR + 0x50)
+#define FHE_REG_I2FSCALE          (CLP_FHE_REG_BASE_ADDR + 0x54)
+// B' 2c-step-2: four DMA base-pointer registers (byte addresses of the poly
+// buffers in DRAM), indexed by the walker's PTR index 0..3.
+#define FHE_REG_PTR0_LO           (CLP_FHE_REG_BASE_ADDR + 0x58)
+#define FHE_REG_PTR0_HI           (CLP_FHE_REG_BASE_ADDR + 0x5C)
+#define FHE_REG_PTR1_LO           (CLP_FHE_REG_BASE_ADDR + 0x60)
+#define FHE_REG_PTR1_HI           (CLP_FHE_REG_BASE_ADDR + 0x64)
+#define FHE_REG_PTR2_LO           (CLP_FHE_REG_BASE_ADDR + 0x68)
+#define FHE_REG_PTR2_HI           (CLP_FHE_REG_BASE_ADDR + 0x6C)
+#define FHE_REG_PTR3_LO           (CLP_FHE_REG_BASE_ADDR + 0x70)
+#define FHE_REG_PTR3_HI           (CLP_FHE_REG_BASE_ADDR + 0x74)
 
 // Commands (FHE_CTRL[2:0])
 #define FHE_CMD_NONE              0x0
@@ -65,5 +86,13 @@ void     fhe_set_src_addr(uint64_t addr);
 void     fhe_set_config(uint8_t target_level, uint8_t param_set_id);
 // Issue a command and poll STATUS until VALID; returns the final STATUS word.
 uint32_t fhe_run_poll(uint32_t cmd);
+
+// Stage-B' 2c microsequencer programming (write a 64-bit value lo/hi).
+void     fhe_set_kg_seed(uint64_t seed);
+void     fhe_set_a_seed(uint64_t seed);
+void     fhe_set_err_seed(uint64_t seed);
+void     fhe_set_scales(uint32_t kg_scale, uint32_t enc_scale, uint32_t i2f_scale);
+// Write DMA base pointer reg `idx` (0..3) with a 64-bit DRAM byte address.
+void     fhe_set_ptr(uint32_t idx, uint64_t addr);
 
 #endif

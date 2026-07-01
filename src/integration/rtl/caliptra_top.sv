@@ -58,6 +58,17 @@ module caliptra_top
     axi_if.w_mgr m_axi_w_if,
     axi_if.r_mgr m_axi_r_if,
 
+`ifdef FHE_WALKER
+    // Dedicated FHE DMA AXI manager (B' 2c-step-3a). 64-bit data, distinct from
+    // the 32-bit soc_ifc m_axi above (fhe_dma is fixed DW=64), so it gets its own
+    // top-level manager port rather than sharing/arbitrating onto m_axi. The
+    // wrapper attaches it to FBUS via a (deferred) Chisel TLClientNode; in the
+    // native caliptra_top_tb flow it is backed by a behavioral AXI DRAM model.
+    // Only present in the FHE_WALKER build (the SoC/stub build omits it entirely).
+    axi_if.w_mgr fhe_m_axi_w_if,
+    axi_if.r_mgr fhe_m_axi_r_if,
+`endif
+
     // Caliptra Memory Export Interface
     el2_mem_if.veer_sram_src           el2_mem_export,
 `ifndef CALIPTRA_NO_ADAMS_BRIDGE
@@ -1157,6 +1168,13 @@ abr_top #(
 fhe_top #(
     .AHB_DATA_WIDTH(`CALIPTRA_AHB_HDATA_SIZE),
     .AHB_ADDR_WIDTH(`CALIPTRA_SLAVE_ADDR_WIDTH(`CALIPTRA_SLAVE_SEL_FHE))
+`ifdef FHE_WALKER
+    // FHE DMA AXI manager geometry: matches the soc_ifc DMA manager's addr/id/user
+    // widths (data is fixed 64-bit inside fhe_dma).
+    , .FHE_AXI_AW(`CALIPTRA_AXI_DMA_ADDR_WIDTH)
+    , .FHE_AXI_UW(CPTRA_AXI_DMA_USER_WIDTH)
+    , .FHE_AXI_IW(CPTRA_AXI_DMA_ID_WIDTH)
+`endif
 ) fhe_inst (
      .clk               (clk_cg),
      .rst_b             (cptra_noncore_rst_b),
@@ -1173,15 +1191,20 @@ fhe_top #(
      .busy_o            (fhe_busy),
      .error_intr        (fhe_error_intr),
      .notif_intr        (fhe_notif_intr),
-     .fhe_memory_export (fhe_memory_export),
-     // Stage-B' 2c microsequencer DMA word-stream: idle on the SoC build (stub
-     // path, `FHE_WALKER` undefined). 2c-step-2 wires these to the soc_ifc AXI
-     // DMA / FBUS master; for now the inputs are tied off and outputs left open.
-     .fhe_dma_sel       (/* unconnected */),
-     .fhe_dma_idx       (/* unconnected */),
-     .fhe_dma_din       (64'd0),
-     .fhe_dma_dout_we   (/* unconnected */),
-     .fhe_dma_dout      (/* unconnected */)
+     .fhe_memory_export (fhe_memory_export)
+`ifdef FHE_WALKER
+     // B' 2c-step-3a: the real datapath drives a dedicated FHE DMA AXI manager,
+     // brought straight up to the caliptra_top boundary (no merge with m_axi).
+     , .fhe_axi_r_if    (fhe_m_axi_r_if)
+     , .fhe_axi_w_if    (fhe_m_axi_w_if)
+`else
+     // Stage-0/SoC stub: transitional ptr-indexed word-stream, tied idle.
+     , .fhe_dma_sel     (/* unconnected */)
+     , .fhe_dma_idx     (/* unconnected */)
+     , .fhe_dma_din     (64'd0)
+     , .fhe_dma_dout_we (/* unconnected */)
+     , .fhe_dma_dout    (/* unconnected */)
+`endif
 );
 `else
     // FHE accelerator removed — tie off signals

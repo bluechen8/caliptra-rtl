@@ -221,9 +221,13 @@ self-gated by reproducing the shipped `N=8192` vectors before being used at smal
 
 ---
 
-## B. Stage-0 FHE block tests
+## B. Caliptra-integrated FHE block tests
 
-### Fast standalone unit TB (Verilator, ~seconds)
+Three surfaces, in ascending fidelity: the Stage-0 behavioral stub, the B′ real datapath +
+dedicated DMA (standalone Verilator), and the full-SoC firmware-driven smoke (VeeR on
+`caliptra_top_tb`, VCS).
+
+### Fast standalone unit TB — Stage-0 stub (Verilator, ~seconds)
 
 ```bash
 ./tb/run_fhe_top_tb.sh      # builds + runs fhe_top_tb; prints "FHE_TOP_TB: TEST PASSED"
@@ -255,19 +259,46 @@ under `tb/`. The walker's instruction/seed trace alone (no core, no DMA) is chec
 `./tb/run_fhe_microseq.sh`; the walker driving the real core (no DMA, TB array model)
 is the `+WALKER` mode of `aloha/sim/run_roundtrip.sh` (see §A.3).
 
-### Firmware-driven smoke test on the full SoC
+### B′ 2c-step-3 — firmware-driven smoke on the full SoC (VeeR → real datapath → DMA)
 
-`smoke_test_fhe` boots the SoC (`caliptra_top_tb`), reaches `main()`, drives the FHE
-AHB registers from VeeR, and prints `FHE smoke test PASSED`. It runs on the native
-Caliptra build flow (VCS or Xcelium), not standalone Verilator:
+The end-to-end milestone: `smoke_test_fhe` boots the full `caliptra_top_tb`, reaches
+`main()`, and drives the FHE AHB registers from **VeeR firmware** to run the real Aloha
+datapath. It programs the microsequencer seeds / scales / `CONFIG.L` + the 4 DMA pointer
+registers, then issues **KEYGEN → ENCRYPT → DECRYPT** (polling `STATUS.VALID` per command).
+The ciphertext round-trips through the dedicated `fhe_dma` engine to a behavioral AXI DRAM
+model wired onto `caliptra_top`'s FHE manager port; the testbench backdoor-preloads the
+plaintext and, after the final `DMA_OUT`, checks recovered ≈ input (VeeR can't reach the
+DMA's external DRAM, so the TB owns the data check while the firmware owns the control path).
+
+This is the native Caliptra flow under **VCS** — Verilator 5.022 can **not** build the full
+`caliptra_top_tb` (the base SoC BFM uses `process::self()`/`fork` + `force` on VeeR input
+ports; pre-existing, unrelated to FHE). One harness does golden + ROM generation, the rv32
+firmware build, the VCS build, and the run:
 
 ```bash
-# (one-time env per the caliptra build — see ../../../CLAUDE.md and the design-review progress doc)
-make -C <rundir> -f $CALIPTRA_ROOT/tools/scripts/Makefile TESTNAME=smoke_test_fhe vcs   # or: xrun
+# from src/fhe/ — sources /ecad/tools/vlsi.bashrc for VCS; default LOGN=8 (N=256).
+SIM=vcs ./tb/run_smoke_fhe.sh 8
+# -> [FHE-TB] FHE DMA round-trip: PASS ...  * TESTCASE PASSED  ->  smoke_test_fhe RESULT: PASS
 ```
 
-Sources: `src/integration/test_suites/smoke_test_fhe/` + `libs/fhe_ckks/`. Full
-instructions are in `design-review/fhe-ckks-implementation-progress.md` (§"How to run the tests").
+Under the hood it generates `input.txt` + the Aloha FFT/RNS ROM `.mem` into the rundir,
+builds `program.hex` with the rv32 multilib toolchain, then builds+runs the model via the
+native Makefile with the FHE filelist + defines:
+
+```bash
+make -C <rundir> -f $CALIPTRA_ROOT/tools/scripts/Makefile \
+  TESTNAME=smoke_test_fhe \
+  TB_VF=$CALIPTRA_ROOT/src/integration/config/caliptra_top_tb_fhe.vf \
+  EXTRA_DEFS="+define+FHE_WALKER +define+FHE_N=256" \
+  VERILATOR_RUN_ARGS="+FHE_TVDIR=<rundir>" vcs      # or: xrun
+```
+
+`caliptra_top_tb_fhe.vf` = the base `caliptra_top_tb.vf` (`-f`-included) + the Aloha core
+(`aloha_core.f`) + `fhe_microseq`/`fhe_dma`, with the vendored Aloha sources bracketed by
+`` `default_nettype wire`/`none `` (they predate Caliptra's nettype-none convention). The
+`TB_VF` override keeps the lean default build untouched. Validated at **N = 256** (VCS
+V-2023.12). Sources: `src/integration/test_suites/smoke_test_fhe/` + `libs/fhe_ckks/`. Full
+status in `design-review/fhe-ckks-bprime-microsequencer.md` (§2c-step-3).
 
 ---
 

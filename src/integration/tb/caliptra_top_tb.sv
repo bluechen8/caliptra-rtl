@@ -93,6 +93,19 @@ module caliptra_top_tb (
         .UW(CPTRA_AXI_DMA_USER_WIDTH)
     ) m_axi_if (.clk(core_clk), .rst_n(cptra_rst_b));
 
+`ifdef FHE_WALKER
+    // Stage-B' 2c-step-3: dedicated FHE DMA AXI manager (64-bit data). Backed by
+    // a behavioral AXI subordinate DRAM model below (TB-only memory, separate from
+    // VeeR's address space). Geometry matches caliptra_top's fhe_m_axi_* port.
+    localparam int FHE_DMA_DW = 64;
+    axi_if #(
+        .AW(`CALIPTRA_AXI_DMA_ADDR_WIDTH),
+        .DW(FHE_DMA_DW),
+        .IW(CPTRA_AXI_DMA_ID_WIDTH),
+        .UW(CPTRA_AXI_DMA_USER_WIDTH)
+    ) fhe_m_axi_if (.clk(core_clk), .rst_n(cptra_rst_b));
+`endif
+
     logic ready_for_fuses;
     logic ready_for_mb_processing;
     logic mailbox_data_avail;
@@ -233,6 +246,12 @@ caliptra_top caliptra_top_dut (
     //AXI DMA Interface
     .m_axi_w_if(m_axi_if.w_mgr),
     .m_axi_r_if(m_axi_if.r_mgr),
+
+`ifdef FHE_WALKER
+    // Dedicated FHE DMA manager -> behavioral DRAM model (B' 2c-step-3a/3b).
+    .fhe_m_axi_w_if(fhe_m_axi_if.w_mgr),
+    .fhe_m_axi_r_if(fhe_m_axi_if.r_mgr),
+`endif
 
     .el2_mem_export(el2_mem_export.veer_sram_src),
     .abr_memory_export(abr_memory_export.req),
@@ -395,6 +414,19 @@ caliptra_top_tb_axi_complex tb_axi_complex_i (
     .ctrl               (axi_complex_ctrl   ),
     .axi_error_inj_en   (axi_error_inj_en)
 );
+
+`ifdef FHE_WALKER
+    // Stage-B' 2c-step-3: back the dedicated FHE DMA manager with a behavioral AXI
+    // subordinate DRAM model that also backdoor-preloads the golden plaintext and
+    // checks the recovered-slots round-trip. See src/integration/tb/fhe_axi_dram_model.sv.
+    // (fhe_m_axi_if is declared with the other AXI interfaces above and wired to
+    // caliptra_top's fhe_m_axi_* ports at the DUT instance.)
+    fhe_axi_dram_model #(.N(`FHE_N)) fhe_dram_model_i (
+        .clk   (core_clk),
+        .rst_n (cptra_rst_b),
+        .axi   (fhe_m_axi_if)
+    );
+`endif
 
 //=========================================================================-
 // SVA

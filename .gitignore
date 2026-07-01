@@ -5,3 +5,8 @@ src/integration/test_suites/libs/jtagdpi/jtagdpi.h.gch
 rundir/
 src/BP063-BU-01000-r0p1-00rel0/
 src/fhe/obj_dir
+
+# FHE smoke rundir (tools: src/fhe/tb/run_smoke_fhe.sh) and the VCS L0 regression
+# scratch dirs (tools/scripts/run_vcs_l0_regression.sh) — regenerable build/sim output.
+fhe_rundir/
+vcs_regr_*/
