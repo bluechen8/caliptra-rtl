@@ -1159,7 +1159,9 @@ abr_top #(
     assign responder_inst[`CALIPTRA_SLAVE_SEL_MLDSA].hrdata    = '0;
     // KeyVault tie-offs: ABR used kv_read[7:6], kv_read[2], kv_write[1]
     assign kv_read[7]  = '0;
-    assign kv_read[6]  = '0;
+`ifndef FHE_WALKER
+    assign kv_read[6]  = '0;   // C'-1b: driven by fhe_inst's KV seed reader when FHE_WALKER
+`endif
     assign kv_read[2]  = '0;
     assign kv_write[1] = '0;
 `endif
@@ -1197,6 +1199,16 @@ fhe_top #(
      // brought straight up to the caliptra_top boundary (no merge with m_axi).
      , .fhe_axi_r_if    (fhe_m_axi_r_if)
      , .fhe_axi_w_if    (fhe_m_axi_w_if)
+     // C'-1b: KeyVault keygen-seed read. FHE claims kv_read[6] -- but only when
+     // Adams Bridge is compiled out (ABR owns [6] otherwise). With ABR present
+     // the FHE KV port is left idle and firmware must leave KGKV_CTRL.KV_EN=0.
+  `ifdef CALIPTRA_NO_ADAMS_BRIDGE
+     , .fhe_kv_read     (kv_read[6])
+     , .fhe_kv_rd_resp  (kv_rd_resp[6])
+  `else
+     , .fhe_kv_read     (/* unconnected: kv_read[6] owned by Adams Bridge */)
+     , .fhe_kv_rd_resp  ('0)
+  `endif
 `else
      // Stage-0/SoC stub: transitional ptr-indexed word-stream, tied idle.
      , .fhe_dma_sel     (/* unconnected */)

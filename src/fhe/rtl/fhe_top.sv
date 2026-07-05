@@ -26,6 +26,9 @@
 //
 module fhe_top
   import fhe_params_pkg::*;
+`ifdef FHE_WALKER
+  import kv_defines_pkg::*;   // C'-1b: KeyVault seed read (kv_read_t/kv_rd_resp_t)
+`endif
 #(
   parameter AHB_DATA_WIDTH = 64,
   parameter AHB_ADDR_WIDTH = 32,
@@ -64,7 +67,13 @@ module fhe_top
   //   TB backs it with caliptra_axi_sram. Only present in the FHE_WALKER build.
   ,
   axi_if.r_mgr fhe_axi_r_if,
-  axi_if.w_mgr fhe_axi_w_if
+  axi_if.w_mgr fhe_axi_w_if,
+  // ---- Stage-C' 1b: KeyVault seed read port ----
+  //   The persistent CKKS keygen root secret lives in a firmware-provisioned
+  //   KeyVault entry (never on the AHB bus). fhe_kv_seed reads it out here on a
+  //   single KV client slot (kv_read[6], free when ABR is compiled out).
+  output kv_read_t    fhe_kv_read,
+  input  kv_rd_resp_t fhe_kv_rd_resp
 `else
   // ---- Stage-0/SoC stub: transitional ptr-indexed word-stream, tied idle ----
   ,
@@ -156,6 +165,10 @@ module fhe_top
   localparam logic [5:0] OFF_PTR2_HI  = 6'd27; // 0x6C
   localparam logic [5:0] OFF_PTR3_LO  = 6'd28; // 0x70
   localparam logic [5:0] OFF_PTR3_HI  = 6'd29; // 0x74
+  // C'-1b: KeyVault keygen-seed control. bit[0]=KV_EN (source the keygen root
+  // seed from KeyVault instead of the KGSEED regs); bits[8:4]=READ_ENTRY (KV
+  // entry index holding the 64-bit ternary seed, provisioned by firmware).
+  localparam logic [5:0] OFF_KGKV_CTRL = 6'd30; // 0x78
 
   logic [5:0] word_sel;
   assign word_sel = cif_addr[7:2];
@@ -172,9 +185,27 @@ module fhe_top
   logic [7:0]  param_set_id;
 
   // Stage-B' 2c microsequencer inputs (see OFF_* above)
-  logic [63:0] kg_seed, a_seed, err_seed;
+  logic [63:0] a_seed, err_seed;
   logic [31:0] kg_scale, enc_scale, i2f_scale;
   logic [63:0] dma_ptr [0:3];   // DMA base pointers, indexed by walker PTR index
+`ifndef FHE_KV_SEED_ONLY
+  // Plaintext AHB keygen-seed path. Present for bring-up (the DPI cosim + unit
+  // TBs have no KeyVault); COMPILED OUT by FHE_KV_SEED_ONLY so the final secure
+  // build has no way to inject a keygen seed in the clear over the bus.
+  logic [63:0] kg_seed;
+`endif
+
+  // C'-1b KeyVault keygen-seed control register (KGKV_CTRL).
+  logic        kgkv_en;
+  logic [4:0]  kgkv_entry;
+
+  // In the KV-only (secure) build KeyVault is the sole keygen-seed source, so
+  // the KV read is always taken on KEYGEN regardless of the KV_EN bit.
+`ifdef FHE_KV_SEED_ONLY
+  wire kgkv_en_eff = 1'b1;
+`else
+  wire kgkv_en_eff = kgkv_en;
+`endif
 
   fhe_cmd_e cmd_q;
   logic     cmd_valid;
@@ -203,13 +234,17 @@ module fhe_top
       key_dst_addr <= '0;
       target_level <= '0;
       param_set_id <= '0;
+`ifndef FHE_KV_SEED_ONLY
       kg_seed      <= '0;
+`endif
       a_seed       <= '0;
       err_seed     <= '0;
       kg_scale     <= '0;
       enc_scale    <= '0;
       i2f_scale    <= '0;
       for (int p = 0; p < 4; p++) dma_ptr[p] <= '0;
+      kgkv_en      <= 1'b0;
+      kgkv_entry   <= '0;
       cmd_q        <= FHE_NONE;
       cmd_valid    <= 1'b0;
     end else if (zeroize) begin
@@ -218,13 +253,17 @@ module fhe_top
       key_dst_addr <= '0;
       target_level <= '0;
       param_set_id <= '0;
+`ifndef FHE_KV_SEED_ONLY
       kg_seed      <= '0;
+`endif
       a_seed       <= '0;
       err_seed     <= '0;
       kg_scale     <= '0;
       enc_scale    <= '0;
       i2f_scale    <= '0;
       for (int p = 0; p < 4; p++) dma_ptr[p] <= '0;
+      kgkv_en      <= 1'b0;
+      kgkv_entry   <= '0;
       cmd_q        <= FHE_NONE;
       cmd_valid    <= 1'b0;
     end else begin
@@ -242,8 +281,10 @@ module fhe_top
             target_level <= cif_wdata[3:0];
             param_set_id <= cif_wdata[11:4];
           end
+`ifndef FHE_KV_SEED_ONLY
           OFF_KGSEED0:  kg_seed[31:0]   <= cif_wdata;
           OFF_KGSEED1:  kg_seed[63:32]  <= cif_wdata;
+`endif
           OFF_ASEED0:   a_seed[31:0]    <= cif_wdata;
           OFF_ASEED1:   a_seed[63:32]   <= cif_wdata;
           OFF_ESEED0:   err_seed[31:0]  <= cif_wdata;
@@ -259,6 +300,10 @@ module fhe_top
           OFF_PTR2_HI:  dma_ptr[2][63:32] <= cif_wdata;
           OFF_PTR3_LO:  dma_ptr[3][31:0]  <= cif_wdata;
           OFF_PTR3_HI:  dma_ptr[3][63:32] <= cif_wdata;
+          OFF_KGKV_CTRL: begin
+            kgkv_en    <= cif_wdata[0];
+            kgkv_entry <= cif_wdata[8:4];
+          end
           default: ;
         endcase
       end
@@ -306,6 +351,62 @@ module fhe_top
   localparam logic [63:0] R2MODQ [0:FHE_L-1] =
       '{0: 64'h00000f47_3d9a6eb2, 1: 64'h00007fff_f7000009, default: 64'd0};
 
+  // ---- C'-1b: KeyVault keygen-seed read ----
+  // On a KEYGEN command with KV_EN set, pulse the KV reader to fetch the 64-bit
+  // ternary root seed from the firmware-provisioned entry. The walker latches
+  // keygen_seed lazily at its EXE step -- hundreds of cycles after cmd_valid (a
+  // full N-word CONST runs first) -- so the ~3-cycle KV read always resolves in
+  // time; no cmd_valid stall is needed. Authorization/lock failures set
+  // kv_err_q, folded into ctrl_error so firmware refuses the resulting key.
+  logic        kv_start;
+  logic [63:0] kv_seed;
+  logic        kv_seed_valid, kv_seed_error;
+  logic        kv_err_q;
+
+  assign kv_start = cmd_accept & (cif_wdata[2:0] == FHE_KEYGEN) & kgkv_en_eff;
+
+  // fhe_kv_seed holds the assembled seed stable on its `seed` output from the
+  // read's completion until the next command -- hundreds of cycles before the
+  // walker samples it -- so no extra latch is needed here (kg_seed_eff taps it
+  // directly). zeroize wipes the seed inside the module.
+  fhe_kv_seed #(.SEED_DWORDS(2)) i_fhe_kv_seed (
+    .clk        (clk),
+    .rst_b      (rst_b),
+    .zeroize    (zeroize),
+    .start      (kv_start),
+    .read_entry (kgkv_entry),
+    .kv_read    (fhe_kv_read),
+    .kv_rd_resp (fhe_kv_rd_resp),
+    .seed       (kv_seed),
+    .seed_valid (kv_seed_valid),
+    .seed_error (kv_seed_error),
+    .busy       (/* unused */)
+  );
+
+  // The module's seed_error only updates at read completion; kv_err_q adds the
+  // early clear at command start so a stale auth/lock error can't taint a new
+  // KEYGEN before the fresh read resolves.
+  always_ff @(posedge clk or negedge rst_b) begin
+    if (!rst_b) begin
+      kv_err_q  <= 1'b0;
+    end else if (zeroize) begin
+      kv_err_q  <= 1'b0;
+    end else begin
+      if (kv_start) kv_err_q <= 1'b0;  // clear stale error at command start
+      if (kv_seed_valid) kv_err_q <= kv_seed_error;
+    end
+  end
+
+  // Effective keygen seed. In the secure KV-only build KeyVault is the sole
+  // source (the KGSEED register path is compiled out); otherwise KV when
+  // enabled, else the AHB KGSEED register (DPI cosim / unit-TB paths).
+  logic [63:0] kg_seed_eff;
+`ifdef FHE_KV_SEED_ONLY
+  assign kg_seed_eff = kv_seed;
+`else
+  assign kg_seed_eff = kgkv_en_eff ? kv_seed : kg_seed;
+`endif
+
   // walker <-> core debug-IO
   logic [31:0] w_cl, w_ch, w_dl, w_dh;
   logic [31:0] core_dout_lo, core_dout_hi, core_status;
@@ -328,7 +429,7 @@ module fhe_top
     .zeroize        (zeroize),
     .cmd_valid      (cmd_valid),
     .cmd            (cmd_q),
-    .keygen_seed    (kg_seed),
+    .keygen_seed    (kg_seed_eff),
     .a_seed         (a_seed),
     .err_seed       (err_seed),
     .rns_scale_kg   (kg_scale),
@@ -418,7 +519,7 @@ module fhe_top
 
   assign ctrl_busy  = w_busy;
   assign ctrl_done  = w_done;
-  assign ctrl_error = w_error;
+  assign ctrl_error = w_error | kv_err_q;   // KV auth/lock failure taints keygen
 
 `else
   //--------------------------------------------------------------------------
@@ -466,8 +567,10 @@ module fhe_top
       OFF_KEYDST0: cif_rdata = key_dst_addr[31:0];
       OFF_KEYDST1: cif_rdata = key_dst_addr[63:32];
       OFF_CONFIG:  cif_rdata = {20'b0, param_set_id, target_level};
+`ifndef FHE_KV_SEED_ONLY
       OFF_KGSEED0: cif_rdata = kg_seed[31:0];
       OFF_KGSEED1: cif_rdata = kg_seed[63:32];
+`endif
       OFF_ASEED0:  cif_rdata = a_seed[31:0];
       OFF_ASEED1:  cif_rdata = a_seed[63:32];
       OFF_ESEED0:  cif_rdata = err_seed[31:0];
@@ -483,6 +586,7 @@ module fhe_top
       OFF_PTR2_HI: cif_rdata = dma_ptr[2][63:32];
       OFF_PTR3_LO: cif_rdata = dma_ptr[3][31:0];
       OFF_PTR3_HI: cif_rdata = dma_ptr[3][63:32];
+      OFF_KGKV_CTRL: cif_rdata = {23'b0, kgkv_entry, 3'b0, kgkv_en_eff};
       default:     cif_rdata = 32'b0;
     endcase
   end

@@ -33,6 +33,7 @@
 module fhe_top_dma_tb
   import fhe_params_pkg::*;
   import axi_pkg::*;
+  import kv_defines_pkg::*;   // C'-1b: KeyVault seed model types
 ;
   localparam int N    = FHE_N;
   localparam int LOGN = FHE_LOGN;
@@ -70,6 +71,7 @@ module fhe_top_dma_tb
   localparam logic [AHW-1:0] A_PTR1_LO  = 'h60;
   localparam logic [AHW-1:0] A_PTR2_LO  = 'h68;
   localparam logic [AHW-1:0] A_PTR3_LO  = 'h70;
+  localparam logic [AHW-1:0] A_KGKV_CTRL = 'h78;   // C'-1b KeyVault seed ctrl
 
   localparam int     RT_SCALE    = 17 + LOGN;
   localparam longint KEYGEN_SEED = 64'hA105_BEEF_0006_A001;
@@ -106,8 +108,23 @@ module fhe_top_dma_tb
     .hresp_o(hresp), .hreadyout_o(hreadyout), .hrdata_o(hrdata),
     .busy_o(busy_o), .error_intr(error_intr), .notif_intr(notif_intr),
     .fhe_memory_export(mem_if),
-    .fhe_axi_r_if(axi), .fhe_axi_w_if(axi)
+    .fhe_axi_r_if(axi), .fhe_axi_w_if(axi),
+    // C'-1b: KeyVault seed port. Default run leaves KGKV_CTRL.KV_EN=0 (AHB
+    // KGSEED register path); the +KVSEED run provisions dut_kv_* below and
+    // enables KV so the keygen root comes from the (modeled) KeyVault instead.
+    .fhe_kv_read(dut_kv_read), .fhe_kv_rd_resp(dut_kv_rd_resp)
   );
+
+  // ---- C'-1b: behavioral single-entry KeyVault model ----
+  localparam int    KV_ENTRY = 5;
+  kv_read_t         dut_kv_read;
+  kv_rd_resp_t      dut_kv_rd_resp;
+  logic [31:0]      kv_ent [0:KV_NUM_DWORDS-1];
+  always_comb begin
+    dut_kv_rd_resp.read_data = kv_ent[dut_kv_read.read_offset];
+    dut_kv_rd_resp.error     = 1'b0;   // authorization covered by fhe_kv_seed_tb
+    dut_kv_rd_resp.last      = (dut_kv_read.read_offset == KV_ENTRY_SIZE_W'(1));
+  end
 
   fhe_mem_top mem_inst (.clk_i(clk), .fhe_memory_export(mem_if));
 
@@ -302,7 +319,21 @@ module fhe_top_dma_tb
     for (int i = 0; i < N; i++) dram[(ADDR_P/8) + i] = g_input[i];
 
     // ---- firmware: seeds + scales + CONFIG.L ----
-    ahb_write(A_KGSEED0, KEYGEN_SEED[31:0]); ahb_write(A_KGSEED1, KEYGEN_SEED[63:32]);
+    // C'-1b: in +KVSEED mode the keygen root comes from the KeyVault. Provision
+    // the KV entry with the correct seed, enable KGKV_CTRL, and deliberately
+    // write the WRONG value to the AHB KGSEED regs. (The sk-scheme round-trip
+    // cancels for ANY key blob -- Rung-6 fact -- so recovery alone can't prove
+    // the source; the decisive check is the hierarchical assert on the walker's
+    // effective keygen seed after KEYGEN, below.)
+    if ($test$plusargs("KVSEED")) begin
+      kv_ent[0] = KEYGEN_SEED[31:0];
+      kv_ent[1] = KEYGEN_SEED[63:32];
+      ahb_write(A_KGKV_CTRL, {23'd0, 5'(KV_ENTRY), 3'd0, 1'b1}); // entry, KV_EN=1
+      ahb_write(A_KGSEED0, 32'hDEAD_0000); ahb_write(A_KGSEED1, 32'h0000_BEEF); // wrong on purpose
+      $display("  [dma] +KVSEED: keygen seed sourced from KeyVault entry %0d", KV_ENTRY);
+    end else begin
+      ahb_write(A_KGSEED0, KEYGEN_SEED[31:0]); ahb_write(A_KGSEED1, KEYGEN_SEED[63:32]);
+    end
     ahb_write(A_ASEED0,  A_SEED[31:0]);      ahb_write(A_ASEED1,  A_SEED[63:32]);
     ahb_write(A_ESEED0,  ERR_SEED[31:0]);    ahb_write(A_ESEED1,  ERR_SEED[63:32]);
     rns_scale = RT_SCALE - 52 - 1023 - LOGN; if (rns_scale < 0) rns_scale += 4096;
@@ -314,6 +345,18 @@ module fhe_top_dma_tb
 
     // ---- KEYGEN (no DMA) ----
     run_cmd(FHE_KEYGEN, "KEYGEN");
+
+    // C'-1b decisive check: the walker's effective keygen seed must equal the
+    // KeyVault-provisioned value (NOT the deliberately-wrong KGSEED registers).
+    if ($test$plusargs("KVSEED")) begin
+      if (dut.kg_seed_eff !== KEYGEN_SEED) begin
+        $display("FAIL[KVSEED]: kg_seed_eff=%h expected %h (KV seed did not reach walker)",
+                 dut.kg_seed_eff, KEYGEN_SEED);
+        errors++;
+      end else begin
+        $display("  [dma] +KVSEED: walker keygen seed = %h (from KeyVault) OK", dut.kg_seed_eff);
+      end
+    end
 
     // ---- ENCRYPT: msg<-PTR0(P), c0->PTR2(C0), c1->PTR3(C1) ----
     ahb_write64(A_PTR0_LO, 64'(ADDR_P));

@@ -23,9 +23,12 @@ $CALIPTRA_ROOT/src/axi/rtl/axi_mgr_rd.sv
 $CALIPTRA_ROOT/src/axi/rtl/axi_mgr_wr.sv
 // FHE block + Aloha core + the DMA engine.
 $ALOHA_PORT/../rtl/fhe_params_pkg.sv
+// C'-1b: KeyVault seed reader (fhe_top imports kv_defines_pkg under FHE_WALKER).
+$CALIPTRA_ROOT/src/keyvault/rtl/kv_defines_pkg.sv
 -f $ALOHA_PORT/sim/aloha_core.f
 $ALOHA_PORT/../rtl/fhe_microseq.sv
 $ALOHA_PORT/../rtl/fhe_dma.sv
+$ALOHA_PORT/../rtl/fhe_kv_seed.sv
 $ALOHA_PORT/../rtl/fhe_1r1w_ram.sv
 $ALOHA_PORT/../rtl/fhe_mem_if.sv
 $ALOHA_PORT/../rtl/fhe_mem_top.sv

@@ -186,6 +186,11 @@ module caliptra_top_tb_services
     logic                       inject_kv23_rand_length_key;
     logic                       inject_random_data;
     logic                       release_kv_inject_flags;
+`ifdef FHE_WALKER
+    // C'-1c: known 64-bit FHE keygen root seed injected into a KeyVault entry
+    // (opcode 0xc6). dwords 0/1 hold the seed; assembled = {[1],[0]}.
+    logic [31:0]                fhe_kv_seed_tb [0:15] = '{0:32'hCAFEBABE, 1:32'hDEADBEEF, default:32'd0};
+`endif
     logic                       check_pcr_ecc_signing;
     logic                       check_pcr_mldsa_signing;
     logic                       inject_single_msg_for_ecc_mldsa;
@@ -829,6 +834,21 @@ module caliptra_top_tb_services
                             force `CPTRA_TOP_PATH.key_vault1.kv_reg_hwif_in.KEY_ENTRY[slot_id][dword_i].data.next = $urandom();
                         end
                     end
+`ifdef FHE_WALKER
+                    //C'-1c: inject a known 64-bit FHE keygen seed into KV entry
+                    //WriteData[12:8], authorized for read-client 6 (kv_read[6]=FHE).
+                    else if((WriteData[7:0] == 8'hc6) && mailbox_write) begin
+                        release_kv_inject_flags <= '0;
+                        if (WriteData[12:8] == slot_id) begin
+                            force `CPTRA_TOP_PATH.key_vault1.kv_reg_hwif_in.KEY_CTRL[slot_id].dest_valid.we = 1'b1;
+                            force `CPTRA_TOP_PATH.key_vault1.kv_reg_hwif_in.KEY_CTRL[slot_id].dest_valid.next = 9'b0_0100_0000; // bit6 = FHE seed read client
+                            force `CPTRA_TOP_PATH.key_vault1.kv_reg_hwif_in.KEY_CTRL[slot_id].last_dword.we = 1'b1;
+                            force `CPTRA_TOP_PATH.key_vault1.kv_reg_hwif_in.KEY_CTRL[slot_id].last_dword.next = 'd1; // 64-bit seed = 2 dwords
+                            force `CPTRA_TOP_PATH.key_vault1.kv_reg_hwif_in.KEY_ENTRY[slot_id][dword_i].data.we = 1'b1;
+                            force `CPTRA_TOP_PATH.key_vault1.kv_reg_hwif_in.KEY_ENTRY[slot_id][dword_i].data.next = fhe_kv_seed_tb[dword_i];
+                        end
+                    end
+`endif
                     //inject valid mldsa seed dest and mldsa_seed value to key reg
                     else if((WriteData[7:0] == 8'hc0) && mailbox_write) begin
                         inject_mldsa_seed <= 1'b1;
@@ -1139,6 +1159,11 @@ module caliptra_top_tb_services
 
 
 
+`ifndef CALIPTRA_NO_ADAMS_BRIDGE
+    // C'-1c: MLDSA/ABR fault-injection backdoors reach into caliptra_top's
+    // abr_inst hierarchy, which does not exist when ABR is compiled out. Guard
+    // the whole block so the NoABR SoC build (the tape-out anchor, needed for the
+    // FHE KeyVault path) elaborates. ABR-on builds are unchanged.
     always_ff @(negedge clk or negedge cptra_rst_b) begin
         if (!cptra_rst_b) begin
             inject_makehint_failure <= 1'b0;
@@ -1199,6 +1224,7 @@ module caliptra_top_tb_services
         else if (!inject_normcheck_failure)
             release `CPTRA_TOP_PATH.abr_inst.norm_check_inst.invalid;
     end
+`endif // CALIPTRA_NO_ADAMS_BRIDGE (MLDSA fault-injection)
 
     `ifndef VERILATOR
     logic mldsa_keygen, mldsa_signing, mldsa_verify, mldsa_keygen_signing;
@@ -1373,6 +1399,8 @@ module caliptra_top_tb_services
     end
 
     genvar mldsa_dword;
+`ifndef CALIPTRA_NO_ADAMS_BRIDGE
+    // C'-1c: MLDSA test-vector injection into abr_inst.* -- absent under NoABR.
     generate
         //MLDSA keygen - inject seed
         for (mldsa_dword = 0; mldsa_dword < SEED_NUM_DWORDS; mldsa_dword++) begin
@@ -1507,6 +1535,7 @@ module caliptra_top_tb_services
             end
         end
     endgenerate
+`endif // CALIPTRA_NO_ADAMS_BRIDGE (MLDSA vector injection)
     `endif
 
     //Randomized wntz
@@ -1666,6 +1695,8 @@ endgenerate //IV_NO
 
     logic inject_zeroize_kv_read;
     logic inject_zeroize_to_mldsa;
+`ifndef CALIPTRA_NO_ADAMS_BRIDGE
+    // C'-1c: MLDSA KV-zeroize backdoor into abr_inst.* -- absent under NoABR.
     always@(posedge clk or negedge cptra_rst_b) begin
         if (~cptra_rst_b) begin
             inject_zeroize_kv_read <= 1'b0;
@@ -1692,6 +1723,7 @@ endgenerate //IV_NO
             release `CPTRA_TOP_PATH.abr_inst.abr_ctrl_inst.abr_reg_hwif_out.MLDSA_CTRL.ZEROIZE.value;
         end
     end
+`endif // CALIPTRA_NO_ADAMS_BRIDGE (MLDSA KV-zeroize)
 
     genvar g_client, g_entry;
     generate
@@ -1768,6 +1800,8 @@ endgenerate //IV_NO
 
     logic inject_mlkem_zeroize_kv_read;
     logic inject_zeroize_to_mlkem;
+`ifndef CALIPTRA_NO_ADAMS_BRIDGE
+    // C'-1c: MLKEM KV-zeroize backdoor into abr_inst.* -- absent under NoABR.
     always@(posedge clk or negedge cptra_rst_b) begin
         if (~cptra_rst_b) begin
             inject_mlkem_zeroize_kv_read <= 1'b0;
@@ -1798,6 +1832,7 @@ endgenerate //IV_NO
             release `CPTRA_TOP_PATH.abr_inst.abr_ctrl_inst.abr_reg_hwif_out.MLKEM_CTRL.ZEROIZE.value;
         end
     end
+`endif // CALIPTRA_NO_ADAMS_BRIDGE (MLKEM KV-zeroize)
 
     //Inject fatal error after a delay
     logic inject_fatal_error;

@@ -42,7 +42,13 @@ else
 fi
 python3 "$ALOHA_PORT/tvgen/gen_roundtrip.py" "$LOGN" "$WORK" >/dev/null
 
-echo "=== build $TOP (N=$N) ==="
+# KV_ONLY=1 builds the secure config (FHE_KV_SEED_ONLY): the plaintext KGSEED
+# register path is compiled out and KeyVault is forced as the sole keygen-seed
+# source. It implies +KVSEED (must provision + read the KV seed to work).
+EXTRA_DEF=""
+if [[ -n "${KV_ONLY:-}" ]]; then EXTRA_DEF="-DFHE_KV_SEED_ONLY"; export KVSEED=1; fi
+
+echo "=== build $TOP (N=$N) ${EXTRA_DEF:+[$EXTRA_DEF]} ==="
 [[ -n "${CLEAN:-}" ]] && rm -rf "$OBJ_DIR"
 "$VERILATOR" --binary -j 0 \
   --timing --assert \
@@ -51,7 +57,7 @@ echo "=== build $TOP (N=$N) ==="
   -Wno-CASEINCOMPLETE -Wno-BLKANDNBLK -Wno-MULTIDRIVEN -Wno-SELRANGE \
   -Wno-LATCH -Wno-IMPLICIT -Wno-UNSIGNED -Wno-CMPCONST -Wno-ASCRANGE \
   -Wno-PINMISSING -Wno-WIDTHCONCAT -Wno-GENUNNAMED -Wno-DECLFILENAME -Wno-UNUSEDSIGNAL \
-  -DFHE_WALKER -DFHE_N="$N" \
+  -DFHE_WALKER -DFHE_N="$N" $EXTRA_DEF \
   --Mdir "$OBJ_DIR" \
   -f "$FLIST" \
   -o "V$TOP" \
@@ -70,7 +76,11 @@ coe2mem "$MIF/TwFctrCache_RNSConsts.coe"   "$RUNDIR/fft_rns_rom.mem"
 coe2mem "$MIF/FFTStoredTwiddleFactors.coe" "$RUNDIR/fft_all_twiddle_rom.mem"
 
 echo "=== running (cwd=$RUNDIR) ==="
-( cd "$RUNDIR" && "$OBJ_DIR/V$TOP" +TVDIR="$WORK" ) 2>&1 | tee -a "$LOG"
+# KVSEED=1 sources the keygen root seed from a modeled KeyVault (C'-1b) and
+# asserts the walker's effective seed == the KV value (KGSEED regs held wrong).
+PLUSARGS=""
+[[ -n "${KVSEED:-}" ]] && PLUSARGS="+KVSEED"
+( cd "$RUNDIR" && "$OBJ_DIR/V$TOP" +TVDIR="$WORK" $PLUSARGS ) 2>&1 | tee -a "$LOG"
 
 echo "=== verdict ==="
 if grep -qiE "assertion failed|%Error|Failed opening file|TIMEOUT|RESULT: FAIL" "$LOG"; then

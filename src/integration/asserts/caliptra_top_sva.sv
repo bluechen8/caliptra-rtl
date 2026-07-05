@@ -235,6 +235,9 @@ module caliptra_top_sva
   )
   else $display("SVA ERROR: KV debug flush comprehensive check failed");
 
+`ifndef CALIPTRA_NO_ADAMS_BRIDGE
+  // C'-1c: ABR/MLKEM KeyVault-write assertions probe abr_inst.* -- absent under
+  // NoABR (the tape-out anchor / FHE KeyVault build). Guarded; ABR-on unchanged.
   generate
     for (genvar dword = 0; dword < KV_NUM_DWORDS; dword++) begin
       //mlkem shared key write
@@ -298,14 +301,16 @@ module caliptra_top_sva
                                                 $stable($past(`KEYVAULT_PATH.kv_reg1.hwif_out.KEY_ENTRY[`ABR_PATH.kv_mlkem_sharedkey_write_ctrl_reg.write_entry][dword].data.value, 16))
                                                 )
                                     else $display("SVA ERROR: Unexpected MLKEM sharedkey write to illegal slot in STD to LOCK flow in OCP LOCK mode!");
-          
+
 `endif
       end
     end
   endgenerate
+`endif // CALIPTRA_NO_ADAMS_BRIDGE (MLKEM sharedkey KV assertions)
 
   generate
     for(genvar dword = 0; dword < KV_NUM_DWORDS; dword++) begin
+`ifndef CALIPTRA_NO_ADAMS_BRIDGE
       if (dword < MLDSA_SEED_NUM_DWORDS) begin
       //mldsa seed read
       kv_mldsa_seed_r_flow:   assert property (
@@ -314,6 +319,7 @@ module caliptra_top_sva
                                             )
                                 else $display("SVA ERROR: MLDSA seed mismatch!, 0x%04x, 0x%04x", `KEYVAULT_PATH.kv_reg1.hwif_out.KEY_ENTRY[`ABR_PATH.kv_read[0].read_entry][dword].data.value, `ABR_PATH.mldsa_seed_reg[(MLDSA_SEED_NUM_DWORDS-1) - dword]);
       end
+`endif // CALIPTRA_NO_ADAMS_BRIDGE (MLDSA seed KV assertion)
 
       //hmac block read
       //If ocp_lock_in_progress = 1 && kv_read_entry == 23, block is not read
@@ -637,7 +643,9 @@ module caliptra_top_sva
   `endif
 
   `ifndef VERILATOR
-  // MLDSA Checks
+`ifndef CALIPTRA_NO_ADAMS_BRIDGE
+  // MLDSA Checks -- all probe abr_inst.* (functions + done/zeroize asserts),
+  // absent under NoABR (C'-1c). ABR-on builds compile this unchanged.
 
   // Helper function for byte swapping
   function automatic logic [31:0] byte_swap(logic [31:0] data);
@@ -966,6 +974,7 @@ module caliptra_top_sva
   
 
 
+`endif // CALIPTRA_NO_ADAMS_BRIDGE (MLDSA Checks)
   `endif
   //Generate disable signal for fuse_wr_check sva when hwclr is asserted. The disable needs to be for 3 clks in order to ignore the fuses being cleared
   logic clear_obf_secrets_f;

@@ -254,7 +254,11 @@ caliptra_top caliptra_top_dut (
 `endif
 
     .el2_mem_export(el2_mem_export.veer_sram_src),
+`ifndef CALIPTRA_NO_ADAMS_BRIDGE
+    // caliptra_top drops the abr_memory_export port when ABR is compiled out
+    // (C'-1c NoABR+FHE build); the TB's abr_mem_top model then just sits idle.
     .abr_memory_export(abr_memory_export.req),
+`endif
     .fhe_memory_export(fhe_memory_export.req),
     
     .ready_for_fuses(ready_for_fuses),
@@ -426,6 +430,25 @@ caliptra_top_tb_axi_complex tb_axi_complex_i (
         .rst_n (cptra_rst_b),
         .axi   (fhe_m_axi_if)
     );
+`ifdef CALIPTRA_NO_ADAMS_BRIDGE
+    // C'-1c decisive check: with the FHE KeyVault client connected (NoABR),
+    // prove the keygen root seed the walker consumes came from KeyVault
+    // (0xDEADBEEF_CAFEBABE, injected by tb_services opcode 0xc6) and NOT the
+    // KGSEED regs. The sk-scheme round-trip cancels for any key, so recovery
+    // alone can't prove the source -- this seed-value check is the real gate.
+    logic fhe_kv_seed_checked = 1'b0;
+    always @(posedge core_clk) begin
+        if (caliptra_top_dut.fhe_inst.kv_seed_valid && !fhe_kv_seed_checked) begin
+            fhe_kv_seed_checked <= 1'b1;
+            if (caliptra_top_dut.fhe_inst.kv_seed !== 64'hDEADBEEF_CAFEBABE)
+                $display("[FHE-KV-TB] FAIL: keygen seed 0x%016x != KeyVault 0xDEADBEEFCAFEBABE",
+                         caliptra_top_dut.fhe_inst.kv_seed);
+            else
+                $display("[FHE-KV-TB] PASS: keygen seed 0x%016x sourced from KeyVault (kv_read[6])",
+                         caliptra_top_dut.fhe_inst.kv_seed);
+        end
+    end
+`endif
 `endif
 
 //=========================================================================-

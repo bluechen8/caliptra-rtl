@@ -82,3 +82,8 @@ void fhe_set_ptr(uint32_t idx, uint64_t addr) {
     lsu_write_32(lo,     (uint32_t)(addr & 0xFFFFFFFF));
     lsu_write_32(lo + 4, (uint32_t)(addr >> 32));
 }
+
+void fhe_set_kgkv(uint32_t read_entry, uint32_t en) {
+    // KGKV_CTRL: bit0 = KV_EN, bits[8:4] = READ_ENTRY.
+    lsu_write_32(FHE_REG_KGKV_CTRL, ((read_entry & 0x1Fu) << 4) | (en ? 1u : 0u));
+}

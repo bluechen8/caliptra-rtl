@@ -14,10 +14,13 @@
 # we can confirm the FHE integration doesn't regress the existing L0 suite:
 #
 #   ./run_vcs_l0_regression.sh                 # default build, full L0 list
-#   BUILD=fhe ./run_vcs_l0_regression.sh       # FHE-enabled build, full L0 list
+#   BUILD=fhe ./run_vcs_l0_regression.sh       # ABR+FHE build, full L0 list
+#   BUILD=fhe_noabr ./run_vcs_l0_regression.sh # NoABR+FHE (tape-out anchor):
+#                                              #   curated fhe_noabr_regression.yml
+#                                              #   (ABR/ML-DSA/ML-KEM dropped, FHE added)
 #   BUILD=fhe JOBS=8 ./run_vcs_l0_regression.sh smoke_test_kv smoke_test_sha256   # subset
 #
-# Env: BUILD=default|fhe (default default) · JOBS=<n> parallel sims (default 6) ·
+# Env: BUILD=default|fhe|fhe_noabr (default default) · JOBS=<n> parallel sims (default 6) ·
 #      FHE_N=<n> for the FHE build (default 256) · TIMEOUT=<sec> per sim (default 3600).
 set -o pipefail   # NOT -u: vlsi.bashrc / caliptra-env.sh reference unbound vars
 
@@ -50,13 +53,24 @@ SCRATCH="$CALIPTRA_ROOT/vcs_regr_${BUILD}"
 COMMON="$SCRATCH/.simv_build"
 
 # --- per-build make flags + sim run args ---
+# BUILD modes: default | fhe (ABR+FHE) | fhe_noabr (NoABR+FHE -- the tape-out
+# anchor; uses the curated fhe_noabr_regression.yml which drops ABR/ML-DSA/ML-KEM
+# tests and adds the FHE accelerator tests, incl. the KeyVault-seed smoke).
 MK_ARGS=(CALIPTRA_ROOT="$CALIPTRA_ROOT")
 RUN_ARGS=(+CLP_REGRESSION)
-if [[ "$BUILD" == "fhe" ]]; then
+IS_FHE=0
+if [[ "$BUILD" == "fhe" || "$BUILD" == "fhe_noabr" ]]; then
+  IS_FHE=1
   export ALOHA_PORT="$CALIPTRA_ROOT/src/fhe/aloha"
   export ALOHA_SRC="$ALOHA_PORT/vendor"
+  DEFS="+define+FHE_WALKER +define+FHE_N=${FHE_N}"
+  if [[ "$BUILD" == "fhe_noabr" ]]; then
+    # NoABR = the tape-out anchor.
+    DEFS="$DEFS +define+CALIPTRA_NO_ADAMS_BRIDGE"
+    STIM="$CALIPTRA_ROOT/src/integration/stimulus/fhe_noabr_regression.yml"
+  fi
   MK_ARGS+=(TB_VF="$CALIPTRA_ROOT/src/integration/config/caliptra_top_tb_fhe.vf"
-            EXTRA_DEFS="+define+FHE_WALKER +define+FHE_N=${FHE_N}")
+            EXTRA_DEFS="$DEFS")
   RUN_ARGS+=(+FHE_TVDIR=.)
 fi
 
@@ -88,7 +102,7 @@ echo "   simv built."
 # FHE build: pre-generate the Aloha ROM .mem + a golden input.txt ONCE (the idle
 # FHE core $readmemh's them; identical for every test at this N).
 FHE_TV="$SCRATCH/.fhe_tv"
-if [[ "$BUILD" == "fhe" ]]; then
+if [[ "$IS_FHE" == 1 ]]; then
   mkdir -p "$FHE_TV/mif"
   LOGN=$(python3 -c "import math;print(int(math.log2($FHE_N)))")
   python3 "$ALOHA_PORT/tvgen/gen_roundtrip.py" "$LOGN" "$FHE_TV" >/dev/null 2>&1
@@ -108,12 +122,18 @@ run_one() {
     echo "FAIL" > "$rd/STATUS"; return
   fi
   cp "${TEST_GEN_FILES[@]}" "$rd/" 2>/dev/null
-  [[ "$BUILD" == "fhe" ]] && cp "$FHE_TV/input.txt" "$FHE_TV"/*.mem "$rd/" 2>/dev/null
+  [[ "$IS_FHE" == 1 ]] && cp "$FHE_TV/input.txt" "$FHE_TV"/*.mem "$rd/" 2>/dev/null
   # run the shared simv from the test's rundir (simv finds its .so via $ORIGIN,
   # reads program.hex + test vectors from cwd)
   ( cd "$rd" && timeout "$TIMEOUT" "$COMMON/simv.caliptra_top_tb" "${RUN_ARGS[@]}" ) \
       > "$rd/run.log" 2>&1
-  if grep -q '\* TESTCASE PASSED' "$rd/run.log"; then echo "PASS" > "$rd/STATUS"
+  # PASS = firmware TESTCASE PASSED AND no FHE-specific TB failure. The FHE
+  # round-trip / KeyVault-seed checks live in the TB (independent of the firmware
+  # STDOUT pass code), so a bad ct or a KV-seed mismatch would otherwise slip
+  # past the TESTCASE-PASSED grep. Those FAIL markers only appear in FHE tests.
+  if grep -q '\* TESTCASE PASSED' "$rd/run.log" \
+     && ! grep -qE '\[FHE-DRAM\] FHE DMA round-trip: FAIL|\[FHE-KV-TB\] FAIL' "$rd/run.log"; then
+    echo "PASS" > "$rd/STATUS"
   else echo "FAIL" > "$rd/STATUS"; fi
 }
 

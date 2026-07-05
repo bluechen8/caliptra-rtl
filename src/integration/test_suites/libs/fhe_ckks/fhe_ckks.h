@@ -60,6 +60,11 @@
 #define FHE_REG_PTR2_HI           (CLP_FHE_REG_BASE_ADDR + 0x6C)
 #define FHE_REG_PTR3_LO           (CLP_FHE_REG_BASE_ADDR + 0x70)
 #define FHE_REG_PTR3_HI           (CLP_FHE_REG_BASE_ADDR + 0x74)
+// C'-1b: KeyVault keygen-seed control. bit0 = KV_EN (source the keygen root
+// seed from KeyVault instead of the KGSEED regs); bits[8:4] = READ_ENTRY (the
+// KV entry index holding the 64-bit ternary seed, provisioned into KeyVault).
+#define FHE_REG_KGKV_CTRL         (CLP_FHE_REG_BASE_ADDR + 0x78)
+#define FHE_KGKV_CTRL_KV_EN       (1 << 0)
 
 // Commands (FHE_CTRL[2:0])
 #define FHE_CMD_NONE              0x0
@@ -94,5 +99,8 @@ void     fhe_set_err_seed(uint64_t seed);
 void     fhe_set_scales(uint32_t kg_scale, uint32_t enc_scale, uint32_t i2f_scale);
 // Write DMA base pointer reg `idx` (0..3) with a 64-bit DRAM byte address.
 void     fhe_set_ptr(uint32_t idx, uint64_t addr);
+// C'-1c: select the KeyVault entry holding the keygen root seed and enable KV
+// as the keygen-seed source (KGKV_CTRL). Pass en=0 to use the KGSEED regs.
+void     fhe_set_kgkv(uint32_t read_entry, uint32_t en);
 
 #endif
