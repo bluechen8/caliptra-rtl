@@ -1,0 +1,33 @@
+diff --git a/Aloha-HE_Common/ComputeCore.v b/Aloha-HE_Common/ComputeCore.v
+index 7b54a1b..e0c7759 100644
+--- a/Aloha-HE_Common/ComputeCore.v
++++ b/Aloha-HE_Common/ComputeCore.v
+@@ -842,11 +842,28 @@ always @(posedge clk) begin
+     random_sampling_rst_1DP <= random_sampling_rst;
+ end
+ 
++// C'-2: per-pass PRNG reseed pulse (default policy = reseed every sampling pass,
++// which reproduces the pre-C'-2 behaviour: each pass restarts the keystream from
++// its `seed`). A 1-cycle pulse at the pass-start edge (random_sampling_rst 1->0).
++// The free-run policy (suppress this for a/e0 passes; inject a CSRNG seed after
++// keygen) is layered on top by the walker via random_sampling_reseed_ext.
++reg random_sampling_rst_2DP;
++always @(posedge clk) begin
++  if(rst)
++    random_sampling_rst_2DP <= 1;
++  else
++    random_sampling_rst_2DP <= random_sampling_rst_1DP;
++end
++wire random_sampling_reseed;
++assign random_sampling_reseed = random_sampling_rst_2DP & ~random_sampling_rst_1DP;
++
+ RandomSampling #(.LOGN(LOGN),.LOGQ(54),.M(17),.W(24)) random_sampling (
+     .clk(clk),
+     .rst(random_sampling_rst_1DP),
+     .sample_errors(sample_errors),
+ 
++    .prng_rst(rst),                        // Trivium held/inited on core reset only
++    .reseed(random_sampling_reseed),       // per-pass reseed (free-run policy TBD by walker)
+     .seed(random_sampling_seed),
+     .current_k(current_k),
+     .qm(qm),

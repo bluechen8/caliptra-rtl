@@ -5,6 +5,9 @@
 +incdir+$ALOHA_SRC/Aloha-HE_Common
 $ALOHA_SRC/Aloha-HE_Common/CommonDefinitions.vh
 
+// C'-2: sampler PRNG = caliptra_prim_trivium (audited), replacing Trivium64.v.
+-f $ALOHA_PORT/sim/aloha_prim_trivium.f
+
 // --- our technology-generic memory models ---
 $ALOHA_PORT/rtl/aloha_bram_behav.sv
 
@@ -14,8 +17,7 @@ $ALOHA_SRC/Aloha-HE_Common/Utils/DelayRegisterReset.sv
 $ALOHA_SRC/Aloha-HE_Common/Utils/HammingWeight.sv
 $ALOHA_SRC/Aloha-HE_Common/Utils/Expand.sv
 
-// --- random sampling datapath ---
-$ALOHA_SRC/Aloha-HE_Common/RandomSampling/Trivium64.v
+// --- random sampling datapath (Trivium64.v retired; PRNG via aloha_prim_trivium.f) ---
 $ALOHA_SRC/Aloha-HE_Common/RandomSampling/TriviumAdapter.sv
 $ALOHA_SRC/Aloha-HE_Common/RandomSampling/RandomSampling.sv
 

@@ -33,9 +33,11 @@ $ALOHA_SRC/Aloha-HE_Common/FloatingPoint/FLPAdder.sv
 $ALOHA_SRC/Aloha-HE_Common/FloatingPoint/FLPMultiplier.sv
 $ALOHA_SRC/Aloha-HE_Common/FloatingPoint/IntToFlP.sv
 $ALOHA_SRC/Aloha-HE_Common/FloatingPoint/IntToFlPWrapper.sv
+// C'-2: sampler PRNG is now caliptra_prim_trivium (see aloha_prim_trivium.f,
+// listed by the standalone tops; in the SoC build it comes from the base .vf).
+// Trivium64.v is retired.
 $ALOHA_SRC/Aloha-HE_Common/RandomSampling/RandomSampling.sv
 $ALOHA_SRC/Aloha-HE_Common/RandomSampling/TriviumAdapter.sv
-$ALOHA_SRC/Aloha-HE_Common/RandomSampling/Trivium64.v
 $ALOHA_SRC/Aloha-HE_Common/SharedArithmetics/IntMultiplier_24x34.sv
 $ALOHA_SRC/Aloha-HE_Common/SharedArithmetics/IntMultiplier_54x54.sv
 $ALOHA_SRC/Aloha-HE_Common/SharedArithmetics/IntMultPool.sv

@@ -7,6 +7,9 @@
 // Reused Caliptra prim: hardened sync FIFO (Secure=0/Pass=0 -> minimal deps).
 // In the SoC build these are already compiled; only the standalone TB lists them.
 $CALIPTRA_ROOT/src/caliptra_prim/rtl/caliptra_prim_util_pkg.sv
+// C'-2: Aloha sampler PRNG = caliptra_prim_trivium (via TriviumAdapter).
+$CALIPTRA_ROOT/src/caliptra_prim/rtl/caliptra_prim_trivium_pkg.sv
+$CALIPTRA_ROOT/src/caliptra_prim/rtl/caliptra_prim_trivium.sv
 $CALIPTRA_ROOT/src/caliptra_prim/rtl/caliptra_prim_mubi_pkg.sv
 $CALIPTRA_ROOT/src/caliptra_prim/rtl/caliptra_prim_pkg.sv
 $CALIPTRA_ROOT/src/caliptra_prim/rtl/caliptra_prim_count_pkg.sv

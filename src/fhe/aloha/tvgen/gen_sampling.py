@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-# Aloha-HE sampler oracle (Trivium64 + CBD/ternary/uniform), validated bit-exact
-# against the shipped N=8192 error_sampling/key_sampling and against a canonical
-# serial eSTREAM Trivium (cipher gate). Emits small-N sampling tv.
+# Aloha-HE sampler oracle (Trivium + CBD/ternary/uniform). CBD/ternary/uniform
+# post-processing is bit-exact vs RandomSampling.sv and was validated against the
+# shipped N=8192 vectors under the old Trivium64.
+#
+# C'-2: the sampler PRNG is now caliptra_prim_trivium (SeedTypeKeyIv), so the
+# keystream -- and therefore the expected e0/e1/v/pk1 vectors -- are regenerated
+# from the CaliptraPrimTrivium SW model. The 18-update (1152-bit) KeyIv warmup is
+# baked into CaliptraPrimTrivium.__init__, so the first .step() word is already
+# post-warmup => OFF=0 (no extra discard, unlike the old Trivium64 OFF=18 path).
 import sys
-from trivium import Trivium64, cbd
-OFF=18  # warmup words (18*64 = 1152-cycle Trivium warmup)
+from trivium import CaliptraPrimTrivium, cbd
+OFF=0  # warmup baked into CaliptraPrimTrivium.__init__ (KeyIv auto-warmup)
 def tern(w):
     b=(w>>48)&0xffff
     return None if b==0xffff else (0 if b<0x5555 else (1 if b<0xaaaa else 3))
 def words(seed,n):
-    t=Trivium64(seed); return [t.step() for _ in range(n)]
+    t=CaliptraPrimTrivium(seed); return [t.step() for _ in range(n)]
 def gen_error(seeds,N,out):
     with open(out,"w") as f:
         for seed in seeds:
