@@ -72,11 +72,15 @@ module fhe_top_dma_tb
   localparam logic [AHW-1:0] A_PTR2_LO  = 'h68;
   localparam logic [AHW-1:0] A_PTR3_LO  = 'h70;
   localparam logic [AHW-1:0] A_KGKV_CTRL = 'h78;   // C'-1b KeyVault seed ctrl
+  localparam logic [AHW-1:0] A_ENTSEED0  = 'h7C;   // C'-2 a/e0 stream seed [31:0]
+  localparam logic [AHW-1:0] A_ENTSEED1  = 'h80;   // C'-2 a/e0 stream seed [63:32]
+  localparam logic [AHW-1:0] A_RNG_CTRL  = 'h84;   // C'-2 bit0=FREERUN_EN bit1=RESEED_REQ
 
   localparam int     RT_SCALE    = 17 + LOGN;
   localparam longint KEYGEN_SEED = 64'hA105_BEEF_0006_A001;
   localparam longint A_SEED      = 64'h0006_A002_C0FF_EE77;
   localparam longint ERR_SEED    = 64'h2350_e171_5239_2f72;
+  localparam longint ENT_SEED    = 64'hC5A9_1234_FEED_0FF1;  // CSRNG-sourced a/e0 stream seed
 
   // ------------------------------------------------------------------
   logic clk = 1'b0;
@@ -275,6 +279,22 @@ module fhe_top_dma_tb
     @(negedge clk);
   endtask
 
+  // C'-2 free-run helpers ------------------------------------------------------
+  // read N words from DRAM at `base` (e.g. the ciphertext c1 = uniform `a`, or the
+  // recovered OUT slots) into dst.
+  task automatic capture_slots(ref longint dst [], input int base);
+    for (int i = 0; i < N; i++) dst[i] = dram[(base/8) + i];
+  endtask
+  function automatic int diff_count(ref longint x [], ref longint y []);
+    diff_count = 0;
+    for (int i = 0; i < N; i++) if (x[i] !== y[i]) diff_count++;
+  endfunction
+  // firmware doorbell: write the CSRNG-sourced ENTSEED + assert RESEED_REQ.
+  task automatic doorbell(input longint s);
+    ahb_write64(A_ENTSEED0, s);
+    ahb_write(A_RNG_CTRL, 32'h3);                  // FREERUN_EN=1, RESEED_REQ=1
+  endtask
+
   function automatic bit close(input longint ab, input longint bb, input real eps);
     real a = $bitstoreal(ab);
     real b = $bitstoreal(bb);
@@ -374,8 +394,97 @@ module fhe_top_dma_tb
     begin
       longint reco [];
       reco = new[N];
-      for (int i = 0; i < N; i++) reco[i] = dram[(ADDR_OUT/8) + i];
+      capture_slots(reco, ADDR_OUT);
       check_fft(reco, g_input, N, "fhe_top+DMA round-trip (recovered vs input)", 1.0e-3);
+    end
+
+    // ---- C'-2 free-run PRNG test (+FREERUN) ----
+    // Enable free-run, then: (1) two back-to-back encrypts with NO doorbell must
+    // produce DIFFERENT c1(=a) -> the keystream continues, a never repeats;
+    // (2) a doorbell reseed with the SAME ENTSEED must restart the stream and
+    // reproduce encrypt#1's c1 -> the inject is deterministic; (3) a free-run
+    // ciphertext still decrypts to the input.
+    if ($test$plusargs("FREERUN")) begin
+      longint a1 [], a2 [], a3 [];
+      int diff12, diff13, base, guard;
+      logic [31:0] sdata;
+      a1 = new[N]; a2 = new[N]; a3 = new[N];
+      $display("== C'-2 free-run PRNG test ==");
+
+      ahb_write(A_RNG_CTRL, 32'h1);                 // FREERUN_EN=1 (NO doorbell yet)
+
+      // KEYGEN marks the a/e0 stream unseeded -> the first encrypt MUST wait for a
+      // firmware RESEED_REQ (enforced fresh entropy after keygen / cold reset).
+      run_cmd(FHE_KEYGEN, "KEYGEN(freerun)");
+      ahb_write64(A_PTR0_LO, 64'(ADDR_P));
+      ahb_write64(A_PTR2_LO, 64'(ADDR_C0));
+      ahb_write64(A_PTR3_LO, 64'(ADDR_C1));
+
+      // (0) ENFORCEMENT + OBSERVABILITY: the first encrypt with NO reseed must
+      //     STALL (not complete), raise a NOTIF interrupt, and set the bus-readable
+      //     STATUS.RESEED_REQ_PENDING (bit4) -- an observable wait, not a silent hang.
+      base = notif_count;
+      ahb_write(A_CTRL, {29'd0, FHE_ENCRYPT});
+      repeat (20000) @(posedge clk);                // >> a normal encrypt (~5567 cyc)
+      ahb_read(A_STATUS, sdata);                     // sdata[1]=VALID, sdata[4]=RESEED_REQ_PENDING
+      if (dut.status_valid) begin
+        $display("FAIL[FREERUN]: first encrypt completed with NO reseed (enforcement broken)"); errors++;
+      end else if (!dut.ctrl_wait_entropy) begin
+        $display("FAIL[FREERUN]: encrypt neither completed nor in reseed-wait (wedged?)"); errors++;
+      end else
+        $display("  [freerun] enforcement OK: first encrypt STALLED in reseed-wait");
+      if (notif_count == base) begin
+        $display("FAIL[FREERUN]: no NOTIF interrupt raised on entering reseed-wait"); errors++;
+      end else
+        $display("  [freerun] wait-notify OK: NOTIF raised on entering reseed-wait");
+      if (!sdata[4]) begin
+        $display("FAIL[FREERUN]: STATUS.RESEED_REQ_PENDING (bit4) not readable over AHB (read=%08h)", sdata); errors++;
+      end else
+        $display("  [freerun] STATUS OK: RESEED_REQ_PENDING readable over AHB (bit4=1)");
+
+      // release: deliver the doorbell WHILE the command is busy/stalled.
+      doorbell(ENT_SEED);
+      guard = 0;
+      while (!dut.status_valid && (guard < 50_000_000)) begin @(posedge clk); guard++; end
+      ahb_read(A_STATUS, sdata);
+      if (!dut.status_valid) begin
+        $display("FAIL[FREERUN]: stalled encrypt never released after RESEED_REQ"); errors++;
+      end else if (sdata[4]) begin
+        $display("FAIL[FREERUN]: RESEED_REQ_PENDING still set after release"); errors++;
+      end else
+        $display("  [freerun] release OK: encrypt#1 completed after RESEED_REQ (~%0d cyc)", guard);
+      @(negedge clk);
+      capture_slots(a1, ADDR_C1);
+
+      run_cmd(FHE_ENCRYPT, "ENCRYPT#2 (freerun: continue stream)");
+      capture_slots(a2, ADDR_C1);
+
+      diff12 = diff_count(a1, a2);
+      if (diff12 == 0) begin
+        $display("FAIL[FREERUN]: encrypt#1 and #2 produced IDENTICAL c1 -- a was REUSED"); errors++;
+      end else
+        $display("  [freerun] non-repeat OK: c1(=a) differs in %0d/%0d coeffs across two encrypts", diff12, N);
+
+      // doorbell: re-seed the stream with the SAME ENTSEED -> must reproduce a1.
+      doorbell(ENT_SEED);
+      run_cmd(FHE_ENCRYPT, "ENCRYPT#3 (freerun: doorbell reseed)");
+      capture_slots(a3, ADDR_C1);
+      diff13 = diff_count(a1, a3);
+      if (diff13 != 0) begin
+        $display("FAIL[FREERUN]: doorbell reseed (same ENTSEED) did not reproduce c1 (%0d diffs)", diff13); errors++;
+      end else
+        $display("  [freerun] reseed-determinism OK: same ENTSEED -> identical c1");
+
+      // functional: the last free-run ciphertext still decrypts to the input.
+      ahb_write64(A_PTR0_LO, 64'(ADDR_C0));
+      ahb_write64(A_PTR1_LO, 64'(ADDR_C1));
+      ahb_write64(A_PTR2_LO, 64'(ADDR_OUT));
+      run_cmd(FHE_DECRYPT, "DECRYPT(freerun)");
+      begin
+        longint reco []; reco = new[N];
+        capture_slots(reco, ADDR_OUT);
+        check_fft(reco, g_input, N, "freerun round-trip (recovered vs input)", 1.0e-3);
+      end
     end
 
     if (errors == 0) $display("fhe_top_dma_tb RESULT: PASS");

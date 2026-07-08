@@ -5,11 +5,14 @@
 // programs), exercising FFT -> sampling -> RNS -> NTT -> PWM composed through
 // the INS_RAM microcode sequencer rather than each engine in isolation.
 //
-// 5a: N=8192, validate the encode+encrypt ciphertext (one modulus) against the
-// shipped SEAL goldens (Testing/fullEnc.h, extracted by tvgen/extract_full.py).
+// A run-mode plusarg selects the flow: +ROUNDTRIP (5c self-contained recovered
+// round-trip), +SKHW (Rung 6 sk keygen + NTT cross-check), +WALKER (2b), or
+// +DPICOSIM (7c). There is no default mode. (The old no-plusarg Rung 5a, which
+// checked the ciphertext against shipped SEAL goldens, was retired at the C'-2
+// PRNG swap -- caliptra_prim_trivium no longer reproduces SEAL's a/e.)
 //
-// Golden dir via +TVDIR=<path>; instruction params are the fullEnc.h modulus-0
-// values. PROVIDE_DEBUG_IO=1 (send64/receive64 path), stored FFT twiddles.
+// Golden dir via +TVDIR=<path>. PROVIDE_DEBUG_IO=1 (send64/receive64 path),
+// stored FFT twiddles.
 
 `timescale 1ns/1ps
 
@@ -23,14 +26,9 @@ module tb_ckks_roundtrip;
   // datapath choice is a generator flag, not a runtime bit).
   localparam int SCHEME = `ifdef FHE_SK_HW 1 `else 0 `endif;
 
-  // ---- fullEnc.h modulus-0 parameters ---------------------------------------
-  localparam longint ERROR_POLYS_SEED = 64'h2350e17152392f72;
-  localparam int     SCALE            = 4;          // log_scale (host units, 5a goldens)
-  // 5c uses a real CKKS scale: noise ~ sqrt(N)*err/Delta must be << signal.
-  // scale=4 (Delta=16) is fine for HW==SEAL bit-match (5a) but useless for a
-  // clean recovered~=input round-trip at N=8192.
-  // Net encode scale = RT_SCALE - LOGN; keep it at the proven 17 (the @8192
-  // value) across all N so the RNS float->int stays in the same shift regime.
+  // ---- modulus-0/1 parameters -----------------------------------------------
+  // Encode scale = RT_SCALE - LOGN; kept at the proven 17 (the @8192 value)
+  // across all N so the RNS float->int stays in the same shift regime.
   localparam int     RT_SCALE         = 17 + LOGN;   // 30 @ N=8192, 25 @ N=256
   localparam int     QM0              = 'h9;        // q0 = 2^46 - 9*2^24 + 1
   localparam int     CURRENT_K0       = 0;          // log_q index (0 -> 46-bit)
@@ -46,8 +44,6 @@ module tb_ckks_roundtrip;
   // is ~2^(2*34-47)=2^21 -- ample precision at both N.
   localparam int     RESC_NET         = 34;
   localparam int     LOG2_Q1          = 47;         // round(log2(q1)); rescale residual 2^47/q1 ~ 1+1e-7
-  // pk1 seed for modulus 0 (pk1_seeds.txt[0]); errors use ERROR_POLYS_SEED.
-  longint PK1_SEED0;
 
   // BRAM IDs (match ComputeCore.v / communication.h)
   localparam int FFT_BRAM_ID        = 0;
@@ -83,6 +79,10 @@ module tb_ckks_roundtrip;
       .SCHEME(SCHEME)
     ) dut (
       .clk(clk),
+      // legacy: reseed every pass, Trivium reset coupled to the core reset (this
+      // TB validates the golden per-pass-reload keystream, not free-run).
+      .reseed_en(1'b1),
+      .prng_rst_i(core_ch[0]),
       .control_low_word(core_cl),
       .control_high_word(core_ch),
       .dina_ext_low_word(core_dl),
@@ -297,19 +297,7 @@ module tb_ckks_roundtrip;
   string tvdir;
   // one extra slot absorbs the trailing pad word some SDK arrays carry
   longint g_input    [0:N];
-  longint g_pk0      [0:N];
-  longint g_exp_c0   [0:N];
-  longint g_exp_c1   [0:N];
   longint g_pk1seeds [0:7];
-  longint g_msg_rns  [0:N];   // message_after_rns_mod0 (PRE-e0; add e0 for HW match)
-  longint g_e0       [0:N];   // e0_poly (6-bit sign-mag CBD error)
-  // decrypt+decode goldens (fullDec.h)
-  longint g_c0d      [0:N];   // c0_to_decrypt
-  longint g_c1d      [0:N];   // c1_to_decrypt
-  longint g_sk       [0:N];   // sk
-  longint g_dec_ntt  [0:N];   // decrypted_m_ntt   (after PWM, NTT domain)
-  longint g_intt     [0:N];   // intt_m_reference  (after inverse NTT)
-  longint g_proj_ref [0:N];   // projected_reference (final recovered slots, doubles)
 
   // dynamic buffers for send/receive
   longint plain_q [];
@@ -997,7 +985,7 @@ module tb_ckks_roundtrip;
       $display("RESULT: PASS");  // probe is informational
       $finish;
     end
-    if (!$value$plusargs("TVDIR=%s", tvdir)) tvdir = "../build/full8192";
+    if (!$value$plusargs("TVDIR=%s", tvdir)) tvdir = ".";
 
     // release reset
     control_high_word = 1; repeat (5) @(posedge clk);
@@ -1105,135 +1093,17 @@ module tb_ckks_roundtrip;
     end
 `endif
 
-    $readmemh({tvdir, "/input.txt"},            g_input);
-    $readmemh({tvdir, "/pk_0_mod0.txt"},        g_pk0);
-    $readmemh({tvdir, "/expected_c0_mod0.txt"}, g_exp_c0);
-    $readmemh({tvdir, "/expected_c1_mod0.txt"}, g_exp_c1);
-    $readmemh({tvdir, "/pk1_seeds.txt"},        g_pk1seeds);
-    $readmemh({tvdir, "/message_after_rns_mod0.txt"}, g_msg_rns);
-    $readmemh({tvdir, "/e0_poly.txt"},          g_e0);
-    // getMessageAfterRns(): the shipped message_after_rns is pre-e0; the HW
-    // value includes the sampled e0 (6-bit sign-mag), reduced mod q0.
-    begin
-      longint q0 = (64'd1 << 46) - (QM0 << 24) + 1;
-      int i; longint m;
-      for (i = 0; i < N; i++) begin
-        m = g_msg_rns[i];
-        if (g_e0[i] & 'h20) m = m - (g_e0[i] & 'h1f);
-        else                m = m + (g_e0[i] & 'h1f);
-        if (m >= q0)     m -= q0;
-        else if (m < 0)  m += q0;
-        g_msg_rns[i] = m;
-      end
-    end
-    PK1_SEED0 = g_pk1seeds[0];
-
-    // release reset
-    control_high_word = 1; repeat (5) @(posedge clk);
-    control_high_word = 0; repeat (2) @(posedge clk);
-
-    $display("== Rung 5a: encode+encrypt (modulus 0), N=%0d ==", N);
-
-    // ---- encode: load plaintext, run forward FFT + sample errors -----------
-    to_q(plain_q, g_input, N);
-    send64(plain_q, N, 1'b0, FFT_BRAM_EXPAND_ID);    // expand-load N reals
-    enc_w = '{ ins_fft(1'b1) };                       // DIF forward FFT
-    build_ins_buf(enc_w);
-    send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0);
-    exe_ins(ERROR_POLYS_SEED);
-
-    // ---- encrypt: granular (RNS, NTT, PWM separately) with intermediate
-    //      checks to localize, mirroring ckksTest.c FULL_ENCRYPTION ----------
-    // RNS scale transform (ckks_encrypt): -52 -1023 -13, wrap mod 4096
-    rns_scale = SCALE - 52 - 1023 - 13;
-    if (rns_scale < 0) rns_scale += 4096;
-
-    // RNS: reduce encoded message to modulus 0 (+e0), write NTT_MSG
-    enc_w = '{ ins_rns(rns_scale, CURRENT_K0, MODSEL0, QM0) };
-    build_ins_buf(enc_w);
-    send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0);
-    exe_ins(64'd0);
-    receive64(c0_q, N, NTT_MSG_BRAM_ID);
-    check_poly(c0_q, g_msg_rns, "message_after_rns", 1);  // ckksTest delta_max=1
-
-    // forward NTT of message/v/e1; sample pk1 into FFT_IM
-    enc_w = '{ ins_ntt(1'b0, CURRENT_K0, MODSEL0, QM0) };
-    build_ins_buf(enc_w);
-    send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0);
-    exe_ins(PK1_SEED0);
-
-    // PWM: load pk0 to NTT_KEY, compute c0=v*pk0+msg, c1=v*pk1+e1
-    to_q(pk0_q, g_pk0, N);
-    send64(pk0_q, N, 1'b0, NTT_KEY_BRAM_ID);
-    enc_w = '{ ins_pwm(CURRENT_K0, QM0) };
-    build_ins_buf(enc_w);
-    send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0);
-    exe_ins(64'd0);
-
-    // ---- read back ciphertext and compare ----------------------------------
-    receive64(c0_q, N, NTT_MSG_BRAM_ID);
-    receive64(c1_q, N, NTT_KEY_BRAM_ID);
-    check_poly(c0_q, g_exp_c0, "C0", 0);
-    check_poly(c1_q, g_exp_c1, "C1", 0);
-
-    // ====================================================================
-    // decrypt + decode (fullDec.h ciphertext): PWM -> iNTT -> I2F -> iFFT
-    // -> PROJECT, recovering the message slots. Mirrors FULL_DECRYPTION.
-    // ====================================================================
-    $display("== Rung 5a: decrypt+decode, N=%0d ==", N);
-    $readmemh({tvdir, "/c0_to_decrypt.txt"},     g_c0d);
-    $readmemh({tvdir, "/c1_to_decrypt.txt"},     g_c1d);
-    $readmemh({tvdir, "/sk.txt"},                g_sk);
-    $readmemh({tvdir, "/decrypted_m_ntt.txt"},   g_dec_ntt);
-    $readmemh({tvdir, "/intt_m_reference.txt"},  g_intt);
-    $readmemh({tvdir, "/projected_reference.txt"}, g_proj_ref);
-
-    // load c0->MSG(1), c1->KEY(5), sk->V(3)
-    to_q(c0_q, g_c0d, N);   send64(c0_q, N, 1'b0, NTT_MSG_BRAM_ID);
-    to_q(c1_q, g_c1d, N);   send64(c1_q, N, 1'b0, NTT_KEY_BRAM_ID);
-    to_q(plain_q, g_sk, N); send64(plain_q, N, 1'b0, 3 /*NTT_V*/);
-
-    // PWM: decrypted = c0 + c1*sk (NTT domain) -> NTT_MSG
-    enc_w = '{ ins_pwm(CURRENT_K0, QM0) };
-    build_ins_buf(enc_w);
-    send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0);
-    exe_ins(64'd0);
-    receive64(c0_q, N, NTT_MSG_BRAM_ID);
-    check_poly(c0_q, g_dec_ntt, "decrypted_m_ntt", 0);
-
-    // inverse NTT (is_dif=1) of the decrypted message
-    enc_w = '{ ins_ntt(1'b1, CURRENT_K0, MODSEL0, QM0) };
-    build_ins_buf(enc_w);
-    send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0);
-    exe_ins(64'd0);
-    receive64(c0_q, N, NTT_MSG_BRAM_ID);
-    check_poly(c0_q, g_intt, "intt_m_reference", 0);
-
-    // I2F: int -> double, scaled by -scale, -> FFT_BRAM
-    enc_w = '{ ins_i2f(-SCALE, CURRENT_K0, QM0) };
-    build_ins_buf(enc_w);
-    send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0);
-    exe_ins(64'd0);
-
-    // inverse FFT (is_dif=0)
-    enc_w = '{ ins_fft(1'b0) };
-    build_ins_buf(enc_w);
-    send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0);
-    exe_ins(64'd0);
-
-    // PROJECT: extract N/2 slots into the upper half of FFT_BRAM
-    enc_w = '{ ins_project() };
-    build_ins_buf(enc_w);
-    send64(ins_buf, INS_BUFFER_SIZE, 1'b1, 0);
-    exe_ins(64'd0);
-
-    // read 2N words from FFT_BRAM; the projected result is the upper half
-    receive64(c0_q, 2*N, FFT_BRAM_ID);
-    for (int i = 0; i < N; i++) c1_q[i] = c0_q[i+N];
-    check_fft(c1_q, g_proj_ref, N, "projected (recovered msg)", 1.0/(1<<30));
-
-    if (errors == 0) $display("RESULT: PASS");
-    else             $display("RESULT: FAIL (%0d poly mismatches)", errors);
+    // ==== Rung 5a (SEAL-golden ciphertext cross-check) -- RETIRED ===========
+    // The Rung-5a encode+encrypt path asserted C0 / C1 / message_after_rns
+    // against the shipped SEAL/Trivium64 goldens (build/full8192). It became
+    // invalid at the C'-2 PRNG swap (Trivium64 -> caliptra_prim_trivium): the RTL
+    // sampler no longer reproduces SEAL's a/e, so those ciphertext goldens cannot
+    // match by construction (the committed pre-swap RTL fails it identically).
+    // Correctness is covered by +ROUNDTRIP (Rung 5c recovered round-trip), +SKHW
+    // (Rung 6 keygen NTT cross-check), tb_RandomSampling (sampler goldens), and
+    // the DPI cosim. There is no default (no-plusarg) run mode any more.
+    $display("tb_ckks_roundtrip: no run-mode plusarg given.");
+    $display("  select a mode: +ROUNDTRIP (5c) | +SKHW (6) | +WALKER (2b) | +DPICOSIM (7c)");
     $finish;
   end
 

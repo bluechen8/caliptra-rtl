@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
-# Rung 5: build + run the composed-core CKKS round-trip TB.
+# Rung 5/6: build + run the composed-core CKKS round-trip TB.
 #
-#   ./run_roundtrip.sh <golden_dir> [N] [extra verilator args...]
+#   ROUNDTRIP=1 ./run_roundtrip.sh <golden_dir> [N] [extra verilator args...]   # Rung 5c
+#   SKSCHEME_HW=1 ./run_roundtrip.sh <golden_dir> [N] [extra args...]           # Rung 6
 #
-# <golden_dir> holds the $readmemh goldens (input.txt, pk_0_mod0.txt,
-# expected_c{0,1}_mod0.txt, pk1_seeds.txt) -- e.g. ../build/full8192 (made by
-# tvgen/extract_full.py). N defaults to 8192; for small N pass it + the matching
-# ROM dir via ALOHA_MIF_DIR (and goldens in <golden_dir>).
+# The TB requires a run-mode plusarg (this script sets +ROUNDTRIP when ROUNDTRIP
+# is in the env, +SKHW when SKSCHEME_HW is). <golden_dir> holds the $readmemh
+# goldens (input.txt + pk1_seeds.txt [+ error_seed.txt]); make it with
+# tvgen/gen_roundtrip.py <LOGN> <dir>. N defaults to 8192; for small N pass it +
+# the matching ROM dir via ALOHA_MIF_DIR.
+#
+# (The old Rung-5a SEAL-ciphertext cross-check was retired at the C'-2 PRNG swap
+# -- the RTL sampler no longer reproduces SEAL's a/e; see tb_ckks_roundtrip.sv.)
 #
 # Mirrors run_tb.sh: depth-5 rundir + .coe->.mem ROM init, but forwards the
 # golden dir to the binary via +TVDIR and (optionally) overrides N.

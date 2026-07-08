@@ -42,17 +42,17 @@ void fhe_set_config(uint8_t target_level, uint8_t param_set_id) {
     lsu_write_32(FHE_REG_CONFIG, cfg);
 }
 
-uint32_t fhe_run_poll(uint32_t cmd) {
+uint32_t fhe_poll_valid(void) {
     uint32_t st;
-    // Wait until ready.
-    while ((lsu_read_32(FHE_REG_STATUS) & FHE_STATUS_READY) == 0);
-    // Issue the command (self-clearing in HW).
-    lsu_write_32(FHE_REG_CTRL, cmd);
-    // Poll until the operation reports VALID.
     do {
         st = lsu_read_32(FHE_REG_STATUS);
     } while ((st & FHE_STATUS_VALID) == 0);
     return st;
+}
+
+uint32_t fhe_run_poll(uint32_t cmd) {
+    fhe_issue(cmd);            // wait READY + write CTRL
+    return fhe_poll_valid();   // poll until VALID
 }
 
 void fhe_set_kg_seed(uint64_t seed) {
@@ -86,4 +86,25 @@ void fhe_set_ptr(uint32_t idx, uint64_t addr) {
 void fhe_set_kgkv(uint32_t read_entry, uint32_t en) {
     // KGKV_CTRL: bit0 = KV_EN, bits[8:4] = READ_ENTRY.
     lsu_write_32(FHE_REG_KGKV_CTRL, ((read_entry & 0x1Fu) << 4) | (en ? 1u : 0u));
+}
+
+void fhe_set_freerun(uint32_t en) {
+    // RNG_CTRL.FREERUN_EN (bit0); leave RESEED_REQ (bit1) clear.
+    lsu_write_32(FHE_REG_RNG_CTRL, en ? FHE_RNG_CTRL_FREERUN_EN : 0u);
+}
+
+void fhe_reseed(uint64_t entseed) {
+    // Doorbell: publish the CSRNG-sourced seed, then FREERUN_EN | RESEED_REQ. The
+    // ENTSEED/RNG_CTRL regs are busy-writable, so this also RELEASES a first-encrypt
+    // that is stalled in RESEED_REQ_PENDING.
+    lsu_write_32(FHE_REG_ENTSEED0, (uint32_t)(entseed & 0xFFFFFFFF));
+    lsu_write_32(FHE_REG_ENTSEED1, (uint32_t)(entseed >> 32));
+    lsu_write_32(FHE_REG_RNG_CTRL, FHE_RNG_CTRL_FREERUN_EN | FHE_RNG_CTRL_RESEED_REQ);
+}
+
+void fhe_issue(uint32_t cmd) {
+    // Fire-and-return (no completion poll): used when the caller must service a
+    // mid-command request (e.g. RESEED_REQ_PENDING) before the op can finish.
+    while ((lsu_read_32(FHE_REG_STATUS) & FHE_STATUS_READY) == 0);
+    lsu_write_32(FHE_REG_CTRL, cmd);
 }

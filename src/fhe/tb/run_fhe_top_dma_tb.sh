@@ -79,7 +79,8 @@ echo "=== running (cwd=$RUNDIR) ==="
 # KVSEED=1 sources the keygen root seed from a modeled KeyVault (C'-1b) and
 # asserts the walker's effective seed == the KV value (KGSEED regs held wrong).
 PLUSARGS=""
-[[ -n "${KVSEED:-}" ]] && PLUSARGS="+KVSEED"
+[[ -n "${KVSEED:-}" ]]  && PLUSARGS="$PLUSARGS +KVSEED"
+[[ -n "${FREERUN:-}" ]] && PLUSARGS="$PLUSARGS +FREERUN"   # C'-2 free-run PRNG test
 ( cd "$RUNDIR" && "$OBJ_DIR/V$TOP" +TVDIR="$WORK" $PLUSARGS ) 2>&1 | tee -a "$LOG"
 
 echo "=== verdict ==="

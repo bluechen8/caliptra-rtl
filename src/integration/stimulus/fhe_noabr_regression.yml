@@ -25,6 +25,9 @@ contents:
         # ---- FHE accelerator tests ----
         - ../test_suites/smoke_test_fhe/smoke_test_fhe.yml
         - ../test_suites/smoke_test_kv_fhe/smoke_test_kv_fhe.yml
+        # C'-2 free-run PRNG self-serve: CSRNG -> ENTSEED/RESEED_REQ doorbell
+        # releases the enforced first-encrypt stall (STATUS.RESEED_REQ_PENDING).
+        - ../test_suites/smoke_test_fhe_freerun/smoke_test_fhe_freerun.yml
         # ---- L0 tests that pass on NoABR ----
         - ../test_suites/c_intr_handler/c_intr_handler.yml
         - ../test_suites/hello_world_iccm/hello_world_iccm.yml

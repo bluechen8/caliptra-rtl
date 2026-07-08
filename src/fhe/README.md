@@ -108,11 +108,17 @@ the SDK `send64`/`receive64`/`exeIns` debug-IO protocol. One runner, mode-select
 aloha/sim/run_roundtrip.sh <golden_dir> [N]      # N defaults to 8192
 ```
 
+A run-mode plusarg is required (no default mode).
+
 | Mode (env) | Rung | What it checks | Build |
 |---|---|---|---|
-| *(none)* | 5a | encode+encrypt+decrypt+decode vs **SEAL goldens**, bit-exact @ N=8192 | pk (`SCHEME=0`) |
 | `ROUNDTRIP=1` | 5c | self-contained recovered≈input round-trip (all-HW keypair, `s=1` hack) | pk |
 | `SKSCHEME_HW=1` | 6 | **real ternary keygen + secret-key scheme** on the **dedicated `PWMSk`** (self-contained: HW negate, `c1=a` passthrough) | sk (`+define+FHE_SK_HW`) |
+
+> The old *(none)*-mode **Rung 5a** (encode+encrypt+decrypt+decode vs **SEAL goldens**, bit-exact
+> @ N=8192, `build/full8192`) was **retired** at the C'-2 PRNG swap: the RTL sampler
+> (`caliptra_prim_trivium`) no longer reproduces SEAL's `a`/`e`, so those ciphertext goldens can't
+> match by construction. Correctness is now covered by Rung 5c/6 above, `tb_RandomSampling`, and cosim.
 
 `SKSCHEME_HW=1` additionally runs an **independent NTT-oracle keygen cross-check**
 (dump the sampled ternary `s` + the HW `s_ntt`, recompute `NTT(s)` under q0 with the Go/Lattigo
@@ -121,8 +127,6 @@ bad key (the encrypt-negate and decrypt MontMuls cancel for any blob). Needs `so
 
 ```bash
 cd aloha
-# Rung 5a — composed core vs SEAL goldens @ N=8192 (shipped goldens in build/full8192):
-./sim/run_roundtrip.sh build/full8192 8192
 # Rung 6 — keygen + secret-key scheme on the dedicated PWMSk, at small N (compile-time SCHEME=1):
 SKSCHEME_HW=1 ALOHA_MIF_DIR=$PWD/build/N256/mif ./sim/run_roundtrip.sh build/rt256 256
 # At N=8192 the default (vendor) ROMs are used — omit ALOHA_MIF_DIR:

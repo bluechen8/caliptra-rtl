@@ -65,6 +65,15 @@
 // KV entry index holding the 64-bit ternary seed, provisioned into KeyVault).
 #define FHE_REG_KGKV_CTRL         (CLP_FHE_REG_BASE_ADDR + 0x78)
 #define FHE_KGKV_CTRL_KV_EN       (1 << 0)
+// C'-2 free-run PRNG. ENTSEED = CSRNG-sourced 64-bit seed for the per-ciphertext
+// a/e0 keystream; RNG_CTRL bit0 = FREERUN_EN, bit1 = RESEED_REQ (doorbell). After
+// keygen / cold reset the first encrypt STALLS (STATUS.RESEED_REQ_PENDING) until
+// firmware writes ENTSEED + RESEED_REQ -- enforcing fresh entropy every boot.
+#define FHE_REG_ENTSEED0          (CLP_FHE_REG_BASE_ADDR + 0x7C)
+#define FHE_REG_ENTSEED1          (CLP_FHE_REG_BASE_ADDR + 0x80)
+#define FHE_REG_RNG_CTRL          (CLP_FHE_REG_BASE_ADDR + 0x84)
+#define FHE_RNG_CTRL_FREERUN_EN   (1 << 0)
+#define FHE_RNG_CTRL_RESEED_REQ   (1 << 1)
 
 // Commands (FHE_CTRL[2:0])
 #define FHE_CMD_NONE              0x0
@@ -75,10 +84,11 @@
 #define FHE_CTRL_ZEROIZE          (1 << 3)
 
 // Status bits
-#define FHE_STATUS_READY          (1 << 0)
-#define FHE_STATUS_VALID          (1 << 1)
-#define FHE_STATUS_DMA_REQ        (1 << 2)
-#define FHE_STATUS_ERROR          (1 << 3)
+#define FHE_STATUS_READY              (1 << 0)
+#define FHE_STATUS_VALID              (1 << 1)
+#define FHE_STATUS_DMA_REQ            (1 << 2)
+#define FHE_STATUS_ERROR              (1 << 3)
+#define FHE_STATUS_RESEED_REQ_PENDING (1 << 4)   // C'-2: encrypt stalled awaiting reseed
 
 // Expected identity values (see fhe_params_pkg.sv)
 #define FHE_NAME0_EXP             0x534B4B43   // "CKKS"
@@ -89,6 +99,8 @@ uint32_t fhe_read_status(void);
 void     fhe_set_dst_addr(uint64_t addr);
 void     fhe_set_src_addr(uint64_t addr);
 void     fhe_set_config(uint8_t target_level, uint8_t param_set_id);
+// Poll STATUS until VALID; returns the final STATUS word.
+uint32_t fhe_poll_valid(void);
 // Issue a command and poll STATUS until VALID; returns the final STATUS word.
 uint32_t fhe_run_poll(uint32_t cmd);
 
@@ -102,5 +114,10 @@ void     fhe_set_ptr(uint32_t idx, uint64_t addr);
 // C'-1c: select the KeyVault entry holding the keygen root seed and enable KV
 // as the keygen-seed source (KGKV_CTRL). Pass en=0 to use the KGSEED regs.
 void     fhe_set_kgkv(uint32_t read_entry, uint32_t en);
+
+// C'-2 free-run PRNG.
+void     fhe_set_freerun(uint32_t en);           // RNG_CTRL.FREERUN_EN
+void     fhe_reseed(uint64_t entseed);           // write ENTSEED + assert FREERUN_EN|RESEED_REQ
+void     fhe_issue(uint32_t cmd);                // issue a command WITHOUT polling to completion
 
 #endif

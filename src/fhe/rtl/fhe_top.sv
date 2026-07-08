@@ -169,6 +169,14 @@ module fhe_top
   // seed from KeyVault instead of the KGSEED regs); bits[8:4]=READ_ENTRY (KV
   // entry index holding the 64-bit ternary seed, provisioned by firmware).
   localparam logic [5:0] OFF_KGKV_CTRL = 6'd30; // 0x78
+  // C'-2 free-run PRNG. ENTSEED = CSRNG-sourced 64-bit seed for the a/e0 stream
+  // (firmware reads CSRNG and writes it, mirroring the Caliptra self-serve
+  // ENTROPY_IF_SEED pattern). RNG_CTRL bit[0]=FREERUN_EN (encrypt a/e0 free-run),
+  // bit[1]=RESEED_REQ (doorbell: write 1 to (re)seed the a/e0 stream from ENTSEED
+  // at the next encrypt pass; HW-cleared once the walker consumes it).
+  localparam logic [5:0] OFF_ENTSEED0  = 6'd31; // 0x7C  a/e0 stream seed [31:0]
+  localparam logic [5:0] OFF_ENTSEED1  = 6'd32; // 0x80  a/e0 stream seed [63:32]
+  localparam logic [5:0] OFF_RNG_CTRL  = 6'd33; // 0x84  bit0=FREERUN_EN, bit1=RESEED_REQ
 
   logic [5:0] word_sel;
   assign word_sel = cif_addr[7:2];
@@ -188,6 +196,12 @@ module fhe_top
   logic [63:0] a_seed, err_seed;
   logic [31:0] kg_scale, enc_scale, i2f_scale;
   logic [63:0] dma_ptr [0:3];   // DMA base pointers, indexed by walker PTR index
+
+  // C'-2 free-run PRNG registers (see OFF_ENTSEED*/OFF_RNG_CTRL).
+  logic [63:0] entseed;         // CSRNG-sourced a/e0 stream seed (firmware-written)
+  logic        freerun_en;      // RNG_CTRL[0]
+  logic        reseed_req;      // RNG_CTRL[1] doorbell (SW-set, HW-cleared)
+  logic        reseed_ack_hw;   // walker consumed the doorbell (0 in the no-walker build)
 `ifndef FHE_KV_SEED_ONLY
   // Plaintext AHB keygen-seed path. Present for bring-up (the DPI cosim + unit
   // TBs have no KeyVault); COMPILED OUT by FHE_KV_SEED_ONLY so the final secure
@@ -213,6 +227,8 @@ module fhe_top
   logic     status_error;
 
   logic     ctrl_busy, ctrl_done, ctrl_error;
+  logic     ctrl_wait_entropy;   // C'-2: walker stalled awaiting a firmware reseed (RESEED_REQ)
+  logic     wait_entropy_q;      // for a 1-cycle notif pulse on entering the wait
   logic     ready;
   logic     zeroize;
 
@@ -304,9 +320,35 @@ module fhe_top
             kgkv_en    <= cif_wdata[0];
             kgkv_entry <= cif_wdata[8:4];
           end
+          // C'-2 ENTSEED/RNG_CTRL are in a separate UNGATED block below (writable
+          // while busy so a stalled first-encrypt can be released by the doorbell).
           default: ;
         endcase
       end
+    end
+  end
+
+  // C'-2 free-run entropy path (ENTSEED / FREERUN_EN / RESEED_REQ). Deliberately
+  // NOT gated by `ready`: these must be writable even while a command is BUSY, so
+  // firmware can deliver the RESEED_REQ doorbell that RELEASES a first-encrypt which
+  // is stalled waiting for fresh entropy after keygen / cold reset. The AHB slave
+  // never back-pressures (cif_hld=0), so wr_en pulses regardless of ctrl_busy.
+  always_ff @(posedge clk or negedge rst_b) begin
+    if (!rst_b || zeroize) begin
+      entseed <= '0; freerun_en <= 1'b0; reseed_req <= 1'b0;
+    end else begin
+      if (wr_en) begin
+        unique case (word_sel)
+          OFF_ENTSEED0: entseed[31:0]  <= cif_wdata;
+          OFF_ENTSEED1: entseed[63:32] <= cif_wdata;
+          OFF_RNG_CTRL: freerun_en     <= cif_wdata[0];
+          default: ;
+        endcase
+      end
+      // RESEED_REQ doorbell: SW-set (bit1) wins a same-cycle collision; else the
+      // walker's ack clears it once the a/e0 stream is (re)seeded.
+      if (wr_en && (word_sel == OFF_RNG_CTRL) && cif_wdata[1]) reseed_req <= 1'b1;
+      else if (reseed_ack_hw)                                  reseed_req <= 1'b0;
     end
   end
 
@@ -412,6 +454,19 @@ module fhe_top
   logic [31:0] core_dout_lo, core_dout_hi, core_status;
   logic        w_busy, w_done, w_error;
 
+  // C'-2 free-run PRNG controls. `fhe_prng_rst` resets the sampler Trivium ONLY at
+  // FHE power-on -- DECOUPLED from the per-EXE core reset the walker pulses
+  // (control_high_word[0]); tying the Trivium to that would wipe its state before
+  // every pass and defeat free-run. It is driven from the async reset `~rst_b` ONLY
+  // (the adapter consumes it as an async reset): `zeroize` is a synchronous control
+  // everywhere in this block, so it is NOT OR'd onto this async net -- instead the
+  // walker sets ae_needs_seed on zeroize, forcing a firmware reseed before the next
+  // encryption (the stale keystream is never used). `w_reseed_en` is the walker's
+  // per-pass reseed gate (1 = reload from seed; 0 = free-run continue).
+  logic        fhe_prng_rst;
+  assign       fhe_prng_rst = ~rst_b;
+  logic        w_reseed_en;
+
   // walker <-> fhe_dma (descriptor + word stream). ext_sel/ext_idx are unused by
   // the streaming DMA (fhe_dma resolves base from the descriptor + PTR regs).
   logic [2:0]   w_ext_sel;
@@ -432,6 +487,12 @@ module fhe_top
     .keygen_seed    (kg_seed_eff),
     .a_seed         (a_seed),
     .err_seed       (err_seed),
+    .freerun_en     (freerun_en),
+    .entseed        (entseed),
+    .reseed_req     (reseed_req),
+    .reseed_en      (w_reseed_en),
+    .reseed_ack     (reseed_ack_hw),
+    .reseed_wait    (ctrl_wait_entropy),
     .rns_scale_kg   (kg_scale),
     .rns_scale_enc  (enc_scale),
     .i2f_scale_dec  (i2f_scale),
@@ -472,6 +533,8 @@ module fhe_top
     .SCHEME                    (1)
   ) core (
     .clk                (clk),
+    .reseed_en          (w_reseed_en),
+    .prng_rst_i         (fhe_prng_rst),
     .control_low_word   (w_cl),
     .control_high_word  (w_ch),
     .dina_ext_low_word  (w_dl),
@@ -543,10 +606,24 @@ module fhe_top
   assign fhe_dma_idx     = '0;
   assign fhe_dma_dout_we = 1'b0;
   assign fhe_dma_dout    = 64'd0;
+  // No walker -> the RESEED_REQ doorbell is never consumed, and no reseed stall.
+  assign reseed_ack_hw     = 1'b0;
+  assign ctrl_wait_entropy = 1'b0;
 `endif
 
   // Interrupt outputs (1-cycle pulses; PIC programmed edge-sensitive).
-  assign notif_intr = ctrl_done;
+  // C'-2: also raise a NOTIF on ENTERING the reseed-wait, so firmware that forgot
+  // to reseed is alerted (poll STATUS.RESEED_REQ_PENDING, then write the doorbell)
+  // instead of the command silently hanging. busy stays asserted throughout.
+  // NOTIF CONTRACT: notif means "state changed -> read STATUS." It fires for BOTH
+  // completion (VALID) and this reseed-wait (RESEED_REQ_PENDING); the consumer must
+  // read STATUS to tell them apart (there is no fhe ISR today -- all paths poll).
+  always_ff @(posedge clk or negedge rst_b) begin
+    if (!rst_b)       wait_entropy_q <= 1'b0;
+    else if (zeroize) wait_entropy_q <= 1'b0;
+    else              wait_entropy_q <= ctrl_wait_entropy;
+  end
+  assign notif_intr = ctrl_done | (ctrl_wait_entropy & ~wait_entropy_q);
   assign error_intr = ctrl_done & ctrl_error;
 
   //----------------------------------------------------------------
@@ -559,7 +636,8 @@ module fhe_top
       OFF_VER0:    cif_rdata = FHE_CORE_VERSION[31:0];
       OFF_VER1:    cif_rdata = FHE_CORE_VERSION[63:32];
       OFF_CTRL:    cif_rdata = 32'b0; // self-clearing, reads 0
-      OFF_STATUS:  cif_rdata = {28'b0, status_error, 1'b0 /*DMA_REQ*/, status_valid, ready};
+      // bit4 = RESEED_REQ_PENDING (C'-2: encrypt stalled awaiting a firmware reseed)
+      OFF_STATUS:  cif_rdata = {27'b0, ctrl_wait_entropy, status_error, 1'b0 /*DMA_REQ*/, status_valid, ready};
       OFF_SRC0:    cif_rdata = src_addr[31:0];
       OFF_SRC1:    cif_rdata = src_addr[63:32];
       OFF_DST0:    cif_rdata = dst_addr[31:0];

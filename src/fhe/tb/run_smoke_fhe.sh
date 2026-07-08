@@ -74,19 +74,24 @@ coe2mem() {
 coe2mem "$MIF/TwFctrCache_RNSConsts.coe"   "$RUNDIR/fft_rns_rom.mem"
 coe2mem "$MIF/FFTStoredTwiddleFactors.coe" "$RUNDIR/fft_all_twiddle_rom.mem"
 
+# FREERUN=1 runs the C'-2 free-run PRNG self-serve test (CSRNG -> ENTSEED/RESEED_REQ
+# -> release the enforced first-encrypt stall) instead of the base smoke.
+TESTNAME="${TESTNAME:-smoke_test_fhe}"
+[[ -n "${FREERUN:-}" ]] && TESTNAME=smoke_test_fhe_freerun
+
 MK="$CALIPTRA_ROOT/tools/scripts/Makefile"
-COMMON=(CALIPTRA_ROOT="$CALIPTRA_ROOT" TESTNAME=smoke_test_fhe
+COMMON=(CALIPTRA_ROOT="$CALIPTRA_ROOT" TESTNAME="$TESTNAME"
         TB_VF="$CALIPTRA_ROOT/src/integration/config/caliptra_top_tb_fhe.vf"
         EXTRA_DEFS="+define+FHE_WALKER +define+FHE_N=$N")
 
-echo "=== build + run smoke_test_fhe ($SIM, N=$N) ==="
+echo "=== build + run $TESTNAME ($SIM, N=$N) ==="
 LOG="$RUNDIR/smoke_fhe_${SIM}.log"
 make -C "$RUNDIR" -f "$MK" "${COMMON[@]}" \
   VERILATOR_RUN_ARGS="+FHE_TVDIR=$RUNDIR" "$SIM" 2>&1 | tee "$LOG"
 
 echo "=== verdict ==="
 if grep -q "FHE DMA round-trip: PASS" "$LOG" && grep -q "TESTCASE PASSED" "$LOG"; then
-  echo "smoke_test_fhe RESULT: PASS"
+  echo "$TESTNAME RESULT: PASS"
 else
-  echo "smoke_test_fhe RESULT: FAIL (see $LOG)"; exit 1
+  echo "$TESTNAME RESULT: FAIL (see $LOG)"; exit 1
 fi
