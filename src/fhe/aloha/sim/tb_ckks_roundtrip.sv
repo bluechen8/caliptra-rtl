@@ -71,6 +71,12 @@ module tb_ckks_roundtrip;
   wire  [63:0] dma_doutb;
   logic        dma_en = 0;
 
+  // C'-3: Aloha storage banks lifted out of ComputeCore. The TB supplies them
+  // via the behavioral fhe_aloha_mem_top so this composed-core sim keeps the
+  // exact 2-cycle-latency / collision behavior of aloha_bram_behav.sv.
+  fhe_aloha_mem_if aloha_mem();
+  fhe_aloha_mem_top u_aloha_mem (.clk_i(clk), .m(aloha_mem.resp));
+
   ComputeCoreWrapper #(
       .FFT_ON_THE_FLY_GENERATION(0),
       .PROVIDE_DEBUG_IO(1),
@@ -94,7 +100,8 @@ module tb_ckks_roundtrip;
       .dma_bram_abs_addr(dma_abs_addr),
       .dma_bram_dina(dma_dina),
       .dma_bram_doutb(dma_doutb),
-      .dma_bram_en(dma_en)
+      .dma_bram_en(dma_en),
+      .m_aloha_mem(aloha_mem.req)
     );
 
   // ====================================================================

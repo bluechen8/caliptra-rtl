@@ -77,6 +77,10 @@ module caliptra_top
 `ifndef CALIPTRA_NO_FHE
     fhe_mem_if.req                     fhe_memory_export,
 `endif
+`ifdef FHE_WALKER
+    // C'-3: Aloha ComputeCore storage banks lifted to the top for real SRAM.
+    fhe_aloha_mem_if.req               fhe_aloha_memory_export,
+`endif
 
     //SRAM interface for mbox
     output logic mbox_sram_cs,
@@ -1209,6 +1213,8 @@ fhe_top #(
      , .fhe_kv_read     (/* unconnected: kv_read[6] owned by Adams Bridge */)
      , .fhe_kv_rd_resp  ('0)
   `endif
+     // C'-3: storage banks lifted to the top boundary (real SRAM attached there)
+     , .fhe_aloha_mem   (fhe_aloha_memory_export)
 `else
      // Stage-0/SoC stub: transitional ptr-indexed word-stream, tied idle.
      , .fhe_dma_sel     (/* unconnected */)

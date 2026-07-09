@@ -116,8 +116,14 @@ module fhe_top_dma_tb
     // C'-1b: KeyVault seed port. Default run leaves KGKV_CTRL.KV_EN=0 (AHB
     // KGSEED register path); the +KVSEED run provisions dut_kv_* below and
     // enables KV so the keygen root comes from the (modeled) KeyVault instead.
-    .fhe_kv_read(dut_kv_read), .fhe_kv_rd_resp(dut_kv_rd_resp)
+    .fhe_kv_read(dut_kv_read), .fhe_kv_rd_resp(dut_kv_rd_resp),
+    // C'-3: Aloha ComputeCore storage banks lifted to the top; the TB supplies
+    // them via the behavioral fhe_aloha_mem_top (real SRAM at the SoC level).
+    .fhe_aloha_mem(aloha_mem.req)
   );
+
+  fhe_aloha_mem_if aloha_mem();
+  fhe_aloha_mem_top u_aloha_mem (.clk_i(clk), .m(aloha_mem.resp));
 
   // ---- C'-1b: behavioral single-entry KeyVault model ----
   localparam int    KV_ENTRY = 5;

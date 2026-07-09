@@ -148,6 +148,17 @@ module caliptra_top_tb (
     abr_mem_if abr_memory_export();
     fhe_mem_if fhe_memory_export();
     fhe_mem_top fhe_mem_top_inst (.clk_i(core_clk), .fhe_memory_export(fhe_memory_export));
+`ifdef FHE_WALKER
+    // C'-3: the Aloha ComputeCore storage banks are lifted out of the vendored
+    // RTL to the caliptra_top boundary; back them with the behavioral bank model
+    // here (real SRAM lives on the Chisel side in the Chipyard wrapper).
+    fhe_aloha_mem_if fhe_aloha_memory_export();
+    // C'-3: the ROM address is registered in the DUT (clk_cg) before it crosses
+    // the interface, so the behavioral memory here samples a STABLE registered
+    // value. On core_clk (a delta after the DUT's clk_cg) the DUT register and
+    // this memory's first read stage collapse, so RD_LAT=2 nets to 2-cycle read.
+    fhe_aloha_mem_top fhe_aloha_mem_top_inst (.clk_i(core_clk), .m(fhe_aloha_memory_export.resp));
+`endif
 
 `ifndef VERILATOR
     always
@@ -260,7 +271,10 @@ caliptra_top caliptra_top_dut (
     .abr_memory_export(abr_memory_export.req),
 `endif
     .fhe_memory_export(fhe_memory_export.req),
-    
+`ifdef FHE_WALKER
+    .fhe_aloha_memory_export(fhe_aloha_memory_export.req),
+`endif
+
     .ready_for_fuses(ready_for_fuses),
     .ready_for_mb_processing(ready_for_mb_processing),
     .ready_for_runtime(),

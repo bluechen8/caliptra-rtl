@@ -73,7 +73,13 @@ module fhe_top
   //   KeyVault entry (never on the AHB bus). fhe_kv_seed reads it out here on a
   //   single KV client slot (kv_read[6], free when ABR is compiled out).
   output kv_read_t    fhe_kv_read,
-  input  kv_rd_resp_t fhe_kv_rd_resp
+  input  kv_rd_resp_t fhe_kv_rd_resp,
+  // ---- Stage-C' 3: Aloha ComputeCore storage banks lifted to the top ----
+  //   The ComputeCore BRAMs are no longer instantiated inside the vendored
+  //   RTL; their ports come out here so real SRAM (Chisel SyncReadMem) can be
+  //   attached at caliptra_top / CaliptraCoreBlackbox. A unit TB backs them
+  //   with the behavioral fhe_aloha_mem_top.
+  fhe_aloha_mem_if.req fhe_aloha_mem
 `else
   // ---- Stage-0/SoC stub: transitional ptr-indexed word-stream, tied idle ----
   ,
@@ -548,7 +554,9 @@ module fhe_top
     .dma_bram_abs_addr  (18'd0),
     .dma_bram_dina      (64'd0),
     .dma_bram_doutb     (),
-    .dma_bram_en        (1'b0)
+    .dma_bram_en        (1'b0),
+    // C'-3: storage banks lifted to the top (real SRAM at CaliptraCoreBlackbox)
+    .m_aloha_mem        (fhe_aloha_mem)
   );
 
   // Dedicated FHE DMA: reuses Caliptra's axi_mgr_rd/axi_mgr_wr; resolves the

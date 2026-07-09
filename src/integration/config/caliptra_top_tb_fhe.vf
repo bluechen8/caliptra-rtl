@@ -45,3 +45,9 @@ ${CALIPTRA_ROOT}/src/fhe/rtl/fhe_kv_seed.sv
 // 4) TB-only: behavioral AXI DRAM model + round-trip checker that backs the FHE
 //    DMA manager (instantiated by caliptra_top_tb.sv under `ifdef FHE_WALKER).
 ${CALIPTRA_ROOT}/src/integration/tb/fhe_axi_dram_model.sv
+
+// C'-3: behavioral storage banks backing the lifted fhe_aloha_mem_if
+//   (instantiated by caliptra_top_tb.sv under `ifdef FHE_WALKER). Uses the
+//   aloha_bram_behav wrappers from aloha_core.f above. The Chipyard wrapper
+//   attaches real SRAM (Chisel SyncReadMem) instead.
+${CALIPTRA_ROOT}/src/fhe/rtl/fhe_aloha_mem_top.sv
