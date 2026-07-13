@@ -301,6 +301,13 @@ module fhe_top
           OFF_KEYDST1: key_dst_addr[63:32] <= cif_wdata;
           OFF_CONFIG: begin
             target_level <= cif_wdata[3:0];
+            // FIXME: param_set_id is latched and echoed on CONFIG readback but
+            // NOT decoded anywhere — it drives no datapath logic. Today the
+            // parameter set is fixed: N is compile-time (`FHE_N) and the RNS
+            // q-set is baked into the ROMs, so only param_set_id==0 is valid and
+            // firmware always writes 0. To make this a real selector, add a
+            // (q-set, N) table + decode here and an ERROR path for unsupported
+            // ids (see fhe_reg.rdl FHE_CONFIG.PARAM_SET_ID).
             param_set_id <= cif_wdata[11:4];
           end
 `ifndef FHE_KV_SEED_ONLY
