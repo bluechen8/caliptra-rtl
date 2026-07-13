@@ -258,6 +258,19 @@ module fhe_microseq
     for (i=0;i<PROG_N;i=i+1) PROG[i] = mk(OP_NOP, 28'd0);
 
     // ---------- KEYGEN (entry 0) ----------
+    // FIXME(fhe-keygen-fp-split): the secret's VALUE is 100% integer — the ternary
+    // sampler writes vt, and RNSErrorPolys (RNS.sv) sign-magnitude-reduces it to
+    // mod q with NO floating point. But keygen still runs the float FFT+RNS as dead
+    // work: KG+0 zeroes B_FFTEXP, KG+1/+2 run the FFT-DIF butterflies on those zeros
+    // (only because the sampler is welded to a transform pass — ComputeCore.v:177-181,
+    // sample_errors=do_fft), and KG+4's float message path produces just `e0` which
+    // KG+9 (B_NTTMSG=C_ZEROS) then discards. Clean split = sample-only pass +
+    // integer-RNS + NTT, dropping KG+0/the FFT butterflies/the float-RNS message half.
+    // Cost: ~5-15 lines of ComputeCore.v control surgery (add a sample-only opcode,
+    // OR random_sampling_done into done_ins_computation, gate UnifiedTransformation
+    // off) + these microcode words. NO new arithmetic; the FP FFT/RNS stays for the
+    // encrypt/decrypt MESSAGE path (canonical embedding), so it's a keygen latency/
+    // power win, not area. Resolve later.
     PROG[KG_ENTRY+0]  = mk(OP_CONST, pl_const(B_FFTEXP, C_ZEROS));
     PROG[KG_ENTRY+1]  = mk(OP_LDINS, pl_ldins(T_FFTDIF[7:0], 4'd1, 1'b0, SC_NONE));
     PROG[KG_ENTRY+2]  = mk(OP_EXE,   pl_exe(PS_KG));

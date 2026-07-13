@@ -42,6 +42,23 @@
 //   the sk product path (SCHEME==1) drops them (C'-3 Part 1), so ComputeCore
 //   ties the e1 request side off and the top-side storage may omit them.
 
+// Ring dimension N drives the poly-bank address widths (LOGN = $clog2(N)).
+// Mirror aloha_bram_behav.sv's guard so the interface widths track FHE_N even
+// when this file is compiled before the datapath (default = the 8192 max).
+`ifndef FHE_N
+  `define FHE_N 8192
+`endif
+// SDP poly banks (ntt_*/FFT working banks): N/2 entries => LOGN-1 addr bits.
+`define ALOHA_SDP_AW ($clog2(`FHE_N) - 1)
+// SP poly banks (e0/e1/vt): N entries => LOGN addr bits.
+`define ALOHA_SP_AW  ($clog2(`FHE_N))
+// crom (RNS consts + bounded twiddle cache): words = 344 + 8*LOGN (a function of
+// LOGN, NOT proportional to N -- see GenerateConstantsROM.py). Address width =
+// $clog2(words); resolves to 9b (512 words) for all N up to 2^21, then grows.
+`ifndef FHE_CROM_AW
+  `define FHE_CROM_AW ($clog2(344 + 8*$clog2(`FHE_N)))
+`endif
+
 // ---- per-bank signal groups ------------------------------------------------
 `define ALOHA_MEM_SDP_SIG(_W, _AW, _sig)                                        \
   logic               ``_sig``_wea;                                            \
@@ -80,23 +97,32 @@
 
 interface fhe_aloha_mem_if;
 
-  // 8x NTTPolyBank : 54b x 4096 (12b addr), simple-dual-port
-  `ALOHA_MEM_SDP_SIG(54, 12, ntt_msg0)
-  `ALOHA_MEM_SDP_SIG(54, 12, ntt_msg1)
-  `ALOHA_MEM_SDP_SIG(54, 12, ntt_v0)
-  `ALOHA_MEM_SDP_SIG(54, 12, ntt_v1)
-  `ALOHA_MEM_SDP_SIG(54, 12, ntt_e1_0)
-  `ALOHA_MEM_SDP_SIG(54, 12, ntt_e1_1)
-  `ALOHA_MEM_SDP_SIG(54, 12, ntt_key0)
-  `ALOHA_MEM_SDP_SIG(54, 12, ntt_key1)
-  // 2x CBDPolyBRAM (6b) + 1x TernaryPolyBRAM (2b) : x 8192 (13b addr), single-port
-  `ALOHA_MEM_SP_SIG(6, 13, e0)
-  `ALOHA_MEM_SP_SIG(6, 13, e1)
-  `ALOHA_MEM_SP_SIG(2, 13, vt)
-  // 1x FFTTw_RNS_ROM : 128b x 512 (9b addr), single-port ROM
-  `ALOHA_MEM_ROM_SIG(128, 9, crom)
-  // 1x FFTAllTwiddleROM : 128b x 4096 (12b addr), stored FFT twiddles
-  `ALOHA_MEM_ROM_SIG(128, 12, ftwrom)
+  // 8x NTTPolyBank : 54b x N/2 (LOGN-1 addr), simple-dual-port
+  `ALOHA_MEM_SDP_SIG(54, `ALOHA_SDP_AW, ntt_msg0)
+  `ALOHA_MEM_SDP_SIG(54, `ALOHA_SDP_AW, ntt_msg1)
+  `ALOHA_MEM_SDP_SIG(54, `ALOHA_SDP_AW, ntt_v0)
+  `ALOHA_MEM_SDP_SIG(54, `ALOHA_SDP_AW, ntt_v1)
+  `ALOHA_MEM_SDP_SIG(54, `ALOHA_SDP_AW, ntt_e1_0)
+  `ALOHA_MEM_SDP_SIG(54, `ALOHA_SDP_AW, ntt_e1_1)
+  `ALOHA_MEM_SDP_SIG(54, `ALOHA_SDP_AW, ntt_key0)
+  `ALOHA_MEM_SDP_SIG(54, `ALOHA_SDP_AW, ntt_key1)
+  // 2x CBDPolyBRAM (6b) + 1x TernaryPolyBRAM (2b) : x N (LOGN addr), single-port
+  `ALOHA_MEM_SP_SIG(6, `ALOHA_SP_AW, e0)
+  `ALOHA_MEM_SP_SIG(6, `ALOHA_SP_AW, e1)
+  `ALOHA_MEM_SP_SIG(2, `ALOHA_SP_AW, vt)
+  // 4x SharedFFTBrams working banks (lifted from SharedFFTBrams.sv): 2x lower
+  // (54b NTTPolyBank, READ_FIRST) + 2x higher (74b SharedFFTBramBank, WRITE_FIRST),
+  // all N/2 (LOGN-1 addr), simple-dual-port.
+  `ALOHA_MEM_SDP_SIG(54, `ALOHA_SDP_AW, fft_lower0)
+  `ALOHA_MEM_SDP_SIG(54, `ALOHA_SDP_AW, fft_lower1)
+  `ALOHA_MEM_SDP_SIG(74, `ALOHA_SDP_AW, fft_higher0)
+  `ALOHA_MEM_SDP_SIG(74, `ALOHA_SDP_AW, fft_higher1)
+  // 1x FFTTw_RNS_ROM (crom): 128b x nextPow2(344+8*LOGN). Content is a function of
+  // LOGN but NOT proportional to N (408 words @N=256, 448 @N=8192); the addr width
+  // is 9b (512 words) for all N up to 2^21, then auto-grows.
+  `ALOHA_MEM_ROM_SIG(128, `FHE_CROM_AW, crom)
+  // 1x FFTAllTwiddleROM : 128b x N/2 (LOGN-1 addr), stored FFT twiddles.
+  `ALOHA_MEM_ROM_SIG(128, `ALOHA_SDP_AW, ftwrom)
 
   modport req (
     `ALOHA_MEM_SDP_REQ(ntt_msg0),
@@ -110,6 +136,10 @@ interface fhe_aloha_mem_if;
     `ALOHA_MEM_SP_REQ(e0),
     `ALOHA_MEM_SP_REQ(e1),
     `ALOHA_MEM_SP_REQ(vt),
+    `ALOHA_MEM_SDP_REQ(fft_lower0),
+    `ALOHA_MEM_SDP_REQ(fft_lower1),
+    `ALOHA_MEM_SDP_REQ(fft_higher0),
+    `ALOHA_MEM_SDP_REQ(fft_higher1),
     `ALOHA_MEM_ROM_REQ(crom),
     `ALOHA_MEM_ROM_REQ(ftwrom)
   );
@@ -126,6 +156,10 @@ interface fhe_aloha_mem_if;
     `ALOHA_MEM_SP_RESP(e0),
     `ALOHA_MEM_SP_RESP(e1),
     `ALOHA_MEM_SP_RESP(vt),
+    `ALOHA_MEM_SDP_RESP(fft_lower0),
+    `ALOHA_MEM_SDP_RESP(fft_lower1),
+    `ALOHA_MEM_SDP_RESP(fft_higher0),
+    `ALOHA_MEM_SDP_RESP(fft_higher1),
     `ALOHA_MEM_ROM_RESP(crom),
     `ALOHA_MEM_ROM_RESP(ftwrom)
   );

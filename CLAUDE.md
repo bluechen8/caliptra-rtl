@@ -125,3 +125,53 @@ The branch this was forked from (`area-optimized`) carries an ABR-removal and SR
 - ICCM/DCCM sizing is driven from the wrapper's `Cores-VeeR-EL2` config-tool snapshot, not from this repo.
 
 When adding the FHE block, follow these same conventions (compile-out guard + integrator-overridable sizes) — and remember the wrapper's `CaliptraParams` / `CaliptraCoreBlackbox` / Makefile chain must be extended in parallel.
+
+## VCS width-cleanliness fixes for the Chipyard FHE SoC build (2026-07-09)
+
+Chipyard's VCS invocation (`sims/vcs/vcs.mk`) sets **`-error=PCWM-L`**, promoting port-connection
+width mismatches to hard errors. The vendored Aloha-HE RTL had two spots that relied on the silent
+truncation/extension that Verilator (Track A lint) and Vivado tolerate — harmless functionally, but
+fatal under VCS strict. Both are now width-explicit (bit-identical behavior):
+
+1. **FFT working banks** — `src/fhe/aloha/rtl/aloha_bram_behav.sv`: `NTTPolyBank` / `SharedFFTBramBank`
+   hardcoded a 12-bit `addra/addrb` (correct only at N=8192, where `SharedFFTBrams` drives
+   `[LOGN-2:0]` = 12 bits). At N<8192 the driver is narrower (7 bits @ N=256). Fixed by
+   parameterizing the wrappers' address port + depth from `` `FHE_N `` (AW = `$clog2(FHE_N)-1`,
+   DEPTH = `2^AW`); at N=8192 this is exactly `[11:0]`/DEPTH=4096. These wrappers are only compiled
+   via `SharedFFTBrams` (the ntt_msg/v/key banks were lifted to top-level SyncReadMem ports).
+2. **Montgomery-reduction DSP** — `src/fhe/aloha/vendor/Aloha-HE_Common/ModRing/MontRed_Stage.sv:49`:
+   `.C({'d0, T_high})` was a 32-bit unsized-zero concat (70 bits @ stage3) truncated into the 48-bit
+   DSP `C`; `.P` fed a 43-bit reg from the 48-bit DSP output. Fixed to `.C(48'(T_high))` and a 48-bit
+   `dsp_p_full` sliced to `[W+M+1:0]` — the exact bits kept before. `MontRed_DSP_MultAdd` is
+   instantiated only here.
+
+**Fast diagnostic (avoid 15-min full-build cycles):** VCS aborts at the first erroring module
+hierarchy, so incremental fixes reveal errors in batches. To enumerate *all* PCWM at once, regenerate
+the preproc (`make -C ../.. default CALIPTRA_FHE_WALKER=1 FHE_N=256 …`) then run a standalone lenient
+elaboration on `caliptra_top_preproc.sv` with `-top CaliptraCoreBlackbox` and **without**
+`-error=PCWM-L` (PCWM stays a warning) — everything below the blackbox is inlined, so it elaborates
+self-contained. `grep PCWM` the log; 0 hits ⇒ the full strict build is width-clean.
+
+## FHE memory lift complete + N-configurable + twiddle boot-load (2026-07-10)
+
+All FHE **block-RAM/ROM** storage is now lifted to Chisel SyncReadMem macros (was: only 6 ntt SDP +
+e0/vt SP). The lift threads each bank up `fhe_aloha_mem_if` → caliptra_top → CaliptraCoreBlackbox →
+Chisel. Newly lifted here:
+- **4 SharedFFTBrams working banks** (`SharedArithmetics/SharedFFTBrams.sv`): 2× lower (54b NTTPolyBank,
+  READ_FIRST) + 2× higher (74b SharedFFTBramBank, **WRITE_FIRST**). Under `` `ifdef FHE_WALKER `` the
+  module takes an `fhe_aloha_mem_if.req m_fft_mem` port and drives it instead of instantiating the
+  behavioral banks (the `` `else `` keeps them so non-FHE_WALKER unit TBs still build);
+  `ComputeCore.v` (fft_bram inst) connects `.m_fft_mem(m_aloha_mem)`. Chisel models the higher banks'
+  WRITE_FIRST collision forwarding.
+- **crom + ftwrom ROMs** → boot-loadable SDP SRAM macros. The SRAM-macro flow (mems.conf) can't carry
+  `$readmemh` init, so these are **boot-loaded**: Rocket writes the per-N twiddle tables through a new
+  MMIO window at `0x40400000` (wrapper `fheRomNode`, mirrors the IMEM window) into the macros' write
+  port; the datapath reads the read port. `software/gen_twiddle_header.py` + `fhe_twiddle_data.h` +
+  `caliptra-fhe-test.c:fhe_load_twiddles()` do the host side. **fft_*.mem no longer needed in the sim
+  cwd** (behavioral $readmemh ROMs removed from the synth path; defs remain but are un-instantiated).
+
+**N-configurable:** `fhe_aloha_mem_if.sv` widths use `` `ALOHA_SDP_AW=$clog2(`FHE_N)-1 `` /
+`` `ALOHA_SP_AW=$clog2(`FHE_N) ``; `aloha_bram_behav.sv` CBD/Ternary/ModRing banks are `` `FHE_N ``-sized.
+SDP banks = N/2, SP banks = N; **crom stays fixed 9b/512** (RNS consts, N-independent) and **INS_RAM
+stays 16×42** (microprogram, flop/LUTRAM — deliberately NOT lifted). The `fheWalker` Chisel flag is
+gone (implied by `noFhe=false`); the SV `` `ifdef FHE_WALKER `` is now driven off `noFhe`.

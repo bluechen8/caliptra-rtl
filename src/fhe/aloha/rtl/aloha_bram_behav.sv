@@ -89,60 +89,83 @@ endmodule
 
 // ---- named wrappers matching the upstream blk_mem_gen instance names ----
 
-module NTTPolyBank (
-    input         clka, clkb,
-    input  [11:0] addra, addrb,
-    input  [53:0] dina,
-    output [53:0] doutb,
-    input         wea
+// The FFT working banks (NTTPolyBank/SharedFFTBramBank) are the only compiled
+// instantiations of these wrappers — the ntt_msg/v/key banks were lifted out of
+// ComputeCore to top-level SyncReadMem ports, so the sole driver is
+// SharedFFTBrams, which addresses them at an LOGN-scaled width: fft_*_addr_bank*
+// is [LOGN-2:0] and key/rns addr slices are [LOGN-1:1], i.e. LOGN-1 bits, over a
+// depth of 2^(LOGN-1) (N/2 points per bank). Size the address port + depth from
+// FHE_N so sub-8192 configs match exactly — VCS's -error=PCWM-L rejects the
+// 7-bit N=256 driver against a fixed 12-bit port (Verilator zero-extends, which
+// is why the standalone small-N flow never tripped this). At FHE_N=8192 this is
+// bit-identical to the previous [11:0]/DEPTH=4096.
+`ifndef FHE_N
+  `define FHE_N 8192
+`endif
+
+module NTTPolyBank #(
+    parameter int AW    = $clog2(`FHE_N) - 1,
+    parameter int DEPTH = (1 << AW)
+  ) (
+    input             clka, clkb,
+    input  [AW-1:0]   addra, addrb,
+    input  [53:0]     dina,
+    output [53:0]     doutb,
+    input             wea
   );
-  aloha_bram_sdp #(.W(54), .DEPTH(4096), .RD_LAT(2), .WRITE_FIRST(1'b0)) u (
+  aloha_bram_sdp #(.W(54), .DEPTH(DEPTH), .RD_LAT(2), .WRITE_FIRST(1'b0)) u (
     .clka(clka), .clkb(clkb), .addra(addra), .addrb(addrb),
     .dina(dina), .wea(wea), .doutb(doutb));
 endmodule
 
-module SharedFFTBramBank (
-    input         clka, clkb,
-    input  [11:0] addra, addrb,
-    input  [73:0] dina,
-    output [73:0] doutb,
-    input         wea
+module SharedFFTBramBank #(
+    parameter int AW    = $clog2(`FHE_N) - 1,
+    parameter int DEPTH = (1 << AW)
+  ) (
+    input             clka, clkb,
+    input  [AW-1:0]   addra, addrb,
+    input  [73:0]     dina,
+    output [73:0]     doutb,
+    input             wea
   );
-  aloha_bram_sdp #(.W(74), .DEPTH(4096), .RD_LAT(2), .WRITE_FIRST(1'b1)) u (
+  aloha_bram_sdp #(.W(74), .DEPTH(DEPTH), .RD_LAT(2), .WRITE_FIRST(1'b1)) u (
     .clka(clka), .clkb(clkb), .addra(addra), .addrb(addrb),
     .dina(dina), .wea(wea), .doutb(doutb));
 endmodule
 
+// Single-port poly banks hold N entries (LOGN addr). Sized from FHE_N so
+// sub-8192 configs match the N-parameterized fhe_aloha_mem_if SP ports exactly
+// (at FHE_N=8192 this is the historical [12:0]/DEPTH=8192).
 module CBDPolyBRAM (
-    input         clka,
-    input  [12:0] addra,
-    input  [5:0]  dina,
-    output [5:0]  douta,
-    input         wea
+    input                     clka,
+    input  [$clog2(`FHE_N)-1:0] addra,
+    input  [5:0]              dina,
+    output [5:0]              douta,
+    input                     wea
   );
-  aloha_bram_sp #(.W(6), .DEPTH(8192), .RD_LAT(2)) u (
+  aloha_bram_sp #(.W(6), .DEPTH(`FHE_N), .RD_LAT(2)) u (
     .clka(clka), .addra(addra), .dina(dina), .wea(wea), .douta(douta));
 endmodule
 
 module TernaryPolyBRAM (
-    input         clka,
-    input  [12:0] addra,
-    input  [1:0]  dina,
-    output [1:0]  douta,
-    input         wea
+    input                     clka,
+    input  [$clog2(`FHE_N)-1:0] addra,
+    input  [1:0]              dina,
+    output [1:0]              douta,
+    input                     wea
   );
-  aloha_bram_sp #(.W(2), .DEPTH(8192), .RD_LAT(2)) u (
+  aloha_bram_sp #(.W(2), .DEPTH(`FHE_N), .RD_LAT(2)) u (
     .clka(clka), .addra(addra), .dina(dina), .wea(wea), .douta(douta));
 endmodule
 
 module ModRingPolyBRAM (
-    input         clka, clkb,
-    input  [12:0] addra, addrb,
-    input  [53:0] dina,
-    output [53:0] doutb,
-    input         wea
+    input                     clka, clkb,
+    input  [$clog2(`FHE_N)-1:0] addra, addrb,
+    input  [53:0]             dina,
+    output [53:0]             doutb,
+    input                     wea
   );
-  aloha_bram_sdp #(.W(54), .DEPTH(8192), .RD_LAT(2), .WRITE_FIRST(1'b0)) u (
+  aloha_bram_sdp #(.W(54), .DEPTH(`FHE_N), .RD_LAT(2), .WRITE_FIRST(1'b0)) u (
     .clka(clka), .clkb(clkb), .addra(addra), .addrb(addrb),
     .dina(dina), .wea(wea), .doutb(doutb));
 endmodule

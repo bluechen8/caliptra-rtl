@@ -61,6 +61,21 @@ module fhe_aloha_mem_top (
     .addra(m.ntt_key1_addra), .addrb(m.ntt_key1_addrb),
     .dina(m.ntt_key1_dina), .doutb(m.ntt_key1_doutb), .wea(m.ntt_key1_wea));
 
+  // ---- 4x SharedFFTBrams working banks (lifted from SharedFFTBrams.sv) ----
+  //      2x lower (54b NTTPolyBank, READ_FIRST) + 2x higher (74b SharedFFTBramBank)
+  NTTPolyBank fft_lower_bank0 (.clka(clk_i), .clkb(clk_i),
+    .addra(m.fft_lower0_addra), .addrb(m.fft_lower0_addrb),
+    .dina(m.fft_lower0_dina), .doutb(m.fft_lower0_doutb), .wea(m.fft_lower0_wea));
+  NTTPolyBank fft_lower_bank1 (.clka(clk_i), .clkb(clk_i),
+    .addra(m.fft_lower1_addra), .addrb(m.fft_lower1_addrb),
+    .dina(m.fft_lower1_dina), .doutb(m.fft_lower1_doutb), .wea(m.fft_lower1_wea));
+  SharedFFTBramBank fft_higher_bank0 (.clka(clk_i), .clkb(clk_i),
+    .addra(m.fft_higher0_addra), .addrb(m.fft_higher0_addrb),
+    .dina(m.fft_higher0_dina), .doutb(m.fft_higher0_doutb), .wea(m.fft_higher0_wea));
+  SharedFFTBramBank fft_higher_bank1 (.clka(clk_i), .clkb(clk_i),
+    .addra(m.fft_higher1_addra), .addrb(m.fft_higher1_addrb),
+    .dina(m.fft_higher1_dina), .doutb(m.fft_higher1_doutb), .wea(m.fft_higher1_wea));
+
   // ---- 2x CBDPolyBRAM (6b) + 1x TernaryPolyBRAM (2b), single-port ----
   CBDPolyBRAM e0_bram (.clka(clk_i), .addra(m.e0_addra),
     .dina(m.e0_dina), .douta(m.e0_douta), .wea(m.e0_wea));
