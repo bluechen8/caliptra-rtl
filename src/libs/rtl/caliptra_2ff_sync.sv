@@ -22,6 +22,49 @@ module caliptra_2ff_sync  #( parameter WIDTH=1,
 
 );
 
+`ifdef CALIPTRA_SYNTH_SKY130
+
+genvar i;
+logic [WIDTH-1:0] stage1;
+
+generate
+    for (i = 0; i < WIDTH; i++) begin : gen_sync_cell
+        if (RST_VAL == 0) begin : gen_rst0
+            DFFRX1 u_sync_ff0 (
+                .CK (clk),
+                .D  (din[i]),
+                .RN (rst_b),
+                .Q  (stage1[i]),
+                .QN ()
+            );
+            DFFRX1 u_sync_ff1 (
+                .CK (clk),
+                .D  (stage1[i]),
+                .RN (rst_b),
+                .Q  (dout[i]),
+                .QN ()
+            );
+        end else begin : gen_rst1
+            DFFSX1 u_sync_ff0 (
+                .CK (clk),
+                .D  (din[i]),
+                .SN (rst_b),
+                .Q  (stage1[i]),
+                .QN ()
+            );
+            DFFSX1 u_sync_ff1 (
+                .CK (clk),
+                .D  (stage1[i]),
+                .SN (rst_b),
+                .Q  (dout[i]),
+                .QN ()
+            );
+        end
+    end
+endgenerate
+
+`else
+
 logic din_ff;
 
 always_ff@(posedge clk or negedge rst_b) begin
@@ -29,11 +72,12 @@ always_ff@(posedge clk or negedge rst_b) begin
         dout <= RST_VAL;
         din_ff <= RST_VAL;
     end
-    else begin 
+    else begin
         din_ff <= din;
         dout <= din_ff;
     end
 end
 
+`endif
 
 endmodule

@@ -439,10 +439,38 @@ module rvsyncss #(parameter WIDTH = 251)
      output logic [WIDTH-1:0]     dout
      );
 
+`ifdef CALIPTRA_SYNTH_SKY130
+
+   genvar i;
+   logic [WIDTH-1:0] stage1;
+
+   generate
+      for (i = 0; i < WIDTH; i++) begin : gen_sync_cell
+         DFFRX1 u_sync_ff0 (
+            .CK (clk),
+            .D  (din[i]),
+            .RN (rst_l),
+            .Q  (stage1[i]),
+            .QN ()
+         );
+         DFFRX1 u_sync_ff1 (
+            .CK (clk),
+            .D  (stage1[i]),
+            .RN (rst_l),
+            .Q  (dout[i]),
+            .QN ()
+         );
+      end
+   endgenerate
+
+`else
+
    logic [WIDTH-1:0]              din_ff1;
 
    rvdff #(WIDTH) sync_ff1  (.*, .din (din[WIDTH-1:0]),     .dout(din_ff1[WIDTH-1:0]));
    rvdff #(WIDTH) sync_ff2  (.*, .din (din_ff1[WIDTH-1:0]), .dout(dout[WIDTH-1:0]));
+
+`endif
 
 endmodule // rvsyncss
 
@@ -836,6 +864,3 @@ module rvoclkhdr
 `endif
 
 endmodule
-
-
-

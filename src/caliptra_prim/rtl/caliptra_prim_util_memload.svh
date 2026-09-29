@@ -54,6 +54,7 @@
   endfunction
 `endif
 
+`ifndef SYNTHESIS
 initial begin
   logic show_mem_paths;
 
@@ -66,3 +67,4 @@ initial begin
       $readmemh(MemInitFile, mem);
   end
 end
+`endif
