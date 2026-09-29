@@ -26,6 +26,7 @@ module clk_gate (
     input logic cptra_error_fatal,
     input logic cptra_in_debug_scan_mode,
     output logic clk_cg,
+    output logic clk_cg_en, // low-phase-latched enable for lifted base-clock SRAMs
     output logic soc_ifc_clk_cg,
     output logic rdc_clk_cg,
     output logic uc_clk_cg,
@@ -79,6 +80,10 @@ always_comb begin
     disable_uc_clk          = (rdc_clk_dis | rdc_clk_dis_uc);
 end
 
+
+// Match the integrated clock gate's low-phase enable. Consumers clocked from
+// the ungated parent use this to avoid repeating a held peripheral request.
+always_latch if (!clk) clk_cg_en <= !disable_clk;
 
 `ifdef TECH_SPECIFIC_ICG
     `USER_ICG user_icg (.clk(clk), .en(!disable_clk), .clk_cg(clk_cg));

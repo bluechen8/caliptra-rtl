@@ -54,9 +54,12 @@ module tb_fhe_microseq;
   always_comb ext_din = f_data(4'(ext_sel), ext_idx);
 
   fhe_microseq #(.LOGN(LOGN), .N(N)) dut (
+    .step(1'b1),
     .clk(clk), .rst_b(rst_b), .zeroize(zeroize),
     .cmd_valid(cmd_valid), .cmd(cmd),
     .keygen_seed(keygen_seed), .a_seed(a_seed), .err_seed(err_seed),
+    .freerun_en(1'b0), .entseed(64'd0), .reseed_req(1'b0),
+    .reseed_en(), .reseed_ack(), .reseed_wait(),
     .rns_scale_kg(32'(RNS_KG)), .rns_scale_enc(32'(RNS_ENC)), .i2f_scale_dec(32'(I2F_DEC)),
     .num_limbs(num_limbs), .r2modq(r2modq),
     .control_low_word(control_low_word), .control_high_word(control_high_word),
@@ -245,7 +248,7 @@ module tb_fhe_microseq;
     compare("DECRYPT L=1");
 
     if (errors==0) $display("\ntb_fhe_microseq: ALL TRACE CHECKS PASS");
-    else           $display("\ntb_fhe_microseq: FAILED (%0d errors)", errors);
+    else           $fatal(1, "tb_fhe_microseq: FAILED (%0d errors)", errors);
     $finish;
   end
 endmodule

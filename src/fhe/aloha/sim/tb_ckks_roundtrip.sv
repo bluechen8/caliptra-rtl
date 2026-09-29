@@ -141,6 +141,7 @@ module tb_ckks_roundtrip;
   wire [31:0] core_dh = walker_mode ? w_dh : dina_high;
 
   fhe_microseq #(.LOGN(LOGN), .N(N)) walker (
+    .step(1'b1),
     .clk(clk), .rst_b(w_rst_b), .zeroize(1'b0),
     .cmd_valid(w_cmd_valid), .cmd(w_cmd),
     .keygen_seed(w_kg_seed), .a_seed(w_a_seed), .err_seed(w_err_seed),

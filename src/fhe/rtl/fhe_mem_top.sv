@@ -26,11 +26,22 @@ module fhe_mem_top
   fhe_mem_if.resp fhe_memory_export
 );
 
+// The real Aloha walker uses fhe_aloha_mem_if, not the Stage-0 banks.
+// Do not elaborate six dead placeholder SRAMs into the synthesis hierarchy.
+`ifdef FHE_WALKER
+assign fhe_memory_export.poly_c0_rdata_o = '0;
+assign fhe_memory_export.poly_c1_rdata_o = '0;
+assign fhe_memory_export.scratch_rdata_o = '0;
+assign fhe_memory_export.key_rdata_o = '0;
+assign fhe_memory_export.encode_rdata_o = '0;
+assign fhe_memory_export.sk_rdata_o = '0;
+`else
 `FHE_MEM(FHE_MEM_C0_DEPTH,      FHE_MEM_DATA_WIDTH, poly_c0)
 `FHE_MEM(FHE_MEM_C1_DEPTH,      FHE_MEM_DATA_WIDTH, poly_c1)
 `FHE_MEM(FHE_MEM_SCRATCH_DEPTH, FHE_MEM_DATA_WIDTH, scratch)
 `FHE_MEM(FHE_MEM_KEY_DEPTH,     FHE_MEM_DATA_WIDTH, key)
 `FHE_MEM(FHE_MEM_ENCODE_DEPTH,  FHE_MEM_DATA_WIDTH, encode)
 `FHE_MEM(FHE_MEM_SK_DEPTH,      FHE_MEM_DATA_WIDTH, sk)
+`endif
 
 endmodule

@@ -21,7 +21,8 @@
 // Modeled on abr_params_pkg.sv. Knobs N (ring dimension), L (RNS chain
 // length), and BATCH (concurrent ciphertexts) are overridable from the
 // Chipyard wrapper Makefile via +define+ (FHE_N / FHE_L / FHE_BATCH);
-// defaults below target N=2^14, L=4, batch=1. Word length is fixed 32 b.
+// defaults below target N=8192, L=2, batch=1. The 32-bit geometry below
+// describes legacy Stage-0 banks only; the real Aloha path has 54-bit residues.
 // This version is UNMASKED (FHE_NUM_SHARES = 1).
 //
 //======================================================================
@@ -31,10 +32,10 @@
 
 // --- Wrapper-overridable knobs (threaded as +define+ from vsrc/Makefile) ---
 `ifndef FHE_N
-  `define FHE_N 16384      // ring dimension, power of two in 2^13..2^16
+  `define FHE_N 8192       // validated Aloha default
 `endif
 `ifndef FHE_L
-  `define FHE_L 4          // RNS chain length = number of 32-bit primes / max level
+  `define FHE_L 2          // frozen Aloha two-prime chain
 `endif
 `ifndef FHE_BATCH
   `define FHE_BATCH 1      // ciphertexts resident / processed at a time
@@ -47,7 +48,7 @@ package fhe_params_pkg;
   //----------------------------------------------------------------
   parameter FHE_WORD       = 32;                 // fixed RNS limb width
   parameter FHE_N          = `FHE_N;             // ring dimension
-  parameter FHE_LOGN       = $clog2(FHE_N);      // 14 for N=2^14
+  parameter FHE_LOGN       = $clog2(FHE_N);      // 13 for N=8192
   parameter FHE_L          = `FHE_L;             // RNS chain length
   parameter FHE_LEVEL_W    = $clog2(FHE_L) + 1;  // bits to encode a target level (1..L)
   parameter FHE_BATCH      = `FHE_BATCH;         // concurrent ciphertexts

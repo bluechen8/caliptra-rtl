@@ -57,6 +57,7 @@ module fhe_top_tb
   fhe_mem_if mem_if();
 
   fhe_top #(.AHB_DATA_WIDTH(DW), .AHB_ADDR_WIDTH(AW)) dut (
+    .clock_live(1'b1),
     .clk(clk), .rst_b(rst_b),
     .haddr_i(haddr), .hwdata_i(hwdata), .hsel_i(hsel), .hwrite_i(hwrite),
     .hready_i(hready), .htrans_i(htrans), .hsize_i(hsize),

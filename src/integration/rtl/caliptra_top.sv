@@ -174,6 +174,7 @@ module caliptra_top
     logic                       clk_gating_en   ;
     logic                       rdc_clk_dis     ;
     logic                       clk_cg          ;
+    logic                       clk_cg_en       ;
     logic                       soc_ifc_clk_cg  ;
     logic                       rdc_clk_cg      ;
     logic                       uc_clk_cg       ;
@@ -849,10 +850,11 @@ clk_gate cg (
     .cptra_rst_b(cptra_noncore_rst_b),
     .psel(|s_axi_active || s_axi_r_if.arvalid || s_axi_w_if.awvalid),
     .clk_gate_en(clk_gating_en),
-    .cpu_halt_status(o_cpu_halt_status),
+    .cpu_halt_status(o_cpu_halt_status && !(fhe_busy || fhe_error_intr || fhe_notif_intr)),
     .rdc_clk_dis(rdc_clk_dis),
     .rdc_clk_dis_uc (fw_update_rst_window),
     .clk_cg (clk_cg),
+    .clk_cg_en (clk_cg_en),
     .soc_ifc_clk_cg (soc_ifc_clk_cg),
     .rdc_clk_cg (rdc_clk_cg),
     .uc_clk_cg (uc_clk_cg),
@@ -1183,6 +1185,7 @@ fhe_top #(
 `endif
 ) fhe_inst (
      .clk               (clk_cg),
+     .clock_live        (clk_cg_en),
      .rst_b             (cptra_noncore_rst_b),
      .haddr_i           (responder_inst[`CALIPTRA_SLAVE_SEL_FHE].haddr[`CALIPTRA_SLAVE_ADDR_WIDTH(`CALIPTRA_SLAVE_SEL_FHE)-1:0]),
      .hwdata_i          (responder_inst[`CALIPTRA_SLAVE_SEL_FHE].hwdata),

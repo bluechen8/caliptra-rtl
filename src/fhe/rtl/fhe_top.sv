@@ -39,6 +39,7 @@ module fhe_top
   parameter FHE_AXI_IW     = 1
 )(
   input  logic clk,
+  input  logic clock_live, // parent gate enable, for ungated lifted SRAMs
   input  logic rst_b,
 
   // AHB-Lite responder slice (from caliptra_top responder_inst[SEL_FHE])
@@ -236,10 +237,37 @@ module fhe_top
   logic     ctrl_wait_entropy;   // C'-2: walker stalled awaiting a firmware reseed (RESEED_REQ)
   logic     wait_entropy_q;      // for a 1-cycle notif pulse on entering the wait
   logic     ready;
+`ifdef FHE_WALKER
+  logic [1:0] mem_phase;
+  wire core_step = (mem_phase == 2'd1) && clock_live && rst_b && !zeroize;
+  wire mem_read = (mem_phase == 2'd0) && clock_live && rst_b && !zeroize;
+  wire mem_write = (mem_phase == 2'd2) && clock_live && rst_b && !zeroize;
+  always_ff @(posedge clk or negedge rst_b) begin
+    if (!rst_b) mem_phase <= 2'd0;
+    else if (zeroize) mem_phase <= 2'd0;
+    else mem_phase <= (mem_phase == 2'd2) ? 2'd0 : mem_phase + 2'd1;
+  end
+  // Low-phase latch is the standard glitch-free clock-gate pattern. Gate the
+  // complete core, including ISA, sampler, twiddle and arithmetic pipelines.
+  // The walker uses the equivalent synchronous enable; AXI/AHB remain ungated.
+  wire core_clk;
+`ifdef TECH_SPECIFIC_ICG
+  `USER_ICG fhe_core_icg (.clk(clk), .en(core_step), .clk_cg(core_clk));
+`else
+  logic core_clock_enable;
+  always_latch if (!clk) core_clock_enable <= core_step;
+  assign core_clk = clk & core_clock_enable;
+`endif
+  assign fhe_aloha_mem.phase_read = mem_read;
+  assign fhe_aloha_mem.phase_execute = core_step;
+  assign fhe_aloha_mem.phase_write = mem_write;
+  assign fhe_aloha_mem.table_load_ready = rst_b && !zeroize && !ctrl_busy && !cmd_accept;
+`endif
   logic     zeroize;
 
   assign ready  = ~ctrl_busy;
-  assign busy_o = ctrl_busy;
+  // Keep the parent awake until the registered completion is consumed.
+  assign busy_o = ctrl_busy | ctrl_done;
 
   logic ctrl_wr;
   assign ctrl_wr = wr_en & (word_sel == OFF_CTRL);
@@ -289,7 +317,13 @@ module fhe_top
       cmd_q        <= FHE_NONE;
       cmd_valid    <= 1'b0;
     end else begin
+`ifdef FHE_WALKER
+      // Keep an accepted command until the next logical engine edge.
+      if (cmd_accept) cmd_valid <= 1'b1;
+      else if (core_step) cmd_valid <= 1'b0;
+`else
       cmd_valid <= cmd_accept;
+`endif
       if (cmd_accept) cmd_q <= fhe_cmd_e'(cif_wdata[2:0]);
       if (wr_en && ready) begin
         unique case (word_sel)
@@ -492,6 +526,10 @@ module fhe_top
   logic         w_dma_ready, w_rd_valid, w_rd_pop, w_wr_ready;
 
   fhe_microseq #(.LOGN(FHE_LOGN), .N(FHE_N)) walker (
+    .step(core_step),
+    .sk_en(fhe_aloha_mem.sk_en), .sk_we(fhe_aloha_mem.sk_we),
+    .sk_addr(fhe_aloha_mem.sk_addr), .sk_wdata(fhe_aloha_mem.sk_wdata),
+    .sk_rdata(fhe_aloha_mem.sk_rdata),
     .clk            (clk),
     .rst_b          (rst_b),
     .zeroize        (zeroize),
@@ -545,7 +583,7 @@ module fhe_top
     .N                         (FHE_N),
     .SCHEME                    (1)
   ) core (
-    .clk                (clk),
+    .clk                (core_clk),
     .reseed_en          (w_reseed_en),
     .prng_rst_i         (fhe_prng_rst),
     .control_low_word   (w_cl),
@@ -595,7 +633,7 @@ module fhe_top
     .m_axi_w_if (fhe_axi_w_if)
   );
 
-  assign ctrl_busy  = w_busy;
+  assign ctrl_busy  = w_busy | cmd_valid;
   assign ctrl_done  = w_done;
   assign ctrl_error = w_error | kv_err_q;   // KV auth/lock failure taints keygen
 

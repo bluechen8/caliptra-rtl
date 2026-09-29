@@ -48,6 +48,9 @@
 `ifndef FHE_N
   `define FHE_N 8192
 `endif
+`ifndef FHE_L
+  `define FHE_L 2
+`endif
 // SDP poly banks (ntt_*/FFT working banks): N/2 entries => LOGN-1 addr bits.
 `define ALOHA_SDP_AW ($clog2(`FHE_N) - 1)
 // SP poly banks (e0/e1/vt): N entries => LOGN addr bits.
@@ -96,6 +99,13 @@
 `define ALOHA_MEM_ROM_RESP(_sig)  input  ``_sig``_addra, output ``_sig``_douta
 
 interface fhe_aloha_mem_if;
+  // Three physical clock edges per logical ComputeCore edge. Requests are
+  // sampled in READ, the core advances in EXECUTE, saved writes retire in WRITE.
+  logic phase_read, phase_execute, phase_write, table_load_ready;
+
+  logic sk_en, sk_we;
+  logic [$clog2(`FHE_N*`FHE_L)-1:0] sk_addr;
+  logic [53:0] sk_wdata, sk_rdata;
 
   // 8x NTTPolyBank : 54b x N/2 (LOGN-1 addr), simple-dual-port
   `ALOHA_MEM_SDP_SIG(54, `ALOHA_SDP_AW, ntt_msg0)
@@ -125,6 +135,8 @@ interface fhe_aloha_mem_if;
   `ALOHA_MEM_ROM_SIG(128, `ALOHA_SDP_AW, ftwrom)
 
   modport req (
+    output phase_read, phase_execute, phase_write, table_load_ready,
+    output sk_en, sk_we, sk_addr, sk_wdata, input sk_rdata,
     `ALOHA_MEM_SDP_REQ(ntt_msg0),
     `ALOHA_MEM_SDP_REQ(ntt_msg1),
     `ALOHA_MEM_SDP_REQ(ntt_v0),
@@ -145,6 +157,8 @@ interface fhe_aloha_mem_if;
   );
 
   modport resp (
+    input phase_read, phase_execute, phase_write, table_load_ready,
+    input sk_en, sk_we, sk_addr, sk_wdata, output sk_rdata,
     `ALOHA_MEM_SDP_RESP(ntt_msg0),
     `ALOHA_MEM_SDP_RESP(ntt_msg1),
     `ALOHA_MEM_SDP_RESP(ntt_v0),

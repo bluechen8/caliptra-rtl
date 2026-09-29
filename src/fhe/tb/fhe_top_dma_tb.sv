@@ -51,8 +51,8 @@ module fhe_top_dma_tb
   localparam int STRIDE = (N*8 > 2048) ? N*8 : 2048;
   localparam int ADDR_P   = 0*STRIDE;  // plaintext
   localparam int ADDR_C0  = 1*STRIDE;  // ciphertext c0
-  localparam int ADDR_C1  = 2*STRIDE;  // ciphertext c1
-  localparam int ADDR_OUT = 3*STRIDE;  // recovered slots
+  localparam int ADDR_C1  = (1+FHE_L)*STRIDE;  // ciphertext c1
+  localparam int ADDR_OUT = (1+2*FHE_L)*STRIDE;  // recovered slots
 
   // Register byte offsets (match fhe_top OFF_*).
   localparam logic [AHW-1:0] A_CTRL     = 'h10;
@@ -85,6 +85,12 @@ module fhe_top_dma_tb
   // ------------------------------------------------------------------
   logic clk = 1'b0;
   logic rst_b;
+  logic parent_clock_live;
+  logic parent_manual_enable = 1'b1;
+  logic cpu_sleep = 1'b0;
+  always_latch if (!clk)
+    parent_clock_live <= parent_manual_enable && (!cpu_sleep || busy_o || error_intr || notif_intr);
+  wire parent_clk = clk & parent_clock_live;
   always #5 clk = ~clk;
 
   // AHB-Lite responder signals
@@ -106,7 +112,8 @@ module fhe_top_dma_tb
     .AHB_DATA_WIDTH(DW), .AHB_ADDR_WIDTH(AHW),
     .FHE_AXI_AW(AXI_AW), .FHE_AXI_UW(AXI_UW), .FHE_AXI_IW(AXI_IW)
   ) dut (
-    .clk(clk), .rst_b(rst_b),
+    .clock_live(parent_clock_live),
+    .clk(parent_clk), .rst_b(rst_b),
     .haddr_i(haddr), .hwdata_i(hwdata), .hsel_i(hsel), .hwrite_i(hwrite),
     .hready_i(hready), .htrans_i(htrans), .hsize_i(hsize),
     .hresp_o(hresp), .hreadyout_o(hreadyout), .hrdata_o(hrdata),
@@ -123,7 +130,40 @@ module fhe_top_dma_tb
   );
 
   fhe_aloha_mem_if aloha_mem();
-  fhe_aloha_mem_top u_aloha_mem (.clk_i(clk), .m(aloha_mem.resp));
+  fhe_aloha_mem_top #(.PHASED(1)) u_aloha_mem (.clk_i(clk), .m(aloha_mem.resp));
+
+  // Check the narrowed, synchronous resident-key port independently of the
+  // round-trip (which can otherwise hide matching corruption on both paths).
+  logic [53:0] key_shadow [0:N*FHE_L-1];
+  bit key_written [0:N*FHE_L-1];
+  bit key_read_pending;
+  logic [$clog2(N*FHE_L)-1:0] key_read_addr;
+  int key_writes [0:FHE_L-1];
+  int key_reads [0:FHE_L-1];
+  always @(posedge clk) begin
+    if (!rst_b) begin
+      key_read_pending <= 0;
+      foreach (key_written[i]) key_written[i] = 0;
+      foreach (key_writes[i]) key_writes[i] = 0;
+      foreach (key_reads[i]) key_reads[i] = 0;
+    end else begin
+      if (key_read_pending) begin
+        key_reads[int'(key_read_addr)/N]++;
+        assert (key_written[key_read_addr]) else $fatal(1, "key read before write");
+        assert (aloha_mem.sk_rdata === key_shadow[key_read_addr])
+          else $fatal(1, "key SRAM read/latency mismatch at %0d", key_read_addr);
+      end
+      key_read_pending <= aloha_mem.sk_en && !aloha_mem.sk_we;
+      key_read_addr <= aloha_mem.sk_addr;
+      if (aloha_mem.sk_en && aloha_mem.sk_we) begin
+        assert (dut.walker.dout_high[31:22] == 0)
+          else $fatal(1, "resident key truncation would discard nonzero bits");
+        key_shadow[aloha_mem.sk_addr] = aloha_mem.sk_wdata;
+        key_written[aloha_mem.sk_addr] = 1;
+        key_writes[int'(aloha_mem.sk_addr)/N]++;
+      end
+    end
+  end
 
   // ---- C'-1b: behavioral single-entry KeyVault model ----
   localparam int    KV_ENTRY = 5;
@@ -278,11 +318,13 @@ module fhe_top_dma_tb
     int base, guard;
     base = notif_count;
     ahb_write(A_CTRL, {29'd0, c});
+    cpu_sleep = 1; // parent must stay awake through DMA and completion delivery
     guard = 0;
     while ((notif_count == base) && (guard < 50_000_000)) begin @(posedge clk); guard++; end
     if (notif_count == base) begin $display("  FAIL: %s never completed (timeout)", nm); errors++; end
     else                          $display("  [dma] %s done (~%0d cyc)", nm, guard);
     @(negedge clk);
+    cpu_sleep = 0;
   endtask
 
   // C'-2 free-run helpers ------------------------------------------------------
@@ -321,7 +363,7 @@ module fhe_top_dma_tb
         nerr++;
       end
     if (nerr) begin $display("FAIL %s: %0d/%0d", name, nerr, ndbl); errors++; end
-    else        $display("PASS %s (%0d doubles, rel<2^-30)", name, ndbl);
+    else        $display("PASS %s (%0d doubles, relative tolerance=%g, absolute floor=%g)", name, ndbl, eps, fft_abs_floor);
   endtask
 
   // ------------------------------------------------------------------
@@ -337,6 +379,26 @@ module fhe_top_dma_tb
     repeat (4) @(negedge clk);
     rst_b = 1'b1;
     repeat (2) @(negedge clk);
+
+    // Pause the parent clock in each idle phase while lifted SRAMs continue
+    // to receive base-clock edges. No repeated requests/response shifts allowed.
+    for (int phase = 0; phase < 3; phase++) begin
+      logic [53:0] held_response;
+      while (dut.mem_phase != 2'(phase)) @(negedge clk);
+      held_response = aloha_mem.ntt_msg0_doutb;
+      parent_manual_enable = 0;
+      repeat (9) begin
+        @(negedge clk);
+        assert ({aloha_mem.phase_read, aloha_mem.phase_execute, aloha_mem.phase_write} == 0)
+          else $fatal(1, "memory request escaped stopped parent clock");
+        assert (aloha_mem.ntt_msg0_doutb === held_response)
+          else $fatal(1, "memory response advanced while parent clock stopped");
+        assert (dut.mem_phase == 2'(phase)) else $fatal(1, "phase changed while parent clock stopped");
+      end
+      parent_manual_enable = 1;
+      repeat (4) @(negedge clk);
+    end
+    $display("PASS idle parent-clock pause/resume in all three phases");
 
     $display("== Stage-B' 2c-step-2: fhe_top + FHE DMA round-trip (AXI), N=%0d ==", N);
 
@@ -367,7 +429,7 @@ module fhe_top_dma_tb
     ahb_write(A_KGSCALE,  rns_scale[31:0]);
     ahb_write(A_ENCSCALE, rns_scale[31:0]);
     ahb_write(A_I2FSCALE, i2f_val);
-    ahb_write(A_CONFIG,   32'h0000_0001);    // L = 1
+    ahb_write(A_CONFIG, $test$plusargs("LIMBS2") ? 32'd2 : 32'd1);
 
     // ---- KEYGEN (no DMA) ----
     run_cmd(FHE_KEYGEN, "KEYGEN");
@@ -384,11 +446,20 @@ module fhe_top_dma_tb
       end
     end
 
+    for (int limb=0; limb < ($test$plusargs("LIMBS2") ? 2 : 1); limb++) begin
+      assert (key_writes[limb] == N)
+        else $fatal(1, "key limb %0d: expected %0d writes, got %0d", limb, N, key_writes[limb]);
+    end
+
     // ---- ENCRYPT: msg<-PTR0(P), c0->PTR2(C0), c1->PTR3(C1) ----
     ahb_write64(A_PTR0_LO, 64'(ADDR_P));
     ahb_write64(A_PTR2_LO, 64'(ADDR_C0));
     ahb_write64(A_PTR3_LO, 64'(ADDR_C1));
     run_cmd(FHE_ENCRYPT, "ENCRYPT");
+    for (int limb=0; limb < ($test$plusargs("LIMBS2") ? 2 : 1); limb++) begin
+      assert (key_reads[limb] == N)
+        else $fatal(1, "key limb %0d: expected %0d reads, got %0d", limb, N, key_reads[limb]);
+    end
 
     // ---- DECRYPT: c0<-PTR0(C0), c1<-PTR1(C1), out->PTR2(OUT) ----
     ahb_write64(A_PTR0_LO, 64'(ADDR_C0));
@@ -431,7 +502,13 @@ module fhe_top_dma_tb
       //     STATUS.RESEED_REQ_PENDING (bit4) -- an observable wait, not a silent hang.
       base = notif_count;
       ahb_write(A_CTRL, {29'd0, FHE_ENCRYPT});
-      repeat (20000) @(posedge clk);                // >> a normal encrypt (~5567 cyc)
+      // Reach the entropy wait after the N-dependent load/conversion prefix.
+      // A fixed 20k-cycle delay is too short for the phased full-size engine.
+      guard = 0;
+      while (!dut.ctrl_wait_entropy && !dut.status_valid && guard < 50_000_000) begin
+        @(posedge clk); guard++;
+      end
+      repeat (200) @(posedge clk); // prove it remains blocked without the doorbell
       ahb_read(A_STATUS, sdata);                     // sdata[1]=VALID, sdata[4]=RESEED_REQ_PENDING
       if (dut.status_valid) begin
         $display("FAIL[FREERUN]: first encrypt completed with NO reseed (enforcement broken)"); errors++;

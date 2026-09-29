@@ -38,8 +38,18 @@ module fhe_microseq
   parameter int N    = 1 << LOGN
 )(
   input  logic        clk,
+  input  logic        step, // logical engine edge; bus-facing pulses remain one base cycle
   input  logic        rst_b,
   input  logic        zeroize,
+
+`ifdef FHE_WALKER
+  // One-cycle synchronous single-port resident key SRAM, exported to Chisel.
+  output logic sk_en,
+  output logic sk_we,
+  output logic [$clog2(N*FHE_L)-1:0] sk_addr,
+  output logic [53:0] sk_wdata,
+  input logic [53:0] sk_rdata,
+`endif
 
   // command issue (1-cycle pulse)
   input  logic        cmd_valid,
@@ -326,7 +336,7 @@ module fhe_microseq
   typedef enum logic [4:0] {
     S_IDLE, S_FETCH, S_DECODE,
     S_DMA_REQ,
-    S_WR, S_WR_LO,
+    S_WR, S_WR_LO, S_SK_READ,
     S_RD,
     S_EXE_DINA, S_EXE_RST, S_EXE_START, S_EXE_POLL, S_EXE_CLR1, S_EXE_CLR0,
     S_DONE
@@ -367,21 +377,33 @@ module fhe_microseq
   logic [2:0]    desc_ptr_r;
   logic [3:0]    desc_limb_r;
 
-  // sk-bank: the walker's resident +sk_ntt store (an SRAM macro in fhe_mem_top
-  // for real N; a reg array here). NOT addressed over the 3-bit Aloha bram_sel
-  // -- MOVE moves between this local store and a core bank via send64/receive64.
-  // (Declared before the assigns below, which reference cur_sk -- required under
-  // `default_nettype none in the full Caliptra build.)
-  logic [63:0]   sk_mem [0:N*FHE_L-1];
-  logic          cur_sk;          // current op touches sk_mem
-  logic [3:0]    mv_limb;         // limb whose sk slice this MOVE uses
+  // Resident +sk_ntt: one synchronous read/write port. The integrated path
+  // exports this storage; the trace-only walker TB uses the same latency model.
+  logic          cur_sk;
+  logic [3:0]    mv_limb;
+`ifndef FHE_WALKER
+  logic sk_en, sk_we;
+  logic [$clog2(N*FHE_L)-1:0] sk_addr;
+  logic [53:0] sk_wdata, sk_rdata;
+  logic [53:0] sk_mem [0:N*FHE_L-1];
+  always_ff @(posedge clk) begin
+    if (sk_en) begin
+      if (sk_we) sk_mem[sk_addr] <= sk_wdata;
+      else sk_rdata <= sk_mem[sk_addr];
+    end
+  end
+`endif
+  assign sk_we = (st == S_RD) && cur_sk && (rd_wait >= 3'd2);
+  assign sk_en = step && rst_b && !zeroize && ((st == S_SK_READ) || sk_we);
+  assign sk_addr = $clog2(N*FHE_L)'(mv_limb*N + widx);
+  assign sk_wdata = {dout_high[21:0], dout_low};
 
-  assign dma_desc_valid = (st == S_DMA_REQ) && dma_ready;
+  assign dma_desc_valid = step && (st == S_DMA_REQ) && dma_ready;
   assign dma_desc_wr    = desc_wr_r;
   assign dma_desc_ptr   = desc_ptr_r;
   assign dma_desc_limb  = desc_limb_r;
   // pop a DMA_IN word the cycle the walker consumes it (S_WR, not stalled)
-  assign dma_rd_pop     = (st == S_WR) && !cur_ins && !cur_sk && (cur_cid == C_DIN) && dma_rd_valid;
+  assign dma_rd_pop     = step && (st == S_WR) && !cur_ins && !cur_sk && (cur_cid == C_DIN) && dma_rd_valid;
 
   // ---- scale patch (replicates ins_rns / ins_i2f bit math) ----
   // replicate ins_rns / ins_i2f scale-field packing exactly. RNS: sh masked
@@ -439,7 +461,7 @@ module fhe_microseq
   // write-data source for the current send64 word
   function automatic logic [63:0] cur_wr_data();
     if (cur_ins)              cur_wr_data = ins_word(widx, ins_patched, ins_len_r);
-    else if (cur_sk)          cur_wr_data = sk_mem[mv_limb*N + widx]; // SK-load
+    else if (cur_sk)          cur_wr_data = {10'd0, sk_rdata}; // SK-load
     else if (cur_cid == C_DIN) cur_wr_data = ext_din;       // DMA_IN
     else if (cur_cid == C_R2) cur_wr_data = r2modq[limb_idx];
     else                      cur_wr_data = 64'd0;          // CONST ZEROS
@@ -474,7 +496,7 @@ module fhe_microseq
       ext_dout_we <= 1'b0; limb_active <= 1'b0;
       reseed_en <= 1'b1; reseed_ack <= 1'b0; reseed_wait <= 1'b0;
       ae_needs_seed <= 1'b1; ae_reseed_pending <= 1'b0; reseed_req_q <= 1'b0;
-    end else begin
+    end else if (step) begin
       done <= 1'b0; ext_dout_we <= 1'b0;
       // C'-2 free-run bookkeeping: reseed_ack is a 1-cycle pulse; a firmware
       // doorbell arms a re-seed of the a/e0 stream on its RISING edge (the inject at
@@ -621,7 +643,7 @@ module fhe_microseq
               if (f_sb(op_w) == B_SK) begin
                 // SK-load: send64 from sk_mem to dst core bank (cur_sk picks the data)
                 cur_bank <= f_db(op_w); cur_ins <= 1'b0;
-                st <= S_WR;
+                st <= S_SK_READ;
               end else begin
                 // SK-store: receive64 from src core bank into sk_mem
                 cur_bank <= f_sb(op_w); cur_off <= 1'b0;
@@ -643,6 +665,7 @@ module fhe_microseq
           if (dma_ready) st <= desc_wr_r ? S_RD : S_WR;
         end
         // ------------ send64 word loop (wea=1 cycle) ------------------
+        S_SK_READ: st <= S_WR; // SRAM captures address; data is ready in S_WR
         S_WR: begin
           // DMA_IN read stall: hold until the DMA engine presents the next word.
           if ((cur_cid == C_DIN) && !cur_ins && !cur_sk && !dma_rd_valid) begin
@@ -664,7 +687,7 @@ module fhe_microseq
             st <= S_FETCH;
           end else begin
             widx <= widx + 1'b1;
-            st <= S_WR;
+            st <= cur_sk ? S_SK_READ : S_WR;
           end
         end
         // ------------ receive64 word loop (DMA_OUT) -------------------
@@ -675,8 +698,7 @@ module fhe_microseq
             // DMA_OUT write stall: the DMA FIFO is full; hold this beat (rd_wait
             // stays at 2, core read address held) until it can accept the word.
           end else begin
-            if (cur_sk) sk_mem[mv_limb*N + widx] <= dout;  // SK-store
-            else begin ext_dout <= dout; ext_dout_we <= 1'b1; end // DMA_OUT push
+            if (!cur_sk) begin ext_dout <= dout; ext_dout_we <= 1'b1; end // DMA_OUT push
             if (widx == wn - 1) begin
               control_low_word <= 32'd0;
               pc <= pc + 8'd1;
@@ -728,6 +750,9 @@ module fhe_microseq
         end
         default: st <= S_IDLE;
       endcase
+    end else begin
+      // Bus-facing event pulses must not stretch across held engine cycles.
+      done <= 1'b0; ext_dout_we <= 1'b0; reseed_ack <= 1'b0;
     end
   end
 

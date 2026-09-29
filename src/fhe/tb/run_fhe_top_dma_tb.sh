@@ -50,7 +50,7 @@ if [[ -n "${KV_ONLY:-}" ]]; then EXTRA_DEF="-DFHE_KV_SEED_ONLY"; export KVSEED=1
 
 echo "=== build $TOP (N=$N) ${EXTRA_DEF:+[$EXTRA_DEF]} ==="
 [[ -n "${CLEAN:-}" ]] && rm -rf "$OBJ_DIR"
-"$VERILATOR" --binary -j 0 \
+"$VERILATOR" --binary -j "${JOBS:-4}" \
   --timing --assert \
   --top-module "$TOP" \
   -Wno-fatal -Wno-WIDTH -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNOPTFLAT \
@@ -79,6 +79,7 @@ echo "=== running (cwd=$RUNDIR) ==="
 # KVSEED=1 sources the keygen root seed from a modeled KeyVault (C'-1b) and
 # asserts the walker's effective seed == the KV value (KGSEED regs held wrong).
 PLUSARGS=""
+[[ -n "${LIMBS2:-}" ]] && PLUSARGS="$PLUSARGS +LIMBS2"
 [[ -n "${KVSEED:-}" ]]  && PLUSARGS="$PLUSARGS +KVSEED"
 [[ -n "${FREERUN:-}" ]] && PLUSARGS="$PLUSARGS +FREERUN"   # C'-2 free-run PRNG test
 ( cd "$RUNDIR" && "$OBJ_DIR/V$TOP" +TVDIR="$WORK" $PLUSARGS ) 2>&1 | tee -a "$LOG"
