@@ -262,73 +262,75 @@ module fhe_microseq
   localparam int ENC_ENTRY = 16;
   localparam int DEC_ENTRY = 32;
 
-  logic [31:0] PROG [0:PROG_N-1];
-  initial begin
-    integer i;
-    for (i=0;i<PROG_N;i=i+1) PROG[i] = mk(OP_NOP, 28'd0);
+  // Combinational ROM: synthesizes as constant decode logic (an `initial`-filled
+  // array would be dropped by synthesis). Unlisted addresses decode to NOP.
+  function automatic logic [31:0] prog_rom(input logic [7:0] a);
+    prog_rom = mk(OP_NOP, 28'd0);
+    case (a)
+      // ---------- KEYGEN (entry 0) ----------
+      // FIXME(fhe-keygen-fp-split): the secret's VALUE is 100% integer — the ternary
+      // sampler writes vt, and RNSErrorPolys (RNS.sv) sign-magnitude-reduces it to
+      // mod q with NO floating point. But keygen still runs the float FFT+RNS as dead
+      // work: KG+0 zeroes B_FFTEXP, KG+1/+2 run the FFT-DIF butterflies on those zeros
+      // (only because the sampler is welded to a transform pass — ComputeCore.v:177-181,
+      // sample_errors=do_fft), and KG+4's float message path produces just `e0` which
+      // KG+9 (B_NTTMSG=C_ZEROS) then discards. Clean split = sample-only pass +
+      // integer-RNS + NTT, dropping KG+0/the FFT butterflies/the float-RNS message half.
+      // Cost: ~5-15 lines of ComputeCore.v control surgery (add a sample-only opcode,
+      // OR random_sampling_done into done_ins_computation, gate UnifiedTransformation
+      // off) + these microcode words. NO new arithmetic; the FP FFT/RNS stays for the
+      // encrypt/decrypt MESSAGE path (canonical embedding), so it's a keygen latency/
+      // power win, not area. Resolve later.
+      KG_ENTRY+0:  prog_rom = mk(OP_CONST, pl_const(B_FFTEXP, C_ZEROS));
+      KG_ENTRY+1:  prog_rom = mk(OP_LDINS, pl_ldins(T_FFTDIF[7:0], 4'd1, 1'b0, SC_NONE));
+      KG_ENTRY+2:  prog_rom = mk(OP_EXE,   pl_exe(PS_KG));
+      KG_ENTRY+3:  prog_rom = mk(OP_LIMB,  pl_limb(8'd9));        // body = next 9 words
+      KG_ENTRY+4:  prog_rom = mk(OP_LDINS, pl_ldins(T_RNS[7:0],    4'd1, 1'b1, SC_RNSKG));
+      KG_ENTRY+5:  prog_rom = mk(OP_EXE,   pl_exe(PS_ZERO));
+      KG_ENTRY+6:  prog_rom = mk(OP_LDINS, pl_ldins(T_NTTFWD[7:0], 4'd1, 1'b1, SC_NONE));
+      KG_ENTRY+7:  prog_rom = mk(OP_EXE,   pl_exe(PS_ZERO));
+      KG_ENTRY+8:  prog_rom = mk(OP_CONST, pl_const(B_NTTKEY, C_R2));
+      KG_ENTRY+9:  prog_rom = mk(OP_CONST, pl_const(B_NTTMSG, C_ZEROS));
+      KG_ENTRY+10: prog_rom = mk(OP_LDINS, pl_ldins(T_PWMDEC[7:0], 4'd1, 1'b1, SC_NONE));
+      KG_ENTRY+11: prog_rom = mk(OP_EXE,   pl_exe(PS_ZERO));
+      KG_ENTRY+12: prog_rom = mk(OP_MOVE,  pl_move(B_NTTMSG, B_SK, 1'b0, 1'b1)); // NTT_MSG->SK[limb]
+      KG_ENTRY+13: prog_rom = mk(OP_DONE,  pl_done(1'b0));
 
-    // ---------- KEYGEN (entry 0) ----------
-    // FIXME(fhe-keygen-fp-split): the secret's VALUE is 100% integer — the ternary
-    // sampler writes vt, and RNSErrorPolys (RNS.sv) sign-magnitude-reduces it to
-    // mod q with NO floating point. But keygen still runs the float FFT+RNS as dead
-    // work: KG+0 zeroes B_FFTEXP, KG+1/+2 run the FFT-DIF butterflies on those zeros
-    // (only because the sampler is welded to a transform pass — ComputeCore.v:177-181,
-    // sample_errors=do_fft), and KG+4's float message path produces just `e0` which
-    // KG+9 (B_NTTMSG=C_ZEROS) then discards. Clean split = sample-only pass +
-    // integer-RNS + NTT, dropping KG+0/the FFT butterflies/the float-RNS message half.
-    // Cost: ~5-15 lines of ComputeCore.v control surgery (add a sample-only opcode,
-    // OR random_sampling_done into done_ins_computation, gate UnifiedTransformation
-    // off) + these microcode words. NO new arithmetic; the FP FFT/RNS stays for the
-    // encrypt/decrypt MESSAGE path (canonical embedding), so it's a keygen latency/
-    // power win, not area. Resolve later.
-    PROG[KG_ENTRY+0]  = mk(OP_CONST, pl_const(B_FFTEXP, C_ZEROS));
-    PROG[KG_ENTRY+1]  = mk(OP_LDINS, pl_ldins(T_FFTDIF[7:0], 4'd1, 1'b0, SC_NONE));
-    PROG[KG_ENTRY+2]  = mk(OP_EXE,   pl_exe(PS_KG));
-    PROG[KG_ENTRY+3]  = mk(OP_LIMB,  pl_limb(8'd9));        // body = next 9 words
-    PROG[KG_ENTRY+4]  = mk(OP_LDINS, pl_ldins(T_RNS[7:0],    4'd1, 1'b1, SC_RNSKG));
-    PROG[KG_ENTRY+5]  = mk(OP_EXE,   pl_exe(PS_ZERO));
-    PROG[KG_ENTRY+6]  = mk(OP_LDINS, pl_ldins(T_NTTFWD[7:0], 4'd1, 1'b1, SC_NONE));
-    PROG[KG_ENTRY+7]  = mk(OP_EXE,   pl_exe(PS_ZERO));
-    PROG[KG_ENTRY+8]  = mk(OP_CONST, pl_const(B_NTTKEY, C_R2));
-    PROG[KG_ENTRY+9]  = mk(OP_CONST, pl_const(B_NTTMSG, C_ZEROS));
-    PROG[KG_ENTRY+10] = mk(OP_LDINS, pl_ldins(T_PWMDEC[7:0], 4'd1, 1'b1, SC_NONE));
-    PROG[KG_ENTRY+11] = mk(OP_EXE,   pl_exe(PS_ZERO));
-    PROG[KG_ENTRY+12] = mk(OP_MOVE,  pl_move(B_NTTMSG, B_SK, 1'b0, 1'b1)); // NTT_MSG->SK[limb]
-    PROG[KG_ENTRY+13] = mk(OP_DONE,  pl_done(1'b0));
+      // ---------- ENCRYPT (entry 16) ----------
+      ENC_ENTRY+0:  prog_rom = mk(OP_DMA_IN, pl_dma(B_FFTEXP, 3'd0, 1'b0, 2'd0, 1'b0)); // PTR0=msg
+      ENC_ENTRY+1:  prog_rom = mk(OP_LDINS,  pl_ldins(T_FFTDIF[7:0], 4'd1, 1'b0, SC_NONE));
+      ENC_ENTRY+2:  prog_rom = mk(OP_EXE,    pl_exe(PS_ERR));
+      ENC_ENTRY+3:  prog_rom = mk(OP_LIMB,   pl_limb(8'd9));
+      ENC_ENTRY+4:  prog_rom = mk(OP_LDINS,  pl_ldins(T_RNS[7:0],    4'd1, 1'b1, SC_RNSENC));
+      ENC_ENTRY+5:  prog_rom = mk(OP_EXE,    pl_exe(PS_ZERO));
+      ENC_ENTRY+6:  prog_rom = mk(OP_LDINS,  pl_ldins(T_NTTFWD[7:0], 4'd1, 1'b1, SC_NONE));
+      ENC_ENTRY+7:  prog_rom = mk(OP_EXE,    pl_exe(PS_A));
+      ENC_ENTRY+8:  prog_rom = mk(OP_MOVE,   pl_move(B_SK, B_NTTV, 1'b1, 1'b0)); // SK[limb]->NTT_V
+      ENC_ENTRY+9:  prog_rom = mk(OP_LDINS,  pl_ldins(T_PWMENC[7:0], 4'd1, 1'b1, SC_NONE));
+      ENC_ENTRY+10: prog_rom = mk(OP_EXE,    pl_exe(PS_ZERO));
+      ENC_ENTRY+11: prog_rom = mk(OP_DMA_OUT,pl_dma(B_NTTMSG, 3'd2, 1'b1, 2'd0, 1'b0)); // c0->PTR2
+      ENC_ENTRY+12: prog_rom = mk(OP_DMA_OUT,pl_dma(B_NTTKEY, 3'd3, 1'b1, 2'd0, 1'b0)); // c1->PTR3
+      ENC_ENTRY+13: prog_rom = mk(OP_DONE,   pl_done(1'b0));
 
-    // ---------- ENCRYPT (entry 16) ----------
-    PROG[ENC_ENTRY+0]  = mk(OP_DMA_IN, pl_dma(B_FFTEXP, 3'd0, 1'b0, 2'd0, 1'b0)); // PTR0=msg
-    PROG[ENC_ENTRY+1]  = mk(OP_LDINS,  pl_ldins(T_FFTDIF[7:0], 4'd1, 1'b0, SC_NONE));
-    PROG[ENC_ENTRY+2]  = mk(OP_EXE,    pl_exe(PS_ERR));
-    PROG[ENC_ENTRY+3]  = mk(OP_LIMB,   pl_limb(8'd9));
-    PROG[ENC_ENTRY+4]  = mk(OP_LDINS,  pl_ldins(T_RNS[7:0],    4'd1, 1'b1, SC_RNSENC));
-    PROG[ENC_ENTRY+5]  = mk(OP_EXE,    pl_exe(PS_ZERO));
-    PROG[ENC_ENTRY+6]  = mk(OP_LDINS,  pl_ldins(T_NTTFWD[7:0], 4'd1, 1'b1, SC_NONE));
-    PROG[ENC_ENTRY+7]  = mk(OP_EXE,    pl_exe(PS_A));
-    PROG[ENC_ENTRY+8]  = mk(OP_MOVE,   pl_move(B_SK, B_NTTV, 1'b1, 1'b0)); // SK[limb]->NTT_V
-    PROG[ENC_ENTRY+9]  = mk(OP_LDINS,  pl_ldins(T_PWMENC[7:0], 4'd1, 1'b1, SC_NONE));
-    PROG[ENC_ENTRY+10] = mk(OP_EXE,    pl_exe(PS_ZERO));
-    PROG[ENC_ENTRY+11] = mk(OP_DMA_OUT,pl_dma(B_NTTMSG, 3'd2, 1'b1, 2'd0, 1'b0)); // c0->PTR2
-    PROG[ENC_ENTRY+12] = mk(OP_DMA_OUT,pl_dma(B_NTTKEY, 3'd3, 1'b1, 2'd0, 1'b0)); // c1->PTR3
-    PROG[ENC_ENTRY+13] = mk(OP_DONE,   pl_done(1'b0));
-
-    // ---------- DECRYPT (entry 32, L=1) ----------
-    PROG[DEC_ENTRY+0]  = mk(OP_DMA_IN, pl_dma(B_NTTMSG, 3'd0, 1'b0, 2'd0, 1'b0)); // c0<-PTR0
-    PROG[DEC_ENTRY+1]  = mk(OP_DMA_IN, pl_dma(B_NTTKEY, 3'd1, 1'b0, 2'd0, 1'b0)); // c1<-PTR1
-    PROG[DEC_ENTRY+2]  = mk(OP_MOVE,   pl_move(B_SK, B_NTTV, 1'b0, 1'b0));        // SK[0]->NTT_V
-    PROG[DEC_ENTRY+3]  = mk(OP_LDINS,  pl_ldins(T_PWMDEC[7:0], 4'd1, 1'b1, SC_NONE));
-    PROG[DEC_ENTRY+4]  = mk(OP_EXE,    pl_exe(PS_ZERO));
-    PROG[DEC_ENTRY+5]  = mk(OP_LDINS,  pl_ldins(T_NTTINV[7:0], 4'd1, 1'b1, SC_NONE));
-    PROG[DEC_ENTRY+6]  = mk(OP_EXE,    pl_exe(PS_ZERO));
-    PROG[DEC_ENTRY+7]  = mk(OP_LDINS,  pl_ldins(T_I2F[7:0],    4'd1, 1'b1, SC_I2F));
-    PROG[DEC_ENTRY+8]  = mk(OP_EXE,    pl_exe(PS_ZERO));
-    PROG[DEC_ENTRY+9]  = mk(OP_LDINS,  pl_ldins(T_FFTDIT[7:0], 4'd1, 1'b0, SC_NONE));
-    PROG[DEC_ENTRY+10] = mk(OP_EXE,    pl_exe(PS_ZERO));
-    PROG[DEC_ENTRY+11] = mk(OP_LDINS,  pl_ldins(T_PROJ[7:0],   4'd1, 1'b0, SC_NONE));
-    PROG[DEC_ENTRY+12] = mk(OP_EXE,    pl_exe(PS_ZERO));
-    PROG[DEC_ENTRY+13] = mk(OP_DMA_OUT,pl_dma(B_FFT, 3'd2, 1'b0, 2'd0, 1'b1));    // out<-upper N of 2N
-    PROG[DEC_ENTRY+14] = mk(OP_DONE,   pl_done(1'b0));
-  end
+      // ---------- DECRYPT (entry 32, L=1) ----------
+      DEC_ENTRY+0:  prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTMSG, 3'd0, 1'b0, 2'd0, 1'b0)); // c0<-PTR0
+      DEC_ENTRY+1:  prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTKEY, 3'd1, 1'b0, 2'd0, 1'b0)); // c1<-PTR1
+      DEC_ENTRY+2:  prog_rom = mk(OP_MOVE,   pl_move(B_SK, B_NTTV, 1'b0, 1'b0));        // SK[0]->NTT_V
+      DEC_ENTRY+3:  prog_rom = mk(OP_LDINS,  pl_ldins(T_PWMDEC[7:0], 4'd1, 1'b1, SC_NONE));
+      DEC_ENTRY+4:  prog_rom = mk(OP_EXE,    pl_exe(PS_ZERO));
+      DEC_ENTRY+5:  prog_rom = mk(OP_LDINS,  pl_ldins(T_NTTINV[7:0], 4'd1, 1'b1, SC_NONE));
+      DEC_ENTRY+6:  prog_rom = mk(OP_EXE,    pl_exe(PS_ZERO));
+      DEC_ENTRY+7:  prog_rom = mk(OP_LDINS,  pl_ldins(T_I2F[7:0],    4'd1, 1'b1, SC_I2F));
+      DEC_ENTRY+8:  prog_rom = mk(OP_EXE,    pl_exe(PS_ZERO));
+      DEC_ENTRY+9:  prog_rom = mk(OP_LDINS,  pl_ldins(T_FFTDIT[7:0], 4'd1, 1'b0, SC_NONE));
+      DEC_ENTRY+10: prog_rom = mk(OP_EXE,    pl_exe(PS_ZERO));
+      DEC_ENTRY+11: prog_rom = mk(OP_LDINS,  pl_ldins(T_PROJ[7:0],   4'd1, 1'b0, SC_NONE));
+      DEC_ENTRY+12: prog_rom = mk(OP_EXE,    pl_exe(PS_ZERO));
+      DEC_ENTRY+13: prog_rom = mk(OP_DMA_OUT,pl_dma(B_FFT, 3'd2, 1'b0, 2'd0, 1'b1));    // out<-upper N of 2N
+      DEC_ENTRY+14: prog_rom = mk(OP_DONE,   pl_done(1'b0));
+      default: ;
+    endcase
+  endfunction
 
   // =====================================================================
   // FSM
@@ -531,13 +533,13 @@ module fhe_microseq
             if ((limb_idx + 1'b1) < limb_cnt) begin
               limb_idx <= limb_idx + 1'b1;
               pc       <= limb_base;
-              op_w     <= PROG[limb_base];
+              op_w     <= prog_rom(limb_base);
             end else begin
               limb_active <= 1'b0;
-              op_w        <= PROG[pc];
+              op_w        <= prog_rom(pc);
             end
           end else begin
-            op_w <= PROG[pc];
+            op_w <= prog_rom(pc);
           end
           st <= S_DECODE;
         end
