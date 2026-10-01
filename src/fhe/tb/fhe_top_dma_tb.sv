@@ -75,6 +75,13 @@ module fhe_top_dma_tb
   localparam logic [AHW-1:0] A_ENTSEED0  = 'h7C;   // C'-2 a/e0 stream seed [31:0]
   localparam logic [AHW-1:0] A_ENTSEED1  = 'h80;   // C'-2 a/e0 stream seed [63:32]
   localparam logic [AHW-1:0] A_RNG_CTRL  = 'h84;   // C'-2 bit0=FREERUN_EN bit1=RESEED_REQ
+  localparam logic [AHW-1:0] A_STREAM_STATUS = 'h88; // private stream (FHE_LOCAL_STREAM)
+  localparam logic [AHW-1:0] A_STREAM_LEFT   = 'h8C;
+  localparam logic [AHW-1:0] A_STREAM_DATA   = 'h90;
+  localparam logic [AHW-1:0] A_STREAM_CAP    = 'h94;
+  localparam logic [31:0]    CTRL_ZEROIZE    = 32'h8;
+  // Aloha limb moduli (profile 0xa108).
+  localparam logic [63:0] Q_LIMB [2] = '{(64'd1<<46)-(64'd9<<24)+1, (64'd1<<47)-(64'd1<<24)+1};
 
   localparam int     RT_SCALE    = 17 + LOGN;
   localparam longint KEYGEN_SEED = 64'hA105_BEEF_0006_A001;
@@ -100,6 +107,9 @@ module fhe_top_dma_tb
   logic [1:0]     htrans;
   logic [2:0]     hsize;
   logic           hresp, hreadyout;
+  // Single-responder AHB-Lite: the bus HREADY is the responder's HREADYOUT, so
+  // wait states and the two-cycle ERROR response behave as on the real fabric.
+  assign hready = hreadyout;
   logic [DW-1:0]  hrdata;
   logic busy_o, error_intr, notif_intr;
 
@@ -285,34 +295,159 @@ module fhe_top_dma_tb
   longint g_input [0:N];
   real   fft_abs_floor = 1.0e-4;
 
-  // AHB-Lite single 32-bit register access
-  task automatic ahb_write(input logic [AHW-1:0] a, input logic [31:0] d);
+  // AHB-Lite single 32-bit register access. The data phase (and HWDATA) is
+  // held while HREADYOUT is low; err reports an ERROR response.
+  task automatic ahb_access(input bit write, input logic [AHW-1:0] a,
+                            input logic [31:0] wd, output logic [31:0] rd,
+                            output bit err);
     begin
       @(negedge clk);
-      hsel <= 1'b1; htrans <= 2'b10; hsize <= 3'b010; hwrite <= 1'b1; haddr <= a;
+      hsel <= 1'b1; htrans <= 2'b10; hsize <= 3'b010; hwrite <= write; haddr <= a;
       @(negedge clk);
       hsel <= 1'b0; htrans <= 2'b00; hwrite <= 1'b0;
-      hwdata <= a[2] ? {d, 32'h0} : {32'h0, d};
+      if (write) hwdata <= a[2] ? {wd, 32'h0} : {32'h0, wd};
+      #1;
+      err = hresp;
+      while (!hreadyout) begin @(negedge clk); #1; end
+      err |= hresp;
+      rd = a[2] ? hrdata[63:32] : hrdata[31:0];
       @(negedge clk);
       hwdata <= '0;
     end
   endtask
 
-  task automatic ahb_read(input logic [AHW-1:0] a, output logic [31:0] d);
-    begin
-      @(negedge clk);
-      hsel <= 1'b1; htrans <= 2'b10; hsize <= 3'b010; hwrite <= 1'b0; haddr <= a;
-      @(negedge clk);
-      hsel <= 1'b0; htrans <= 2'b00;
-      @(negedge clk);
-      d = a[2] ? hrdata[63:32] : hrdata[31:0];
-    end
+  task automatic ahb_write(input logic [AHW-1:0] a, input logic [31:0] d);
+    logic [31:0] unused;
+    bit err;
+    ahb_access(1'b1, a, d, unused, err);
+    if (err) begin $display("FAIL: unexpected AHB error on write 0x%0h", a); errors++; end
   endtask
+
+  task automatic ahb_read(input logic [AHW-1:0] a, output logic [31:0] d);
+    bit err;
+    ahb_access(1'b0, a, '0, d, err);
+    if (err) begin $display("FAIL: unexpected AHB error on read 0x%0h", a); errors++; end
+  endtask
+
+  // AHB-Lite ERROR is exactly two cycles: HREADYOUT low, then high, with
+  // HRESP=ERROR in both. Sampled before each edge.
+  logic resp_err_first;
+  always @(posedge clk or negedge rst_b) begin
+    if (!rst_b) resp_err_first <= 1'b0;
+    else begin
+      if (resp_err_first)
+        assert (hresp && hreadyout) else $fatal(1, "AHB ERROR response did not complete in its second cycle");
+      else if (hresp)
+        assert (!hreadyout) else $fatal(1, "AHB ERROR response skipped its first (wait) cycle");
+      resp_err_first <= hresp && !hreadyout;
+    end
+  end
 
   // write a 64-bit DMA pointer register (lo @ a, hi @ a+4)
   task automatic ahb_write64(input logic [AHW-1:0] a, input logic [63:0] v);
     begin ahb_write(a, v[31:0]); ahb_write(a + 'h4, v[63:32]); end
   endtask
+
+`ifdef FHE_LOCAL_STREAM
+  // Directed bus-level checks of the private stream while the walker is idle.
+  // Illegal DATA accesses must return ERROR without changing stream state.
+  // The race case forces a walker push into the first ERROR cycle: the access
+  // must still fail and must not consume the newly available word.
+  task automatic stream_check(input bit ok, input string what);
+    if (!ok) begin $display("FAIL[STREAM]: %s", what); errors++; end
+  endtask
+
+  task automatic check_local_stream_bus();
+    logic [31:0] d, lo, hi;
+    bit err;
+    int start_errors = errors;
+    ahb_read(A_STREAM_CAP, d);
+    stream_check(d == (32'h80000000 | N), $sformatf("CAP=0x%08h", d));
+    ahb_access(1'b0, A_STREAM_DATA, '0, d, err);
+    stream_check(err, "idle DATA read accepted");
+    ahb_access(1'b1, A_STREAM_DATA, 32'h1234_5678, d, err);
+    stream_check(err, "idle DATA write accepted");
+    ahb_read(A_STREAM_STATUS, d);
+    stream_check(d == 0, $sformatf("rejected access changed STATUS=0x%08h", d));
+    // Keep the next address valid through ERROR completion: no idle bubble
+    // between the rejected transfers. Exercise both read and write errors,
+    // followed immediately by a legal CAP read to check recovery.
+    for (int write_access = 0; write_access < 2; write_access++) begin
+      @(negedge clk);
+      hsel = 1; htrans = 2'b10; haddr = A_STREAM_DATA;
+      hwrite = 1'(write_access); hsize = 3'b010; hwdata = 64'h1234_5678;
+      @(negedge clk);
+      stream_check(hresp && !hreadyout, "first access skipped ERROR wait cycle");
+      @(negedge clk);
+      stream_check(hresp && hreadyout, "first ERROR did not complete");
+      @(negedge clk);
+      stream_check(hresp && !hreadyout, "back-to-back access skipped ERROR wait cycle");
+      haddr = A_STREAM_CAP; hwrite = 0;
+      @(negedge clk);
+      stream_check(hresp && hreadyout, "second ERROR did not complete");
+      @(negedge clk);
+      stream_check(!hresp && hreadyout, "legal access after ERROR did not complete OKAY");
+      stream_check(hrdata[63:32] == (32'h80000000 | N), "CAP read after ERROR returned wrong data");
+      hsel = 0; htrans = 0; hwdata = 0;
+      @(negedge clk);
+      stream_check(!hresp && hreadyout, "spurious ERROR after final access");
+    end
+    ahb_read(A_STREAM_STATUS, d);
+    stream_check(d == 0, "back-to-back errors changed stream state");
+    // Open an output descriptor without running the walker.
+    @(negedge clk);
+    force dut.w_desc_valid = 1'b1; force dut.w_desc_wr = 1'b1;
+    force dut.w_desc_ptr = 3'd2; force dut.w_desc_limb = 4'd0;
+    @(negedge clk);
+    release dut.w_desc_valid; release dut.w_desc_wr; release dut.w_desc_ptr; release dut.w_desc_limb;
+    fork
+      ahb_access(1'b0, A_STREAM_DATA, '0, d, err);
+      begin
+        @(negedge clk); @(posedge clk); #1;   // data phase, first ERROR cycle
+        force dut.w_wr_push = 1'b1; force dut.w_wr_data = 64'hfeed_beef_0bad_cafe;
+        @(posedge clk); #1;
+        release dut.w_wr_push; release dut.w_wr_data;
+      end
+    join
+    stream_check(err, "DATA read completed after its ERROR cycle");
+    ahb_read(A_STREAM_STATUS, d);
+    stream_check(d[3:0] == 4'b1011 && !d[12], $sformatf("race changed STATUS=0x%08h", d));
+    ahb_read(A_STREAM_DATA, lo); ahb_read(A_STREAM_DATA, hi);
+    stream_check({hi, lo} == 64'hfeed_beef_0bad_cafe, $sformatf("word=0x%08h%08h", hi, lo));
+    ahb_read(A_STREAM_LEFT, d);
+    stream_check(d == N-1, $sformatf("LEFT=%0d after one word", d));
+    ahb_write(A_CTRL, CTRL_ZEROIZE);   // discards the open descriptor
+    ahb_read(A_STREAM_STATUS, d);
+    stream_check(d == 0, $sformatf("ZEROIZE left STATUS=0x%08h", d));
+    if (errors == start_errors) $display("PASS local-stream AHB errors, back-to-back errors/recovery, error-cycle race, ZEROIZE");
+  endtask
+`endif
+
+  // Firmware model: private memory <-> AHB stream, no FHE AXI traffic.
+  task automatic service_local_stream();
+`ifdef FHE_LOCAL_STREAM
+    logic [31:0] status, left, lo, hi;
+    int idx;
+    ahb_read(A_STREAM_STATUS, status);
+    if (status[2] || status[3]) begin   // input ready / output valid (both imply active)
+      ahb_read(A_STREAM_LEFT, left);
+      idx = int'(dut.dma_ptr[status[6:4]]/8) + int'(status[11:8])*N + N-int'(left);
+      if (status[1]) begin
+        ahb_read(A_STREAM_DATA, lo); ahb_read(A_STREAM_DATA, hi);
+        dram[idx] = {hi,lo};
+      end else begin
+        ahb_write(A_STREAM_DATA, dram[idx][31:0]); ahb_write(A_STREAM_DATA, dram[idx][63:32]);
+      end
+    end
+`else
+    @(posedge clk);
+`endif
+  endtask
+`ifdef FHE_LOCAL_STREAM
+  always @(posedge clk) if (rst_b)
+    assert (!axi.arvalid && !axi.awvalid && !axi.wvalid)
+      else $fatal(1, "private stream leaked external AXI request");
+`endif
 
   task automatic run_cmd(input fhe_cmd_e c, input string nm);
     int base, guard;
@@ -320,9 +455,9 @@ module fhe_top_dma_tb
     ahb_write(A_CTRL, {29'd0, c});
     cpu_sleep = 1; // parent must stay awake through DMA and completion delivery
     guard = 0;
-    while ((notif_count == base) && (guard < 50_000_000)) begin @(posedge clk); guard++; end
+    while ((notif_count == base) && (guard < 50_000_000)) begin service_local_stream(); guard++; end
     if (notif_count == base) begin $display("  FAIL: %s never completed (timeout)", nm); errors++; end
-    else                          $display("  [dma] %s done (~%0d cyc)", nm, guard);
+    else                          $display("  [dma] %s done (%0d polling iterations)", nm, guard);
     @(negedge clk);
     cpu_sleep = 0;
   endtask
@@ -366,6 +501,72 @@ module fhe_top_dma_tb
     else        $display("PASS %s (%0d doubles, relative tolerance=%g, absolute floor=%g)", name, ndbl, eps, fft_abs_floor);
   endtask
 
+  // Independent public integer evaluator: scalar multiply/add only, using
+  // unbounded-domain model weights and canonical modular reduction per term.
+  // An encrypted constant-one channel supplies bias without assuming an NTT
+  // or Montgomery representation for a freshly constructed plaintext constant.
+  task automatic run_mnist(input string directory);
+    longint slots[0:N-1];
+    longint expected[0:2*10-1];          // two images x ten logits
+    logic [31:0] weights[0:10*197-1];     // ten classes x (196 pixels + bias)
+    logic [63:0] acc[0:10*4*N-1];
+    logic [63:0] q, x, term;
+    int weight;
+    real error, max_error;
+    foreach (acc[i]) acc[i] = 0;
+    $readmemh({directory, "/weights.mem"}, weights);
+    $readmemh({directory, "/expected.mem"}, expected);
+    ahb_write(A_CONFIG, 2);
+    ahb_write(A_RNG_CTRL, 1);
+    for (int feature_idx=0; feature_idx<197; feature_idx++) begin
+      $readmemh($sformatf("%s/input_%03d.mem", directory, feature_idx), slots);
+      for (int i=0;i<N;i++) dram[ADDR_P/8+i] = slots[i];
+      ahb_write64(A_PTR0_LO, 64'(ADDR_P));
+      ahb_write64(A_PTR2_LO, 64'(ADDR_C0));
+      ahb_write64(A_PTR3_LO, 64'(ADDR_C1));
+      doorbell(ENT_SEED + 64'(feature_idx));
+      run_cmd(FHE_ENCRYPT, $sformatf("MNIST ingress %0d", feature_idx));
+      for (int k=0;k<10;k++) begin
+        weight = int'(weights[k*197+feature_idx]);
+        for (int component=0;component<2;component++)
+          for (int li=0;li<2;li++) begin
+            q = Q_LIMB[li];
+            for (int i=0;i<N;i++) begin
+              int a;
+              a = k*4*N + (component*2+li)*N+i;
+              x = dram[(component == 0 ? ADDR_C0 : ADDR_C1)/8+li*N+i] % q;
+              term = (x * 64'(weight < 0 ? -weight : weight)) % q;
+              if (weight < 0 && term != 0) term = q-term;
+              acc[a] = (acc[a]+term) % q;
+            end
+          end
+      end
+    end
+    max_error = 0;
+    for (int k=0;k<10;k++) begin
+      for (int i=0;i<2*N;i++) begin
+        dram[ADDR_C0/8+i] = acc[k*4*N+i];
+        dram[ADDR_C1/8+i] = acc[k*4*N+2*N+i];
+      end
+      ahb_write64(A_PTR0_LO, 64'(ADDR_C0));
+      ahb_write64(A_PTR1_LO, 64'(ADDR_C1));
+      ahb_write64(A_PTR2_LO, 64'(ADDR_OUT));
+      run_cmd(FHE_DECRYPT, $sformatf("MNIST egress %0d",k));
+      for (int image_idx=0;image_idx<2;image_idx++) begin
+        error = $bitstoreal(dram[ADDR_OUT/8+2*image_idx]) - $bitstoreal(expected[image_idx*10+k]);
+        if (error < 0) error = -error;
+        if (error > max_error) max_error = error;
+        // Fail closed: comparisons against NaN are false, including >=.
+        if (!(error < 0.5)) begin
+          errors++;
+          $display("FAIL MNIST image=%0d class=%0d got=%g expected=%g", image_idx,k,
+            $bitstoreal(dram[ADDR_OUT/8+2*image_idx]), $bitstoreal(expected[image_idx*10+k]));
+        end
+      end
+    end
+    $display("MNIST two-image max absolute logit error=%g", max_error);
+  endtask
+
   // ------------------------------------------------------------------
   int          rns_scale;
   logic [31:0] i2f_val;
@@ -373,12 +574,36 @@ module fhe_top_dma_tb
   initial begin
     if (!$value$plusargs("TVDIR=%s", tvdir)) tvdir = ".";
 
-    hsel=0; hwrite=0; haddr=0; hwdata=0; htrans=0; hsize=3'b010; hready=1'b1;
+    hsel=0; hwrite=0; haddr=0; hwdata=0; htrans=0; hsize=3'b010;
     for (int i = 0; i < DEPTH; i++) dram[i] = 64'd0;
     rst_b = 1'b0;
     repeat (4) @(negedge clk);
     rst_b = 1'b1;
     repeat (2) @(negedge clk);
+
+    // Functional firmware co-simulation: time advances only for MMIO requests.
+    // This deliberately makes no CPU/peripheral timing claim.
+    if ($test$plusargs("RPC")) begin
+      int op, count;
+      logic [31:0] addr, value, rdata;
+      bit err;
+      forever begin
+        count = $fscanf(32'h80000000, "%d %h %h", op, addr, value);
+        if (count != 3) $finish;
+        else begin
+          // Reply "RPC <read data> <1 if AHB ERROR>"; the emulator raises a
+          // load/store access fault for an ERROR response.
+          ahb_access(op == 1, addr, value, rdata, err);
+          repeat (32) @(negedge clk);
+          $display("RPC %08x %0d", rdata, err);
+          $fflush();
+        end
+      end
+    end
+
+`ifdef FHE_LOCAL_STREAM
+    check_local_stream_bus();
+`endif
 
     // Pause the parent clock in each idle phase while lifted SRAMs continue
     // to receive base-clock edges. No repeated requests/response shifts allowed.
@@ -506,7 +731,7 @@ module fhe_top_dma_tb
       // A fixed 20k-cycle delay is too short for the phased full-size engine.
       guard = 0;
       while (!dut.ctrl_wait_entropy && !dut.status_valid && guard < 50_000_000) begin
-        @(posedge clk); guard++;
+        service_local_stream(); guard++;
       end
       repeat (200) @(posedge clk); // prove it remains blocked without the doorbell
       ahb_read(A_STATUS, sdata);                     // sdata[1]=VALID, sdata[4]=RESEED_REQ_PENDING
@@ -528,7 +753,7 @@ module fhe_top_dma_tb
       // release: deliver the doorbell WHILE the command is busy/stalled.
       doorbell(ENT_SEED);
       guard = 0;
-      while (!dut.status_valid && (guard < 50_000_000)) begin @(posedge clk); guard++; end
+      while (!dut.status_valid && (guard < 50_000_000)) begin service_local_stream(); guard++; end
       ahb_read(A_STATUS, sdata);
       if (!dut.status_valid) begin
         $display("FAIL[FREERUN]: stalled encrypt never released after RESEED_REQ"); errors++;
@@ -570,6 +795,10 @@ module fhe_top_dma_tb
       end
     end
 
+    begin
+      string mnist_dir;
+      if ($value$plusargs("MNIST=%s",mnist_dir)) run_mnist(mnist_dir);
+    end
     if (errors == 0) $display("fhe_top_dma_tb RESULT: PASS");
     else             $display("fhe_top_dma_tb RESULT: FAIL (%0d error(s))", errors);
     $finish;

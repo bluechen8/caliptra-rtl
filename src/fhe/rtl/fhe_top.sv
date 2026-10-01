@@ -104,7 +104,14 @@ module fhe_top
   logic                  cif_err;
 
   assign cif_hld = 1'b0;
+`ifdef FHE_LOCAL_STREAM
+  // Declared before first use for strict simulators.
+  logic [31:0] stream_status, stream_left, stream_data;
+  logic stream_access_error;
+  assign cif_err = stream_access_error;
+`else
   assign cif_err = 1'b0;
+`endif
 
   fhe_ahb_slv_sif #(
     .AHB_DATA_WIDTH    (AHB_DATA_WIDTH),
@@ -185,6 +192,10 @@ module fhe_top
   localparam logic [5:0] OFF_ENTSEED1  = 6'd32; // 0x80  a/e0 stream seed [63:32]
   localparam logic [5:0] OFF_RNG_CTRL  = 6'd33; // 0x84  bit0=FREERUN_EN, bit1=RESEED_REQ
 
+  localparam logic [5:0] OFF_STREAM_STATUS = 6'd34; // 0x88
+  localparam logic [5:0] OFF_STREAM_LEFT   = 6'd35; // 0x8c, 64-bit words remaining
+  localparam logic [5:0] OFF_STREAM_DATA   = 6'd36; // 0x90, ordered low/high words
+  localparam logic [5:0] OFF_STREAM_CAP    = 6'd37; // 0x94, private-stream capability and N
   logic [5:0] word_sel;
   assign word_sel = cif_addr[7:2];
 
@@ -606,6 +617,43 @@ module fhe_top
     .m_aloha_mem        (fhe_aloha_mem)
   );
 
+`ifdef FHE_LOCAL_STREAM
+  fhe_local_stream #(.N(FHE_N)) i_local_stream (
+    .clk(clk), .rst_n(rst_b), .clear(zeroize),
+    .desc_valid(w_desc_valid), .desc_wr(w_desc_wr),
+    .desc_ptr(w_desc_ptr), .desc_limb(w_desc_limb), .dma_ready(w_dma_ready),
+    .rd_valid(w_rd_valid), .rd_data(w_rd_data), .rd_ready(w_rd_pop),
+    .wr_valid(w_wr_push), .wr_data(w_wr_data), .wr_ready(w_wr_ready),
+    .data_read(rd_en && word_sel == OFF_STREAM_DATA),
+    .data_write(wr_en && word_sel == OFF_STREAM_DATA),
+    .data_wdata(cif_wdata), .data_rdata(stream_data),
+    .status(stream_status), .remaining(stream_left), .access_error(stream_access_error)
+  );
+  // No external transaction is possible in the private-stream configuration.
+  assign fhe_axi_r_if.araddr = '0;
+  assign fhe_axi_r_if.arburst = '0;
+  assign fhe_axi_r_if.arsize = '0;
+  assign fhe_axi_r_if.arlen = '0;
+  assign fhe_axi_r_if.arid = '0;
+  assign fhe_axi_r_if.aruser = '0;
+  assign fhe_axi_r_if.arlock = '0;
+  assign fhe_axi_r_if.arvalid = 0;
+  assign fhe_axi_r_if.rready = 0;
+  assign fhe_axi_w_if.awaddr = '0;
+  assign fhe_axi_w_if.awburst = '0;
+  assign fhe_axi_w_if.awsize = '0;
+  assign fhe_axi_w_if.awlen = '0;
+  assign fhe_axi_w_if.awid = '0;
+  assign fhe_axi_w_if.awuser = '0;
+  assign fhe_axi_w_if.awlock = '0;
+  assign fhe_axi_w_if.awvalid = 0;
+  assign fhe_axi_w_if.wdata = '0;
+  assign fhe_axi_w_if.wstrb = '0;
+  assign fhe_axi_w_if.wlast = 0;
+  assign fhe_axi_w_if.wuser = '0;
+  assign fhe_axi_w_if.wvalid = 0;
+  assign fhe_axi_w_if.bready = 0;
+`else
   // Dedicated FHE DMA: reuses Caliptra's axi_mgr_rd/axi_mgr_wr; resolves the
   // walker descriptor + PTR regs to chunked AXI bursts on the manager port.
   fhe_dma #(
@@ -634,6 +682,8 @@ module fhe_top
     .m_axi_r_if (fhe_axi_r_if),
     .m_axi_w_if (fhe_axi_w_if)
   );
+
+`endif
 
   assign ctrl_busy  = w_busy | cmd_valid;
   assign ctrl_done  = w_done;
@@ -719,6 +769,12 @@ module fhe_top
       OFF_PTR2_HI: cif_rdata = dma_ptr[2][63:32];
       OFF_PTR3_LO: cif_rdata = dma_ptr[3][31:0];
       OFF_PTR3_HI: cif_rdata = dma_ptr[3][63:32];
+`ifdef FHE_LOCAL_STREAM
+      OFF_STREAM_STATUS: cif_rdata = stream_status;
+      OFF_STREAM_LEFT: cif_rdata = stream_left;
+      OFF_STREAM_DATA: cif_rdata = stream_data;
+      OFF_STREAM_CAP:    cif_rdata = 32'h80000000 | FHE_N;
+`endif
       OFF_KGKV_CTRL: cif_rdata = {23'b0, kgkv_entry, 3'b0, kgkv_en_eff};
       default:     cif_rdata = 32'b0;
     endcase

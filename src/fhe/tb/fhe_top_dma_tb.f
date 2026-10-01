@@ -31,6 +31,7 @@ $CALIPTRA_ROOT/src/keyvault/rtl/kv_defines_pkg.sv
 -f $ALOHA_PORT/sim/aloha_core.f
 $ALOHA_PORT/../rtl/fhe_microseq.sv
 $ALOHA_PORT/../rtl/fhe_dma.sv
+$ALOHA_PORT/../rtl/fhe_local_stream.sv
 $ALOHA_PORT/../rtl/fhe_kv_seed.sv
 $ALOHA_PORT/../rtl/fhe_1r1w_ram.sv
 $ALOHA_PORT/../rtl/fhe_mem_if.sv

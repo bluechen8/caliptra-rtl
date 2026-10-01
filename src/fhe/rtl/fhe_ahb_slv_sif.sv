@@ -52,7 +52,11 @@ module fhe_ahb_slv_sif #(
     localparam logic H_ERROR = 1'b1;
     localparam BITS_WDATA = $bits(wdata);
 
-    logic err_f;
+    // An ERROR response is two cycles. The first comes from the client's err;
+    // the second is the slave's own (err_2nd), with dv hidden from the client
+    // so the rejected access is neither repeated nor completed.
+    logic dv_q, err_2nd;
+    assign dv = dv_q & ~err_2nd;
 
     // 64-bit AHB, 32-bit client: select the addressed word and lane-align.
     always_comb begin
@@ -67,14 +71,14 @@ module fhe_ahb_slv_sif #(
 
     always_ff @(posedge hclk or negedge hreset_n) begin
         if (!hreset_n) begin
-            dv    <= 1'b0;
-            write <= 1'b0;
-            addr  <= '0;
-            err_f <= 1'b0;
+            dv_q    <= 1'b0;
+            write   <= 1'b0;
+            addr    <= '0;
+            err_2nd <= 1'b0;
         end else begin
-            err_f <= err;
+            err_2nd <= err & ~err_2nd;
             if (hready_i) begin
-                dv <= hsel_i & (htrans_i inside {2'b10, 2'b11});
+                dv_q <= hsel_i & (htrans_i inside {2'b10, 2'b11});
             end
             if (hready_i & hsel_i) begin
                 addr  <= haddr_i[CLIENT_ADDR_WIDTH-1:0];
@@ -86,13 +90,13 @@ module fhe_ahb_slv_sif #(
     always_comb begin : response_block
         hreadyout_o = 1'b1;
         hresp_o     = H_OKAY;
-        if (err & ~err_f) begin
-            // first error cycle: de-assert ready, drive error
-            hreadyout_o = 1'b0;
-            hresp_o     = H_ERROR;
-        end else if (err & err_f) begin
+        if (err_2nd) begin
             // second error cycle: ready high, error still asserted
             hreadyout_o = 1'b1;
+            hresp_o     = H_ERROR;
+        end else if (err) begin
+            // first error cycle: de-assert ready, drive error
+            hreadyout_o = 1'b0;
             hresp_o     = H_ERROR;
         end else if (hld) begin
             hreadyout_o = 1'b0;

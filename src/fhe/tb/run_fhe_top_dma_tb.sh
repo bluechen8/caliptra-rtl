@@ -46,7 +46,8 @@ python3 "$ALOHA_PORT/tvgen/gen_roundtrip.py" "$LOGN" "$WORK" >/dev/null
 # register path is compiled out and KeyVault is forced as the sole keygen-seed
 # source. It implies +KVSEED (must provision + read the KV seed to work).
 EXTRA_DEF=""
-if [[ -n "${KV_ONLY:-}" ]]; then EXTRA_DEF="-DFHE_KV_SEED_ONLY"; export KVSEED=1; fi
+[[ "${LOCAL_STREAM:-0}" == 1 ]] && EXTRA_DEF="-DFHE_LOCAL_STREAM"
+if [[ -n "${KV_ONLY:-}" ]]; then EXTRA_DEF="$EXTRA_DEF -DFHE_KV_SEED_ONLY"; export KVSEED=1; fi
 
 echo "=== build $TOP (N=$N) ${EXTRA_DEF:+[$EXTRA_DEF]} ==="
 [[ -n "${CLEAN:-}" ]] && rm -rf "$OBJ_DIR"
@@ -75,10 +76,17 @@ coe2mem() {
 coe2mem "$MIF/TwFctrCache_RNSConsts.coe"   "$RUNDIR/fft_rns_rom.mem"
 coe2mem "$MIF/FFTStoredTwiddleFactors.coe" "$RUNDIR/fft_all_twiddle_rom.mem"
 
+if [[ "${BUILD_ONLY:-0}" == 1 ]]; then
+  echo "RPC executable: $OBJ_DIR/V$TOP"
+  echo "RPC working directory: $RUNDIR"
+  exit 0
+fi
+
 echo "=== running (cwd=$RUNDIR) ==="
 # KVSEED=1 sources the keygen root seed from a modeled KeyVault (C'-1b) and
 # asserts the walker's effective seed == the KV value (KGSEED regs held wrong).
 PLUSARGS=""
+[[ -n "${MNIST_DIR:-}" ]] && PLUSARGS="$PLUSARGS +MNIST=$MNIST_DIR"
 [[ -n "${LIMBS2:-}" ]] && PLUSARGS="$PLUSARGS +LIMBS2"
 [[ -n "${KVSEED:-}" ]]  && PLUSARGS="$PLUSARGS +KVSEED"
 [[ -n "${FREERUN:-}" ]] && PLUSARGS="$PLUSARGS +FREERUN"   # C'-2 free-run PRNG test
