@@ -237,6 +237,8 @@ module fhe_top
   logic     ctrl_wait_entropy;   // C'-2: walker stalled awaiting a firmware reseed (RESEED_REQ)
   logic     wait_entropy_q;      // for a 1-cycle notif pulse on entering the wait
   logic     ready;
+  logic     zeroize;
+  logic     cmd_accept;
 `ifdef FHE_WALKER
   logic [1:0] mem_phase;
   wire core_step = (mem_phase == 2'd1) && clock_live && rst_b && !zeroize;
@@ -263,7 +265,6 @@ module fhe_top
   assign fhe_aloha_mem.phase_write = mem_write;
   assign fhe_aloha_mem.table_load_ready = rst_b && !zeroize && !ctrl_busy && !cmd_accept;
 `endif
-  logic     zeroize;
 
   assign ready  = ~ctrl_busy;
   // Keep the parent awake until the registered completion is consumed.
@@ -274,7 +275,6 @@ module fhe_top
   assign zeroize = ctrl_wr & cif_wdata[3];               // ZEROIZE bit
 
   // Command accept: CTRL written with a non-NONE opcode while ready.
-  logic cmd_accept;
   assign cmd_accept = ctrl_wr & ready & (cif_wdata[2:0] != 3'b000);
 
   always_ff @(posedge clk or negedge rst_b) begin
@@ -381,7 +381,9 @@ module fhe_top
   // is stalled waiting for fresh entropy after keygen / cold reset. The AHB slave
   // never back-pressures (cif_hld=0), so wr_en pulses regardless of ctrl_busy.
   always_ff @(posedge clk or negedge rst_b) begin
-    if (!rst_b || zeroize) begin
+    if (!rst_b) begin
+      entseed <= '0; freerun_en <= 1'b0; reseed_req <= 1'b0;
+    end else if (zeroize) begin
       entseed <= '0; freerun_en <= 1'b0; reseed_req <= 1'b0;
     end else begin
       if (wr_en) begin
