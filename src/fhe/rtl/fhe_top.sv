@@ -538,8 +538,10 @@ module fhe_top
   logic [3:0]   w_desc_limb;
   logic         w_dma_ready, w_rd_valid, w_rd_pop, w_wr_ready;
 
-  fhe_microseq #(.LOGN(FHE_LOGN), .N(FHE_N)) walker (
+  logic [3:0] active_key_limb;
+  fhe_microseq #(.SRAM_REUSE(1), .LOGN(FHE_LOGN), .N(FHE_N)) walker (
     .step(core_step),
+    .active_limb(active_key_limb),
     .sk_en(fhe_aloha_mem.sk_en), .sk_we(fhe_aloha_mem.sk_we),
     .sk_addr(fhe_aloha_mem.sk_addr), .sk_wdata(fhe_aloha_mem.sk_wdata),
     .sk_rdata(fhe_aloha_mem.sk_rdata),
@@ -590,12 +592,15 @@ module fhe_top
   );
 
   ComputeCoreWrapper #(
+    .SRAM_REUSE                (1),
     .FFT_ON_THE_FLY_GENERATION (0),
     .PROVIDE_DEBUG_IO          (1),
     .LOGN                      (FHE_LOGN),
     .N                         (FHE_N),
     .SCHEME                    (1)
   ) core (
+    .reuse_keygen(cmd_q == FHE_KEYGEN),
+    .reuse_limb(active_key_limb),
     .clk                (core_clk),
     .reseed_en          (w_reseed_en),
     .prng_rst_i         (fhe_prng_rst),

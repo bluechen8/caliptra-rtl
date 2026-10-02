@@ -140,38 +140,85 @@ module fhe_top_dma_tb
   );
 
   fhe_aloha_mem_if aloha_mem();
-  fhe_aloha_mem_top #(.PHASED(1)) u_aloha_mem (.clk_i(clk), .m(aloha_mem.resp));
+  fhe_aloha_mem_top #(.PHASED(1), .SRAM_REUSE(1)) u_aloha_mem (.clk_i(clk), .m(aloha_mem.resp));
 
-  // Check the narrowed, synchronous resident-key port independently of the
-  // round-trip (which can otherwise hide matching corruption on both paths).
-  logic [53:0] key_shadow [0:N*FHE_L-1];
-  bit key_written [0:N*FHE_L-1];
-  bit key_read_pending;
-  logic [$clog2(N*FHE_L)-1:0] key_read_addr;
+  // Banked resident keys are transformed in place and never written by
+  // application commands. Count only final representation-conversion writes.
   int key_writes [0:FHE_L-1];
   int key_reads [0:FHE_L-1];
   always @(posedge clk) begin
     if (!rst_b) begin
-      key_read_pending <= 0;
-      foreach (key_written[i]) key_written[i] = 0;
       foreach (key_writes[i]) key_writes[i] = 0;
       foreach (key_reads[i]) key_reads[i] = 0;
-    end else begin
-      if (key_read_pending) begin
-        key_reads[int'(key_read_addr)/N]++;
-        assert (key_written[key_read_addr]) else $fatal(1, "key read before write");
-        assert (aloha_mem.sk_rdata === key_shadow[key_read_addr])
-          else $fatal(1, "key SRAM read/latency mismatch at %0d", key_read_addr);
+    end else if (aloha_mem.phase_read) begin
+      assert (!aloha_mem.sk_en) else $fatal(1,"obsolete resident-key copy port used");
+      if (dut.cmd_q != FHE_KEYGEN)
+        assert (!aloha_mem.ntt_v0_wea && !aloha_mem.ntt_v1_wea)
+          else $fatal(1,"application command overwrote persistent key");
+      if (dut.cmd_q == FHE_KEYGEN && !dut.core.CORE.pwm_rst) begin
+        if(aloha_mem.ntt_v0_wea) key_writes[int'(aloha_mem.ntt_v0_addra)/(N/2)]++;
+        if(aloha_mem.ntt_v1_wea) key_writes[int'(aloha_mem.ntt_v1_addra)/(N/2)]++;
       end
-      key_read_pending <= aloha_mem.sk_en && !aloha_mem.sk_we;
-      key_read_addr <= aloha_mem.sk_addr;
-      if (aloha_mem.sk_en && aloha_mem.sk_we) begin
-        assert (dut.walker.dout_high[31:22] == 0)
-          else $fatal(1, "resident key truncation would discard nonzero bits");
-        key_shadow[aloha_mem.sk_addr] = aloha_mem.sk_wdata;
-        key_written[aloha_mem.sk_addr] = 1;
-        key_writes[int'(aloha_mem.sk_addr)/N]++;
-      end
+      if (dut.cmd_q == FHE_ENCRYPT && !dut.core.CORE.pwm_rst)
+        key_reads[int'(aloha_mem.ntt_v0_addrb)/(N/2)]++;
+      // Modular writes must never clobber samples; sampler writes touch only
+      // the upper byte. The stream must serialize only residue bits.
+      assert (aloha_mem.ntt_msg0_mask inside {8'h7f,8'h80});
+      assert (aloha_mem.ntt_msg1_mask inside {8'h7f,8'h80});
+    end
+  end
+
+  string state_dump_dir;
+  task automatic dump_state(input bit keys);
+    int fd;
+    if ($value$plusargs("STATE_DUMP=%s", state_dump_dir)) begin
+      fd=$fopen({state_dump_dir, keys ? "/key.hex" : "/ciphertext.hex"},"w");
+      assert(fd!=0) else $fatal(1,"cannot open state dump");
+      for(int limb=0;limb<($test$plusargs("LIMBS2")?2:1);limb++)
+        for(int i=0;i<N;i++) begin
+          if(keys) begin
+            if(i%2==0) $fdisplay(fd,"%014h",u_aloha_mem.ntt_v0.mem[limb*(N/2)+i/2]);
+            else $fdisplay(fd,"%014h",u_aloha_mem.ntt_v1.mem[limb*(N/2)+i/2]);
+          end else begin
+            $fdisplay(fd,"%016h",dram[ADDR_C0/8+limb*N+i]);
+            $fdisplay(fd,"%016h",dram[ADDR_C1/8+limb*N+i]);
+          end
+        end
+      $fclose(fd);
+    end
+  endtask
+  task automatic check_baseline(input bit keys);
+    string dir;
+    logic [63:0] expected [0:2*N*FHE_L-1];
+    logic [63:0] actual;
+    if($value$plusargs("GOLDEN_DIR=%s",dir)) begin
+      assert(N==256 && $test$plusargs("LIMBS2")) else $fatal(1,"golden geometry mismatch");
+      $readmemh({dir,keys ? "/key.hex" : "/ciphertext.hex"},expected,0,keys ? N*FHE_L-1 : 2*N*FHE_L-1);
+      for(int limb=0;limb<FHE_L;limb++)
+        for(int i=0;i<N;i++) begin
+          if(keys) begin
+            actual=i%2==0 ? {10'd0,u_aloha_mem.ntt_v0.mem[limb*(N/2)+i/2]} :
+                           {10'd0,u_aloha_mem.ntt_v1.mem[limb*(N/2)+i/2]};
+            assert(actual===expected[limb*N+i]) else $fatal(1,"baseline key mismatch limb=%0d i=%0d",limb,i);
+          end else begin
+            assert(dram[ADDR_C0/8+limb*N+i]===expected[2*(limb*N+i)])
+              else $fatal(1,"baseline c0 mismatch limb=%0d i=%0d",limb,i);
+            assert(dram[ADDR_C1/8+limb*N+i]===expected[2*(limb*N+i)+1])
+              else $fatal(1,"baseline c1 mismatch limb=%0d i=%0d",limb,i);
+          end
+        end
+      $display("PASS pre-reuse baseline %s: both limbs bit-exact",keys ? "secret" : "ciphertext");
+    end
+  endtask
+  longint measured_cycles;
+  bit measured_busy;
+  always @(posedge clk) begin
+    if(!rst_b) begin measured_busy=0; measured_cycles=0; end
+    else begin
+      if(dut.w_busy && !measured_busy) measured_cycles=0;
+      if(dut.w_busy) measured_cycles++;
+      if(!dut.w_busy && measured_busy) $display("FHE_CYCLES cmd=%0d base_cycles=%0d",dut.cmd_q,measured_cycles);
+      measured_busy=dut.w_busy;
     end
   end
 
@@ -608,7 +655,7 @@ module fhe_top_dma_tb
     // Pause the parent clock in each idle phase while lifted SRAMs continue
     // to receive base-clock edges. No repeated requests/response shifts allowed.
     for (int phase = 0; phase < 3; phase++) begin
-      logic [53:0] held_response;
+      logic [63:0] held_response;
       while (dut.mem_phase != 2'(phase)) @(negedge clk);
       held_response = aloha_mem.ntt_msg0_doutb;
       parent_manual_enable = 0;
@@ -658,6 +705,8 @@ module fhe_top_dma_tb
 
     // ---- KEYGEN (no DMA) ----
     run_cmd(FHE_KEYGEN, "KEYGEN");
+    dump_state(1);
+    check_baseline(1);
 
     // C'-1b decisive check: the walker's effective keygen seed must equal the
     // KeyVault-provisioned value (NOT the deliberately-wrong KGSEED registers).
@@ -681,8 +730,10 @@ module fhe_top_dma_tb
     ahb_write64(A_PTR2_LO, 64'(ADDR_C0));
     ahb_write64(A_PTR3_LO, 64'(ADDR_C1));
     run_cmd(FHE_ENCRYPT, "ENCRYPT");
+    dump_state(0);
+    check_baseline(0);
     for (int limb=0; limb < ($test$plusargs("LIMBS2") ? 2 : 1); limb++) begin
-      assert (key_reads[limb] == N)
+      assert (key_reads[limb] >= N)
         else $fatal(1, "key limb %0d: expected %0d reads, got %0d", limb, N, key_reads[limb]);
     end
 

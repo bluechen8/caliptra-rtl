@@ -12,35 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Description:
-//   C'-3 SRAM-macro routing. Bundles the Aloha-HE ComputeCore's internal
-//   storage banks so they can be LIFTED out of the vendored RTL to the
-//   caliptra_top / CaliptraCoreBlackbox boundary and instantiated as real
-//   SRAM on the Chisel side (SyncReadMem -> FIRRTL mems.conf -> Sky130 macro),
-//   exactly like the VeeR ICCM/DCCM banks. Modeled on abr_mem_if.sv /
-//   fhe_mem_if.sv but carries each bank's NATIVE Aloha wrapper port shape and
-//   latency contract (aloha_bram_behav.sv): the behavioral bank wrappers live
-//   in a fhe_aloha_mem_top module (instantiated in the standalone TBs, and in
-//   CaliptraCoreBlackbox for the SoC) so the original TBs keep running.
-//
-//   Rung 1a scope = the 12 banks instantiated DIRECTLY in ComputeCore.v:
-//     8x NTTPolyBank    (simple-dual-port, 54b x 4096, 12b addr, READ_FIRST)
-//         ntt_msg0/1, ntt_v0/1, ntt_e1_0/1, ntt_key0/1
-//     2x CBDPolyBRAM    (single-port,      6b  x 8192, 13b addr, WRITE_FIRST)
-//         e0, e1
-//     1x TernaryPolyBRAM(single-port,      2b  x 8192, 13b addr, WRITE_FIRST)
-//         vt
-//     1x FFTTw_RNS_ROM  (single-port ROM,  128b x 512, 9b  addr)
-//         crom
-//   plus the stored FFT-twiddle ROM lifted from FFTTwFctStorage (2 hops up through
-//   UnifiedTransformation):
-//     1x FFTAllTwiddleROM(single-port ROM,  128b x 4096, 12b addr)
-//         ftwrom
-//   (SharedFFTBrams -- the 74b FFT banks -- are lifted in a later rung.)
-//
-//   The ntt_e1_* banks are only DRIVEN in the pk reference path (SCHEME==0);
-//   the sk product path (SCHEME==1) drops them (C'-3 Part 1), so ComputeCore
-//   ties the e1 request side off and the top-side storage may omit them.
+// Shared-SRAM boundary. SRAM_REUSE=1 uses packed 64-bit message banks,
+// two 64-bit FFT bank pairs, banked 54-bit resident keys and the two tables.
+// The ntt_v request names now address resident K with a limb offset. Retired
+// ntt_key/e0/vt/sk-copy ports remain for the standalone reference mode only;
+// the integrated Chisel implementation does not instantiate their storage.
+// Module-facing read/write requests are time-multiplexed onto physical 1RW
+// SRAM by the READ/EXECUTE/WRITE adapter; these are not physical 1R1W ports.
 
 // Ring dimension N drives the poly-bank address widths (LOGN = $clog2(N)).
 // Mirror aloha_bram_behav.sv's guard so the interface widths track FHE_N even
@@ -103,15 +81,17 @@ interface fhe_aloha_mem_if;
   // sampled in READ, the core advances in EXECUTE, saved writes retire in WRITE.
   logic phase_read, phase_execute, phase_write, table_load_ready;
 
+  logic [7:0] ntt_msg0_mask, ntt_msg1_mask;
   logic sk_en, sk_we;
   logic [$clog2(`FHE_N*`FHE_L)-1:0] sk_addr;
   logic [53:0] sk_wdata, sk_rdata;
 
-  // 8x NTTPolyBank : 54b x N/2 (LOGN-1 addr), simple-dual-port
-  `ALOHA_MEM_SDP_SIG(54, `ALOHA_SDP_AW, ntt_msg0)
-  `ALOHA_MEM_SDP_SIG(54, `ALOHA_SDP_AW, ntt_msg1)
-  `ALOHA_MEM_SDP_SIG(54, `ALOHA_SDP_AW, ntt_v0)
-  `ALOHA_MEM_SDP_SIG(54, `ALOHA_SDP_AW, ntt_v1)
+  // M is 64-bit with byte masks; ntt_v ports are resident K (NL/2 per bank).
+  // e1/key requests below are retained for reference-mode compatibility.
+  `ALOHA_MEM_SDP_SIG(64, `ALOHA_SDP_AW, ntt_msg0)
+  `ALOHA_MEM_SDP_SIG(64, `ALOHA_SDP_AW, ntt_msg1)
+  `ALOHA_MEM_SDP_SIG(54, $clog2(`FHE_N*`FHE_L/2), ntt_v0)
+  `ALOHA_MEM_SDP_SIG(54, $clog2(`FHE_N*`FHE_L/2), ntt_v1)
   `ALOHA_MEM_SDP_SIG(54, `ALOHA_SDP_AW, ntt_e1_0)
   `ALOHA_MEM_SDP_SIG(54, `ALOHA_SDP_AW, ntt_e1_1)
   `ALOHA_MEM_SDP_SIG(54, `ALOHA_SDP_AW, ntt_key0)
@@ -120,13 +100,12 @@ interface fhe_aloha_mem_if;
   `ALOHA_MEM_SP_SIG(6, `ALOHA_SP_AW, e0)
   `ALOHA_MEM_SP_SIG(6, `ALOHA_SP_AW, e1)
   `ALOHA_MEM_SP_SIG(2, `ALOHA_SP_AW, vt)
-  // 4x SharedFFTBrams working banks (lifted from SharedFFTBrams.sv): 2x lower
-  // (54b NTTPolyBank, READ_FIRST) + 2x higher (74b SharedFFTBramBank, WRITE_FIRST),
-  // all N/2 (LOGN-1 addr), simple-dual-port.
-  `ALOHA_MEM_SDP_SIG(54, `ALOHA_SDP_AW, fft_lower0)
-  `ALOHA_MEM_SDP_SIG(54, `ALOHA_SDP_AW, fft_lower1)
-  `ALOHA_MEM_SDP_SIG(74, `ALOHA_SDP_AW, fft_higher0)
-  `ALOHA_MEM_SDP_SIG(74, `ALOHA_SDP_AW, fft_higher1)
+  // FFT real/imaginary: both 64 bits. Lower doubles as a/c1; higher holds
+  // the encoded real vector across limbs. Lower READ_FIRST, higher WRITE_FIRST.
+  `ALOHA_MEM_SDP_SIG(64, `ALOHA_SDP_AW, fft_lower0)
+  `ALOHA_MEM_SDP_SIG(64, `ALOHA_SDP_AW, fft_lower1)
+  `ALOHA_MEM_SDP_SIG(64, `ALOHA_SDP_AW, fft_higher0)
+  `ALOHA_MEM_SDP_SIG(64, `ALOHA_SDP_AW, fft_higher1)
   // 1x FFTTw_RNS_ROM (crom): 128b x nextPow2(344+8*LOGN). Content is a function of
   // LOGN but NOT proportional to N (408 words @N=256, 448 @N=8192); the addr width
   // is 9b (512 words) for all N up to 2^21, then auto-grows.
@@ -136,6 +115,7 @@ interface fhe_aloha_mem_if;
 
   modport req (
     output phase_read, phase_execute, phase_write, table_load_ready,
+    output ntt_msg0_mask, ntt_msg1_mask,
     output sk_en, sk_we, sk_addr, sk_wdata, input sk_rdata,
     `ALOHA_MEM_SDP_REQ(ntt_msg0),
     `ALOHA_MEM_SDP_REQ(ntt_msg1),
@@ -158,6 +138,7 @@ interface fhe_aloha_mem_if;
 
   modport resp (
     input phase_read, phase_execute, phase_write, table_load_ready,
+    input ntt_msg0_mask, ntt_msg1_mask,
     input sk_en, sk_we, sk_addr, sk_wdata, output sk_rdata,
     `ALOHA_MEM_SDP_RESP(ntt_msg0),
     `ALOHA_MEM_SDP_RESP(ntt_msg1),

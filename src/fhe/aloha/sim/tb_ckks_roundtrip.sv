@@ -84,6 +84,7 @@ module tb_ckks_roundtrip;
       .N(N),
       .SCHEME(SCHEME)
     ) dut (
+    .reuse_keygen(1'b0), .reuse_limb(4'd0),
       .clk(clk),
       // legacy: reseed every pass, Trivium reset coupled to the core reset (this
       // TB validates the golden per-pass-reload keystream, not free-run).
@@ -141,6 +142,7 @@ module tb_ckks_roundtrip;
   wire [31:0] core_dh = walker_mode ? w_dh : dina_high;
 
   fhe_microseq #(.LOGN(LOGN), .N(N)) walker (
+    .active_limb(),
     .step(1'b1),
     .clk(clk), .rst_b(w_rst_b), .zeroize(1'b0),
     .cmd_valid(w_cmd_valid), .cmd(w_cmd),

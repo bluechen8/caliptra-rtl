@@ -57,6 +57,7 @@ module tb_fhe_microseq;
     .step(1'b1),
     .clk(clk), .rst_b(rst_b), .zeroize(zeroize),
     .cmd_valid(cmd_valid), .cmd(cmd),
+    .active_limb(),
     .keygen_seed(keygen_seed), .a_seed(a_seed), .err_seed(err_seed),
     .freerun_en(1'b0), .entseed(64'd0), .reseed_req(1'b0),
     .reseed_en(), .reseed_ack(), .reseed_wait(),

@@ -86,6 +86,9 @@ echo "=== running (cwd=$RUNDIR) ==="
 # KVSEED=1 sources the keygen root seed from a modeled KeyVault (C'-1b) and
 # asserts the walker's effective seed == the KV value (KGSEED regs held wrong).
 PLUSARGS=""
+if [[ "$N" == 256 && -n "${LIMBS2:-}" ]]; then
+  PLUSARGS="$PLUSARGS +GOLDEN_DIR=$HERE/golden/shared-sram-n256"
+fi
 [[ -n "${MNIST_DIR:-}" ]] && PLUSARGS="$PLUSARGS +MNIST=$MNIST_DIR"
 [[ -n "${LIMBS2:-}" ]] && PLUSARGS="$PLUSARGS +LIMBS2"
 [[ -n "${KVSEED:-}" ]]  && PLUSARGS="$PLUSARGS +KVSEED"

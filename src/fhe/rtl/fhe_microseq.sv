@@ -34,6 +34,7 @@
 module fhe_microseq
   import fhe_params_pkg::*;
 #(
+  parameter bit SRAM_REUSE = 0, // legacy standalone trace/core driver keeps copies
   parameter int LOGN = 13,
   parameter int N    = 1 << LOGN
 )(
@@ -53,6 +54,7 @@ module fhe_microseq
 
   // command issue (1-cycle pulse)
   input  logic        cmd_valid,
+  output logic [3:0] active_limb,
   input  fhe_cmd_e    cmd,
 
   // runtime inputs (registers in fhe_top; CSRNG/Trivium in C')
@@ -293,7 +295,7 @@ module fhe_microseq
       KG_ENTRY+9:  prog_rom = mk(OP_CONST, pl_const(B_NTTMSG, C_ZEROS));
       KG_ENTRY+10: prog_rom = mk(OP_LDINS, pl_ldins(T_PWMDEC[7:0], 4'd1, 1'b1, SC_NONE));
       KG_ENTRY+11: prog_rom = mk(OP_EXE,   pl_exe(PS_ZERO));
-      KG_ENTRY+12: prog_rom = mk(OP_MOVE,  pl_move(B_NTTMSG, B_SK, 1'b0, 1'b1)); // NTT_MSG->SK[limb]
+      KG_ENTRY+12: prog_rom = SRAM_REUSE ? mk(OP_NOP, 28'd0) : mk(OP_MOVE,  pl_move(B_NTTMSG, B_SK, 1'b0, 1'b1));
       KG_ENTRY+13: prog_rom = mk(OP_DONE,  pl_done(1'b0));
 
       // ---------- ENCRYPT (entry 16) ----------
@@ -305,7 +307,7 @@ module fhe_microseq
       ENC_ENTRY+5:  prog_rom = mk(OP_EXE,    pl_exe(PS_ZERO));
       ENC_ENTRY+6:  prog_rom = mk(OP_LDINS,  pl_ldins(T_NTTFWD[7:0], 4'd1, 1'b1, SC_NONE));
       ENC_ENTRY+7:  prog_rom = mk(OP_EXE,    pl_exe(PS_A));
-      ENC_ENTRY+8:  prog_rom = mk(OP_MOVE,   pl_move(B_SK, B_NTTV, 1'b1, 1'b0)); // SK[limb]->NTT_V
+      ENC_ENTRY+8:  prog_rom = SRAM_REUSE ? mk(OP_NOP, 28'd0) : mk(OP_MOVE,   pl_move(B_SK, B_NTTV, 1'b1, 1'b0));
       ENC_ENTRY+9:  prog_rom = mk(OP_LDINS,  pl_ldins(T_PWMENC[7:0], 4'd1, 1'b1, SC_NONE));
       ENC_ENTRY+10: prog_rom = mk(OP_EXE,    pl_exe(PS_ZERO));
       ENC_ENTRY+11: prog_rom = mk(OP_DMA_OUT,pl_dma(B_NTTMSG, 3'd2, 1'b1, 2'd0, 1'b0)); // c0->PTR2
@@ -315,7 +317,7 @@ module fhe_microseq
       // ---------- DECRYPT (entry 32, L=1) ----------
       DEC_ENTRY+0:  prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTMSG, 3'd0, 1'b0, 2'd0, 1'b0)); // c0<-PTR0
       DEC_ENTRY+1:  prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTKEY, 3'd1, 1'b0, 2'd0, 1'b0)); // c1<-PTR1
-      DEC_ENTRY+2:  prog_rom = mk(OP_MOVE,   pl_move(B_SK, B_NTTV, 1'b0, 1'b0));        // SK[0]->NTT_V
+      DEC_ENTRY+2:  prog_rom = SRAM_REUSE ? mk(OP_NOP, 28'd0) : mk(OP_MOVE,   pl_move(B_SK, B_NTTV, 1'b0, 1'b0));
       DEC_ENTRY+3:  prog_rom = mk(OP_LDINS,  pl_ldins(T_PWMDEC[7:0], 4'd1, 1'b1, SC_NONE));
       DEC_ENTRY+4:  prog_rom = mk(OP_EXE,    pl_exe(PS_ZERO));
       DEC_ENTRY+5:  prog_rom = mk(OP_LDINS,  pl_ldins(T_NTTINV[7:0], 4'd1, 1'b1, SC_NONE));
@@ -351,6 +353,7 @@ module fhe_microseq
   // limb loop
   logic        limb_active;
   logic [3:0]  limb_idx;
+  assign active_limb = limb_idx;
   logic [3:0]  limb_cnt;         // = num_limbs for this cmd (1 if decrypt)
   logic [7:0]  limb_base;        // pc of first body word
   logic [7:0]  limb_len;

@@ -80,6 +80,13 @@ module PWMSk #(
   //////////// address generation (identical to PWM) //////////
   logic [LOGN-1:0] read_addr_DP;
   logic done_internal;
+  // Emit one write per coefficient. The last read address remains held while
+  // the pipeline drains; it must not create duplicate in-place key writes.
+  logic issued_last;
+  always_ff @(posedge clk) begin
+    if (rst) issued_last <= 1'b0;
+    else if (done_internal) issued_last <= 1'b1;
+  end
   always_ff @(posedge clk) begin
     if(rst)
       read_addr_DP <= 0;
@@ -91,7 +98,7 @@ module PWMSk #(
   assign done_internal = read_addr_DP == {LOGN{1'b1}}; // last coefficient = N-1
   DelayRegister #(.CYCLE_COUNT(MODMUL_LAT), .BITWIDTH(LOGN)) c_rd_addr_delay (.clk(clk), .in(read_addr_DP), .out(c_bram_rd_addr));
   DelayRegister #(.CYCLE_COUNT(MODMUL_LAT+BRAM_RD_LAT+MODADD_LAT), .BITWIDTH(LOGN)) result_wr_addr_delay (.clk(clk), .in(read_addr_DP), .out(result_bram_wr_addr));
-  DelayRegisterReset #(.CYCLE_COUNT(MODMUL_LAT+BRAM_RD_LAT+MODADD_LAT), .BITWIDTH(1)) wea_delay (.clk(clk), .rst(rst), .in(~rst), .out(result_bram_wea));
+  DelayRegisterReset #(.CYCLE_COUNT(MODMUL_LAT+BRAM_RD_LAT+MODADD_LAT), .BITWIDTH(1)) wea_delay (.clk(clk), .rst(rst), .in(~rst && !issued_last), .out(result_bram_wea));
   DelayRegisterReset #(.CYCLE_COUNT(MODMUL_LAT+BRAM_RD_LAT+MODADD_LAT), .BITWIDTH(1)) done_delay (.clk(clk), .rst(rst), .in(done_internal), .out(done));
 
   //////////// b-operand select + negate fold //////////
