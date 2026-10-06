@@ -29,7 +29,7 @@ FLIST="$HERE/${TOP}.f"
 BUILD="$FHE/build"
 WORK="$BUILD/dmaN$N"
 MIF="$WORK/mif"
-OBJ_DIR="$BUILD/obj_dir_$TOP"
+OBJ_DIR="${OBJ_DIR:-$BUILD/obj_dir_$TOP}"
 LOG="$BUILD/${TOP}.log"
 mkdir -p "$MIF"
 
@@ -86,6 +86,10 @@ echo "=== running (cwd=$RUNDIR) ==="
 # KVSEED=1 sources the keygen root seed from a modeled KeyVault (C'-1b) and
 # asserts the walker's effective seed == the KV value (KGSEED regs held wrong).
 PLUSARGS=""
+if [[ "$N" == 256 ]]; then
+  python3 "$ALOHA_PORT/tvgen/gen_recovery.py" "$WORK"
+  PLUSARGS="$PLUSARGS +RECOVERY_DIR=$WORK"
+fi
 if [[ "$N" == 256 && -n "${LIMBS2:-}" ]]; then
   PLUSARGS="$PLUSARGS +GOLDEN_DIR=$HERE/golden/shared-sram-n256"
 fi

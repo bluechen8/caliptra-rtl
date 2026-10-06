@@ -105,7 +105,9 @@ package fhe_params_pkg;
     FHE_ENCRYPT = 3'b001, // svc1: encode + encrypt (fresh L-limb ct -> DRAM)
     FHE_KEYGEN  = 3'b010, // svc2: keygen (sk->KeyVault, emit pk + evk)
     FHE_REENC   = 3'b011, // svc3: decrypt + decode + re-encrypt to TARGET_LEVEL
-    FHE_DECRYPT = 3'b100  // standalone decrypt (test hook)
+    FHE_DECRYPT = 3'b100, // decoded slots, limb zero
+    FHE_REFRESH = 3'b110, // single-limb centered level refresh
+    FHE_RECOVER = 3'b101 // coefficient residues, all selected limbs; no FFT
   } fhe_cmd_e;
 
   parameter [63:0] FHE_CORE_NAME    = 64'h00000000_53_4B_4B_43; // "CKKS"

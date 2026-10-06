@@ -144,6 +144,28 @@ module fhe_top_dma_tb
 
   // Banked resident keys are transformed in place and never written by
   // application commands. Count only final representation-conversion writes.
+  // Independent refresh oracle: record the sampler's committed signed errors,
+  // then compare decrypted output to centered input + exactly these samples.
+  int refresh_noise [0:N-1];
+  int refresh_samples = 0;
+  int refresh_snapshots = 0;
+  int refresh_lifts = 0;
+  always @(posedge clk) begin
+    if (rst_b && aloha_mem.phase_write && dut.cmd_q == FHE_REFRESH && dut.w_busy) begin
+      if (aloha_mem.ntt_msg0_wea && aloha_mem.ntt_msg0_mask == 8'h80) begin
+        refresh_noise[2*int'(aloha_mem.ntt_msg0_addra)] = aloha_mem.ntt_msg0_dina[61] ? -int'(aloha_mem.ntt_msg0_dina[60:56]) : int'(aloha_mem.ntt_msg0_dina[60:56]);
+        refresh_samples++;
+      end
+      if (aloha_mem.ntt_msg1_wea && aloha_mem.ntt_msg1_mask == 8'h80) begin
+        refresh_noise[2*int'(aloha_mem.ntt_msg1_addra)+1] = aloha_mem.ntt_msg1_dina[61] ? -int'(aloha_mem.ntt_msg1_dina[60:56]) : int'(aloha_mem.ntt_msg1_dina[60:56]);
+        refresh_samples++;
+      end
+      if (dut.core.CORE.lift_active && dut.core.CORE.lift_we) begin
+        if (dut.core.CORE.lift_snapshot) refresh_snapshots++;
+        else refresh_lifts++;
+      end
+    end
+  end
   int key_writes [0:FHE_L-1];
   int key_reads [0:FHE_L-1];
   always @(posedge clk) begin
@@ -152,6 +174,14 @@ module fhe_top_dma_tb
       foreach (key_reads[i]) key_reads[i] = 0;
     end else if (aloha_mem.phase_read) begin
       assert (!aloha_mem.sk_en) else $fatal(1,"obsolete resident-key copy port used");
+      if ((dut.cmd_q == FHE_RECOVER || dut.cmd_q == FHE_REFRESH) && dut.w_busy) begin
+        assert (dut.core.CORE.transform_rst || !dut.core.CORE.do_fft)
+          else $fatal(1,"recovery entered FFT");
+        assert (dut.core.CORE.i2f_rst && dut.core.CORE.prj_rst)
+          else $fatal(1,"recovery entered floating decode/project");
+        if (dut.cmd_q == FHE_RECOVER) assert (!aloha_mem.fft_higher0_wea && !aloha_mem.fft_higher1_wea)
+          else $fatal(1,"recovery modified FFT real workspace");
+      end
       if (dut.cmd_q != FHE_KEYGEN)
         assert (!aloha_mem.ntt_v0_wea && !aloha_mem.ntt_v1_wea)
           else $fatal(1,"application command overwrote persistent key");
@@ -749,6 +779,158 @@ module fhe_top_dma_tb
       reco = new[N];
       capture_slots(reco, ADDR_OUT);
       check_fft(reco, g_input, N, "fhe_top+DMA round-trip (recovered vs input)", 1.0e-3);
+    end
+
+
+    // Coefficient recovery exercises both key/modulus limbs without decoding.
+    // First use the real encrypted input, then an independent constant-polynomial
+    // vector whose NTT is constant in every lane and whose c1 is zero.
+    begin
+      logic [63:0] saved_c0 [0:2*N-1], saved_c1 [0:2*N-1];
+      logic [63:0] q [0:1];
+      logic signed [63:0] centered0, centered1;
+      logic [63:0] expected;
+      int limbs;
+      string recovery_dir;
+      logic [63:0] reference_ntt [0:2*N-1], reference_coeff [0:2*N-1];
+      limbs = $test$plusargs("LIMBS2") ? 2 : 1;
+      q[0] = (64'd1 << 46) - (64'd9 << 24) + 1;
+      q[1] = (64'd1 << 47) - (64'd1 << 24) + 1;
+      for (int i=0;i<limbs*N;i++) begin
+        saved_c0[i] = dram[ADDR_C0/8+i];
+        saved_c1[i] = dram[ADDR_C1/8+i];
+      end
+      run_cmd(FHE_RECOVER, "RECOVER encrypted coefficients");
+      for (int i=0;i<N;i++) begin
+        assert (dram[ADDR_OUT/8+i] < q[0]) else $fatal(1,"noncanonical recovery limb 0");
+        if (limbs == 2) begin
+          assert (dram[ADDR_OUT/8+N+i] < q[1]) else $fatal(1,"noncanonical recovery limb 1");
+          centered0 = dram[ADDR_OUT/8+i] > q[0]/2 ? dram[ADDR_OUT/8+i]-q[0] : dram[ADDR_OUT/8+i];
+          centered1 = dram[ADDR_OUT/8+N+i] > q[1]/2 ? dram[ADDR_OUT/8+N+i]-q[1] : dram[ADDR_OUT/8+N+i];
+          assert (centered0 == centered1) else $fatal(1,"recovery limb disagreement at %0d: %0d vs %0d",i,centered0,centered1);
+        end
+      end
+      for (int sign_case=0;sign_case<2;sign_case++) begin
+        for (int li=0;li<limbs;li++) begin
+          // Distinct residues: exercise basis recovery beyond q0's centered range.
+          expected = sign_case ? q[li] - ((q[0]+123) % q[li]) : (q[0]+123) % q[li];
+          for (int i=0;i<N;i++) begin
+            dram[ADDR_C0/8+li*N+i] = expected;
+            dram[ADDR_C1/8+li*N+i] = 0;
+          end
+        end
+        run_cmd(FHE_RECOVER, "RECOVER known constant polynomial");
+        for (int li=0;li<limbs;li++) begin
+          expected = sign_case ? q[li] - ((q[0]+123) % q[li]) : (q[0]+123) % q[li];
+          for (int i=0;i<N;i++)
+            assert (dram[ADDR_OUT/8+li*N+i] == (i == 0 ? expected : 0))
+              else $fatal(1,"coefficient recovery mismatch limb=%0d index=%0d got=%h expected=%h",li,i,dram[ADDR_OUT/8+li*N+i],i == 0 ? expected : 0);
+        end
+      end
+      if (N == 256 && $value$plusargs("RECOVERY_DIR=%s", recovery_dir)) begin
+        $readmemh({recovery_dir,"/recovery_ntt.hex"},reference_ntt);
+        $readmemh({recovery_dir,"/recovery_coeff.hex"},reference_coeff);
+        for (int i=0;i<limbs*N;i++) begin
+          dram[ADDR_C0/8+i] = reference_ntt[i];
+          dram[ADDR_C1/8+i] = 0;
+        end
+        run_cmd(FHE_RECOVER,"RECOVER dense direct-evaluation reference");
+        for (int i=0;i<limbs*N;i++)
+          assert (dram[ADDR_OUT/8+i] == reference_coeff[i])
+            else $fatal(1,"dense recovery mismatch index=%0d got=%h expected=%h",i,dram[ADDR_OUT/8+i],reference_coeff[i]);
+        $display("PASS dense coefficient recovery against independent polynomial evaluation");
+      end
+      for (int i=0;i<limbs*N;i++) begin
+        dram[ADDR_C0/8+i] = saved_c0[i];
+        dram[ADDR_C1/8+i] = saved_c1[i];
+      end
+      for (int command_case=0;command_case<2;command_case++)
+      for (int invalid=0;invalid<2;invalid++) begin
+        logic [31:0] status;
+        int guard;
+        ahb_write(A_CONFIG, invalid == 0 ? 0 : FHE_L+1);
+        ahb_write(A_CTRL, 32'(command_case == 0 ? FHE_RECOVER : FHE_REFRESH));
+        guard=0;
+        do begin ahb_read('h14,status); guard++; end while (!(status[0] && status[1]) && guard<1000);
+        assert (status[0] && status[3]) else $fatal(1,"invalid recovery limb count accepted");
+      end
+      ahb_write(A_CONFIG, limbs);
+      // Rejection must leave the controller usable without destroying the key.
+      run_cmd(FHE_RECOVER, "RECOVER after invalid count");
+      $display("PASS coefficient recovery: encrypted input and signed constant polynomials, %0d limbs, no floating decode",limbs);
+    end
+
+    // Level refresh: q0 only in, both limbs out. Verify signed coefficients
+    // against a pre-refresh recovery, allowing only the fresh CBD error.
+    begin
+      logic [63:0] original0 [0:2*N-1], original1 [0:2*N-1];
+      logic [63:0] previous_a [0:2*N-1];
+      longint signed before_coeff [0:N-1];
+      longint unsigned q [0:1];
+      longint signed got, delta;
+      int limbs, changed;
+      limbs = $test$plusargs("LIMBS2") ? 2 : 1;
+      q[0]=64'd70368593182721; q[1]=64'd140737471578113;
+      for (int i=0;i<limbs*N;i++) begin
+        original0[i]=dram[ADDR_C0/8+i]; original1[i]=dram[ADDR_C1/8+i];
+      end
+      ahb_write(A_RNG_CTRL, 1);
+      ahb_write64(A_ENTSEED0,64'h123456789abcdef0);
+      ahb_write(A_RNG_CTRL, 3);
+      // Real ciphertext, then known positive/negative/center-boundary constants.
+      for (int trial=0;trial<6;trial++) begin
+        if (trial>=2) begin
+          longint unsigned c;
+          case (trial)
+            2: c=0;
+            3: c=q[0]-3;
+            4: c=q[0]/2;
+            default: c=q[0]/2+1;
+          endcase
+          for (int i=0;i<N;i++) begin
+            dram[ADDR_C0/8+i]=c; dram[ADDR_C1/8+i]=0;
+          end
+        end
+        ahb_write64(A_PTR2_LO,64'(ADDR_OUT));
+        ahb_write(A_CONFIG,1);
+        run_cmd(FHE_RECOVER,"pre-refresh single-limb recovery");
+        for (int i=0;i<N;i++)
+          before_coeff[i] = dram[ADDR_OUT/8+i]>q[0]/2 ? dram[ADDR_OUT/8+i]-q[0] : dram[ADDR_OUT/8+i];
+        ahb_write(A_CONFIG,limbs);
+        ahb_write64(A_PTR2_LO,64'(ADDR_C0));
+        ahb_write64(A_PTR3_LO,64'(ADDR_C1));
+        refresh_samples=0; refresh_snapshots=0; refresh_lifts=0;
+        run_cmd(FHE_REFRESH,"REFRESH q0 to target chain");
+        assert(refresh_samples==N && refresh_snapshots==N && refresh_lifts==limbs*N)
+          else $fatal(1,"refresh length mismatch: samples=%0d snapshot=%0d lifts=%0d",refresh_samples,refresh_snapshots,refresh_lifts);
+        changed=0;
+        for (int i=0;i<limbs*N;i++) begin
+          assert(dram[ADDR_C0/8+i]<q[i/N] && dram[ADDR_C1/8+i]<q[i/N])
+            else $fatal(1,"noncanonical refresh ciphertext");
+          if(trial==1 && previous_a[i]!=dram[ADDR_C1/8+i]) changed++;
+          previous_a[i]=dram[ADDR_C1/8+i];
+        end
+        if(trial==1) assert(changed>0) else $fatal(1,"refresh reused uniform randomness");
+        ahb_write64(A_PTR2_LO,64'(ADDR_OUT));
+        run_cmd(FHE_RECOVER,"recover refreshed coefficients");
+        for (int i=0;i<N;i++) begin
+          longint signed first_delta;
+          for (int li=0;li<limbs;li++) begin
+            got = dram[ADDR_OUT/8+li*N+i]>q[li]/2 ? dram[ADDR_OUT/8+li*N+i]-q[li] : dram[ADDR_OUT/8+li*N+i];
+            delta=got-before_coeff[i];
+            // Centered q0 boundary can wrap after adding the fresh error.
+            if(delta>$signed(q[li]/2)) delta-=$signed(q[li]);
+            if(delta< -$signed(q[li]/2)) delta+=$signed(q[li]);
+            assert(delta==refresh_noise[i]) else $fatal(1,"refresh coefficient mismatch trial=%0d limb=%0d i=%0d before=%0d got=%0d delta=%0d",trial,li,i,before_coeff[i],got,delta);
+            if(li==0) first_delta=delta;
+            else assert(delta==first_delta) else $fatal(1,"different refresh noise across limbs");
+          end
+        end
+      end
+      for (int i=0;i<limbs*N;i++) begin
+        dram[ADDR_C0/8+i]=original0[i]; dram[ADDR_C1/8+i]=original1[i];
+      end
+      $display("PASS level refresh: real ciphertext, repeated refresh, signed center boundaries, common noise, no FFT");
     end
 
     // ---- C'-2 free-run PRNG test (+FREERUN) ----

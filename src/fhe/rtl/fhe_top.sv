@@ -562,7 +562,7 @@ module fhe_top
     .rns_scale_kg   (kg_scale),
     .rns_scale_enc  (enc_scale),
     .i2f_scale_dec  (i2f_scale),
-    .num_limbs      (target_level),    // CONFIG.L (encrypt); walker forces 1 for decrypt
+    .num_limbs      (target_level),    // CONFIG.L (keygen/encrypt/recover/refresh); decoded decrypt uses 1
     .r2modq         (R2MODQ),
     // ComputeCore debug-IO master
     .control_low_word  (w_cl),

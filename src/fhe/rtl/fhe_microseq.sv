@@ -15,7 +15,7 @@
 // Description:
 //   Stage-B' FHE microsequencer (the "walker").
 //
-//   Turns one high-level command (KEYGEN / ENCRYPT / DECRYPT) into the
+//   Turns one high-level command (KEYGEN / ENCRYPT / DECRYPT / RECOVER / REFRESH) into the
 //   sequence of Aloha-HE ComputeCore engine passes that implements it, by
 //   driving the ComputeCoreWrapper debug-IO pins (control_low_word /
 //   control_high_word / dina_ext / status / dout_ext) -- i.e. it is a HARDWARE
@@ -73,7 +73,7 @@ module fhe_microseq
   input  logic [31:0] rns_scale_kg,   // RT_SCALE-52-1023-LOGN   (keygen RNS, internal)
   input  logic [31:0] rns_scale_enc,  // encode RNS scale        (ENCRYPT command input)
   input  logic [31:0] i2f_scale_dec,  // signed decode I2F scale (DECRYPT command input)
-  input  logic [3:0]  num_limbs,      // CONFIG.L (encrypt); decrypt forced to 1
+  input  logic [3:0]  num_limbs,      // output/active limbs; slot decrypt forced to 1
 
   // per-limb R^2 mod q_i constant for keygen Montgomery-convert (CONST R2MODQ)
   input  logic [63:0] r2modq [0:FHE_L-1],
@@ -159,7 +159,8 @@ module fhe_microseq
 
   // INS-template indices
   localparam int unsigned T_FFTDIF=0, T_FFTDIT=1, T_RNS=2, T_NTTFWD=3,
-                          T_NTTINV=4, T_PWMENC=5, T_PWMDEC=6, T_I2F=7, T_PROJ=8;
+                          T_NTTINV=4, T_PWMENC=5, T_PWMDEC=6, T_I2F=7, T_PROJ=8,
+                          T_SAMPLE=9, T_SNAPSHOT=10, T_LIFT=11;
 
   // =====================================================================
   // INS-template ROM (raw 64-bit inner words, pre-patch). doc section 5.2.
@@ -180,12 +181,15 @@ module fhe_microseq
       T_PWMDEC: tmpl_base = W40 | 64'd4;                          // PWM enc=0,neg=0
       T_I2F   : tmpl_base = W40 | 64'd3;                          // I2F
       T_PROJ  : tmpl_base = W40 | 64'd5;                          // PROJECT
+      T_SAMPLE: tmpl_base = W40 | 64'd6;
+      T_SNAPSHOT: tmpl_base = W40 | (64'd1<<3) | 64'd7;
+      T_LIFT: tmpl_base = W40 | 64'd7;
       default : tmpl_base = W40;
     endcase
   endfunction
   // which fields the template needs patched
   function automatic logic tmpl_use_q  (input int unsigned t);
-    tmpl_use_q  = (t==T_RNS)||(t==T_NTTFWD)||(t==T_NTTINV)||(t==T_PWMENC)||(t==T_PWMDEC)||(t==T_I2F);
+    tmpl_use_q  = (t==T_RNS)||(t==T_NTTFWD)||(t==T_NTTINV)||(t==T_PWMENC)||(t==T_PWMDEC)||(t==T_I2F)||(t==T_LIFT);
   endfunction
   function automatic logic tmpl_use_rom(input int unsigned t);
     tmpl_use_rom = (t==T_RNS)||(t==T_NTTFWD)||(t==T_NTTINV);
@@ -257,12 +261,14 @@ module fhe_microseq
   function automatic logic        f_irq (input logic [31:0] w); f_irq  = w[27];    endfunction
 
   // =====================================================================
-  // Program ROM (FROZEN -- doc section 7). One contiguous ROM, per-cmd entry.
+  // Program ROM. Existing command entries are stable; recovery starts at 48.
   // =====================================================================
-  localparam int PROG_N = 48;
+  localparam int PROG_N = 96;
   localparam int KG_ENTRY  = 0;
   localparam int ENC_ENTRY = 16;
   localparam int DEC_ENTRY = 32;
+  localparam int REC_ENTRY = 48;
+  localparam int REF_ENTRY = 64;
 
   // Combinational ROM: synthesizes as constant decode logic (an `initial`-filled
   // array would be dropped by synthesis). Unlisted addresses decode to NOP.
@@ -278,11 +284,9 @@ module fhe_microseq
       // sample_errors=do_fft), and KG+4's float message path produces just `e0` which
       // KG+9 (B_NTTMSG=C_ZEROS) then discards. Clean split = sample-only pass +
       // integer-RNS + NTT, dropping KG+0/the FFT butterflies/the float-RNS message half.
-      // Cost: ~5-15 lines of ComputeCore.v control surgery (add a sample-only opcode,
-      // OR random_sampling_done into done_ins_computation, gate UnifiedTransformation
-      // off) + these microcode words. NO new arithmetic; the FP FFT/RNS stays for the
-      // encrypt/decrypt MESSAGE path (canonical embedding), so it's a keygen latency/
-      // power win, not area. Resolve later.
+      // Refresh already provides sample-only control. Reuse it for keygen only
+      // after separating the integer secret conversion from the float RNS path;
+      // retain this established keygen sequence and golden ciphertexts for now.
       KG_ENTRY+0:  prog_rom = mk(OP_CONST, pl_const(B_FFTEXP, C_ZEROS));
       KG_ENTRY+1:  prog_rom = mk(OP_LDINS, pl_ldins(T_FFTDIF[7:0], 4'd1, 1'b0, SC_NONE));
       KG_ENTRY+2:  prog_rom = mk(OP_EXE,   pl_exe(PS_KG));
@@ -330,6 +334,40 @@ module fhe_microseq
       DEC_ENTRY+12: prog_rom = mk(OP_EXE,    pl_exe(PS_ZERO));
       DEC_ENTRY+13: prog_rom = mk(OP_DMA_OUT,pl_dma(B_FFT, 3'd2, 1'b0, 2'd0, 1'b1));    // out<-upper N of 2N
       DEC_ENTRY+14: prog_rom = mk(OP_DONE,   pl_done(1'b0));
+      // Coefficient recovery: each limb stays in the modular datapath.
+      // PTR0/PTR1 input and PTR2 output are limb-major, N u64 words per limb.
+      REC_ENTRY+0: prog_rom = mk(OP_LIMB, pl_limb(8'd8));
+      REC_ENTRY+1: prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTMSG, 3'd0, 1'b1, 2'd0, 1'b0));
+      REC_ENTRY+2: prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTKEY, 3'd1, 1'b1, 2'd0, 1'b0));
+      REC_ENTRY+3: prog_rom = SRAM_REUSE ? mk(OP_NOP, 28'd0) : mk(OP_MOVE, pl_move(B_SK, B_NTTV, 1'b1, 1'b0));
+      REC_ENTRY+4: prog_rom = mk(OP_LDINS, pl_ldins(T_PWMDEC[7:0], 4'd1, 1'b1, SC_NONE));
+      REC_ENTRY+5: prog_rom = mk(OP_EXE, pl_exe(PS_ZERO));
+      REC_ENTRY+6: prog_rom = mk(OP_LDINS, pl_ldins(T_NTTINV[7:0], 4'd1, 1'b1, SC_NONE));
+      REC_ENTRY+7: prog_rom = mk(OP_EXE, pl_exe(PS_ZERO));
+      REC_ENTRY+8: prog_rom = mk(OP_DMA_OUT, pl_dma(B_NTTMSG, 3'd2, 1'b1, 2'd0, 1'b0));
+      REC_ENTRY+9: prog_rom = mk(OP_DONE, pl_done(1'b0));
+
+      // Single q0 input -> centered snapshot R -> fresh e0 -> each target limb.
+      REF_ENTRY+0: prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTMSG, 3'd0, 1'b0, 2'd0, 1'b0));
+      REF_ENTRY+1: prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTKEY, 3'd1, 1'b0, 2'd0, 1'b0));
+      REF_ENTRY+2: prog_rom = mk(OP_LDINS, pl_ldins(T_PWMDEC[7:0], 4'd1, 1'b1, SC_NONE));
+      REF_ENTRY+3: prog_rom = mk(OP_EXE, pl_exe(PS_ZERO));
+      REF_ENTRY+4: prog_rom = mk(OP_LDINS, pl_ldins(T_NTTINV[7:0], 4'd1, 1'b1, SC_NONE));
+      REF_ENTRY+5: prog_rom = mk(OP_EXE, pl_exe(PS_ZERO));
+      REF_ENTRY+6: prog_rom = mk(OP_LDINS, pl_ldins(T_SNAPSHOT[7:0], 4'd1, 1'b0, SC_NONE));
+      REF_ENTRY+7: prog_rom = mk(OP_EXE, pl_exe(PS_ZERO));
+      REF_ENTRY+8: prog_rom = mk(OP_LDINS, pl_ldins(T_SAMPLE[7:0], 4'd1, 1'b0, SC_NONE));
+      REF_ENTRY+9: prog_rom = mk(OP_EXE, pl_exe(PS_ERR));
+      REF_ENTRY+10: prog_rom = mk(OP_LIMB, pl_limb(8'd8));
+      REF_ENTRY+11: prog_rom = mk(OP_LDINS, pl_ldins(T_LIFT[7:0], 4'd1, 1'b1, SC_NONE));
+      REF_ENTRY+12: prog_rom = mk(OP_EXE, pl_exe(PS_ZERO));
+      REF_ENTRY+13: prog_rom = mk(OP_LDINS, pl_ldins(T_NTTFWD[7:0], 4'd1, 1'b1, SC_NONE));
+      REF_ENTRY+14: prog_rom = mk(OP_EXE, pl_exe(PS_A));
+      REF_ENTRY+15: prog_rom = mk(OP_LDINS, pl_ldins(T_PWMENC[7:0], 4'd1, 1'b1, SC_NONE));
+      REF_ENTRY+16: prog_rom = mk(OP_EXE, pl_exe(PS_ZERO));
+      REF_ENTRY+17: prog_rom = mk(OP_DMA_OUT, pl_dma(B_NTTMSG, 3'd2, 1'b1, 2'd0, 1'b0));
+      REF_ENTRY+18: prog_rom = mk(OP_DMA_OUT, pl_dma(B_NTTKEY, 3'd3, 1'b1, 2'd0, 1'b0));
+      REF_ENTRY+19: prog_rom = mk(OP_DONE, pl_done(1'b0));
       default: ;
     endcase
   endfunction
@@ -521,11 +559,19 @@ module fhe_microseq
             error       <= 1'b0;
             limb_active <= 1'b0;
             limb_idx    <= 4'd0;
-            limb_cnt    <= (cmd == FHE_KEYGEN || cmd == FHE_ENCRYPT)
+            limb_cnt    <= (cmd == FHE_KEYGEN || cmd == FHE_ENCRYPT || cmd == FHE_RECOVER || cmd == FHE_REFRESH)
                              ? ((num_limbs==4'd0)?4'd1:num_limbs) : 4'd1;
             pc <= (cmd == FHE_KEYGEN)  ? KG_ENTRY[7:0] :
-                  (cmd == FHE_ENCRYPT) ? ENC_ENTRY[7:0] : DEC_ENTRY[7:0];
-            st <= S_FETCH;
+                  (cmd == FHE_ENCRYPT) ? ENC_ENTRY[7:0] :
+                  (cmd == FHE_REFRESH) ? REF_ENTRY[7:0] :
+                  (cmd == FHE_RECOVER) ? REC_ENTRY[7:0] : DEC_ENTRY[7:0];
+            // Recovery must never address a key/table limb outside this build.
+            if (((cmd == FHE_RECOVER || cmd == FHE_REFRESH) &&
+                 (num_limbs == 0 || num_limbs > FHE_L)) ||
+                (cmd == FHE_REFRESH && !SRAM_REUSE)) begin
+              error <= 1'b1;
+              st <= S_DONE;
+            end else st <= S_FETCH;
           end
         end
         // -------------------------------------------------------------
