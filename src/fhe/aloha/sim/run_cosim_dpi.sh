@@ -46,13 +46,13 @@ case "$OP" in
   *)       echo "unknown COSIM_OP=$OP (add|mul|rescale)"; exit 1;;
 esac
 
-# ---- ROM tables (small N regen; N=8192 uses the shipped MIF) -----------------
-if [[ "$NVAL" != 8192 && ( ! -f "$WORK/mif/TwFctrCache_RNSConsts.coe" || -n "${REGEN:-}" ) ]]; then
-  echo "== [N=$NVAL] regenerating ROM tables ==" | tee -a "$LOG"
-  python3 "$ALOHA_SRC/Scripts/GenerateConstantsROM.py"        "$LOGN" "$WORK/mif/TwFctrCache_RNSConsts.coe"
-  python3 "$ALOHA_SRC/Scripts/GenerateStoredFFTTwiddleFct.py" "$LOGN" "$WORK/mif/FFTStoredTwiddleFactors.coe"
+# Generate default tables locally; explicit ALOHA_MIF_DIR remains a read-only input.
+MIF="${ALOHA_MIF_DIR:-$WORK/mif}"
+if [[ -z "${ALOHA_MIF_DIR:-}" ]]; then
+  mkdir -p "$MIF"
+  python3 "$ALOHA_SRC/Scripts/GenerateConstantsROM.py" "$LOGN" "$MIF/TwFctrCache_RNSConsts.coe"
+  python3 "$ALOHA_SRC/Scripts/GenerateStoredFFTTwiddleFct.py" "$LOGN" "$MIF/FFTStoredTwiddleFactors.coe"
 fi
-MIF="${ALOHA_MIF_DIR:-$([[ "$NVAL" == 8192 ]] && echo "$ALOHA_SRC/Aloha-HE_Common/MemoryInitializationFiles" || echo "$WORK/mif")}"
 
 # ---- inputs m1, m2 -----------------------------------------------------------
 echo "== generating plaintexts m1,m2 (seed=$SEED) ==" | tee -a "$LOG"
@@ -94,7 +94,7 @@ set -e
 RUNDIR="$SIM_DIR/.run_${TOP}_cosim_dpi/a/b/c/d"
 mkdir -p "$RUNDIR"
 coe2mem() {
-  [[ -f "$1" ]] || return 0
+  [[ -f "$1" ]] || { echo "ERROR: missing ROM table: $1" >&2; return 1; }
   sed -e 's/memory_initialization_radix.*//I' \
       -e 's/memory_initialization_vector[[:space:]]*=//I' \
       -e 's/[;,]//g' "$1" | grep -viE '[^0-9a-fx[:space:]]' | grep -vE '^[[:space:]]*$' > "$2"

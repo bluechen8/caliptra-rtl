@@ -91,12 +91,16 @@ module fhe_aloha_mem_top #(parameter bit PHASED = 0, SRAM_REUSE = 0) (
     .clk(clk_i), .rd(m.phase_read), .exec(m.phase_execute), .wr(m.phase_write),
     .we(m.fft_higher1_wea), .wa(m.fft_higher1_addra), .wd(m.fft_higher1_dina), .mask(1'b1),
     .ra(m.fft_higher1_addrb), .q(m.fft_higher1_doutb));
-  fhe_shared_bank #(.W(128), .DEPTH(512), .PHASED(PHASED), .INIT_FILE("fft_rns_rom.mem")) crom (
+  fhe_shared_bank #(.W(128), .DEPTH(1 << `FHE_CROM_AW), .PHASED(PHASED), .INIT_FILE("fft_rns_rom.mem")) crom (
     .clk(clk_i), .rd(m.phase_read), .exec(m.phase_execute), .wr(m.phase_write),
     .we(1'b0), .wa('0), .wd('0), .mask(1'b1), .ra(m.crom_addra), .q(m.crom_douta));
+`ifdef FHE_FFT_ON_THE_FLY
+  assign m.ftwrom_douta = '0; // no stored FFT table in generated-twiddle mode
+`else
   fhe_shared_bank #(.W(128), .DEPTH(`FHE_N/2), .PHASED(PHASED), .INIT_FILE("fft_all_twiddle_rom.mem")) ftwrom (
     .clk(clk_i), .rd(m.phase_read), .exec(m.phase_execute), .wr(m.phase_write),
     .we(1'b0), .wa('0), .wd('0), .mask(1'b1), .ra(m.ftwrom_addra), .q(m.ftwrom_douta));
+`endif
 endmodule
 
 module fhe_shared_bank #(

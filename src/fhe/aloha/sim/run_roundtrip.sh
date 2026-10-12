@@ -58,9 +58,16 @@ echo "=== $TOP (N=$NVAL, goldens=$GOLDEN_ABS) ==="
 RUNDIR="$SIM_DIR/.run_$TOP/a/b/c/d"
 mkdir -p "$RUNDIR"
 
-MIF="${ALOHA_MIF_DIR:-$ALOHA_SRC/Aloha-HE_Common/MemoryInitializationFiles}"
+# Generate default tables locally; explicit ALOHA_MIF_DIR remains a read-only input.
+MIF="${ALOHA_MIF_DIR:-$RUNDIR/mif}"
+if [[ -z "${ALOHA_MIF_DIR:-}" ]]; then
+  mkdir -p "$MIF"
+  LOGN="$(python3 -c 'import math, sys; print(int(math.log2(int(sys.argv[1]))))' "$NVAL")"
+  python3 "$ALOHA_SRC/Scripts/GenerateConstantsROM.py" "$LOGN" "$MIF/TwFctrCache_RNSConsts.coe"
+  python3 "$ALOHA_SRC/Scripts/GenerateStoredFFTTwiddleFct.py" "$LOGN" "$MIF/FFTStoredTwiddleFactors.coe"
+fi
 coe2mem() {
-  [[ -f "$1" ]] || return 0
+  [[ -f "$1" ]] || { echo "ERROR: missing ROM table: $1" >&2; return 1; }
   sed -e 's/memory_initialization_radix.*//I' \
       -e 's/memory_initialization_vector[[:space:]]*=//I' \
       -e 's/[;,]//g' "$1" | grep -viE '[^0-9a-fx[:space:]]' | grep -vE '^[[:space:]]*$' > "$2"

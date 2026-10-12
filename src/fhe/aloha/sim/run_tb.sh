@@ -58,12 +58,18 @@ RUNDIR="$SIM_DIR/.run_$TOP/a/b/c/d"   # 5 levels under SIM_DIR (.run_*,a,b,c,d)
 mkdir -p "$RUNDIR"
 ln -sfn "$TV_DIR" "$SIM_DIR/testvectors"
 
-# Convert the upstream .coe ROM-init files to $readmemh hex (one word/line) in
+# Convert the generated .coe ROM-init files to $readmemh hex (one word/line) in
 # the run cwd, so the aloha_rom_sp INIT_FILE names resolve. (.coe = a radix
 # line + a vector line + one hex/line, terminated by ';'.)
-MIF="${ALOHA_MIF_DIR:-$ALOHA_SRC/Aloha-HE_Common/MemoryInitializationFiles}"
+# Generate default tables locally; explicit ALOHA_MIF_DIR remains a read-only input.
+MIF="${ALOHA_MIF_DIR:-$RUNDIR/mif}"
+if [[ -z "${ALOHA_MIF_DIR:-}" ]]; then
+  mkdir -p "$MIF"
+  python3 "$ALOHA_SRC/Scripts/GenerateConstantsROM.py" 13 "$MIF/TwFctrCache_RNSConsts.coe"
+  python3 "$ALOHA_SRC/Scripts/GenerateStoredFFTTwiddleFct.py" 13 "$MIF/FFTStoredTwiddleFactors.coe"
+fi
 coe2mem() {  # <src.coe> <dst.mem>
-  [[ -f "$1" ]] || return 0
+  [[ -f "$1" ]] || { echo "ERROR: missing ROM table: $1" >&2; return 1; }
   # Always regenerate: the mtime skip is unsafe across ALOHA_MIF_DIR switches
   # (a stale small-N .mem could shadow a default-N source, or vice versa).
   sed -e 's/memory_initialization_radix.*//I' \

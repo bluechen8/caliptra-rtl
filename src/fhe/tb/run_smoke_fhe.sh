@@ -57,16 +57,12 @@ echo "== [N=$N / LOGN=$LOGN] generating golden plaintext + Aloha ROM tables =="
 python3 "$ALOHA_PORT/tvgen/gen_roundtrip.py" "$LOGN" "$RUNDIR" >/dev/null
 
 # Aloha FFT/RNS twiddle ROMs (.coe -> .mem) the ComputeCore $readmemh's from cwd.
-if [[ "$N" == 8192 ]]; then
-  SRCMIF="$ALOHA_SRC/Aloha-HE_Common/MemoryInitializationFiles"
-  cp "$SRCMIF/TwFctrCache_RNSConsts.coe"   "$MIF/" 2>/dev/null || true
-  cp "$SRCMIF/FFTStoredTwiddleFactors.coe" "$MIF/" 2>/dev/null || true
-else
-  python3 "$ALOHA_PORT/vendor/Scripts/GenerateConstantsROM.py"        "$LOGN" "$MIF/TwFctrCache_RNSConsts.coe"
-  python3 "$ALOHA_PORT/vendor/Scripts/GenerateStoredFFTTwiddleFct.py" "$LOGN" "$MIF/FFTStoredTwiddleFactors.coe"
-fi
+# Generate both tables locally for every N; never use a checked-in CROM.
+python3 "$ALOHA_PORT/vendor/Scripts/GenerateConstantsROM.py"        "$LOGN" "$MIF/TwFctrCache_RNSConsts.coe"
+python3 "$ALOHA_PORT/vendor/Scripts/GenerateStoredFFTTwiddleFct.py" "$LOGN" "$MIF/FFTStoredTwiddleFactors.coe"
+
 coe2mem() {
-  [[ -f "$1" ]] || return 0
+  [[ -f "$1" ]] || { echo "ERROR: missing ROM table: $1" >&2; return 1; }
   sed -e 's/memory_initialization_radix.*//I' \
       -e 's/memory_initialization_vector[[:space:]]*=//I' \
       -e 's/[;,]//g' "$1" | grep -viE '[^0-9a-fx[:space:]]' | grep -vE '^[[:space:]]*$' > "$2"

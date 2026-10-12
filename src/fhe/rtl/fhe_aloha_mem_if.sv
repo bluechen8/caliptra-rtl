@@ -33,11 +33,9 @@
 `define ALOHA_SDP_AW ($clog2(`FHE_N) - 1)
 // SP poly banks (e0/e1/vt): N entries => LOGN addr bits.
 `define ALOHA_SP_AW  ($clog2(`FHE_N))
-// crom (RNS consts + bounded twiddle cache): words = 344 + 8*LOGN (a function of
-// LOGN, NOT proportional to N -- see GenerateConstantsROM.py). Address width =
-// $clog2(words); resolves to 9b (512 words) for all N up to 2^21, then grows.
+// CROM holds exactly FHE_L installed prime profiles after the fixed prefix.
 `ifndef FHE_CROM_AW
-  `define FHE_CROM_AW ($clog2(344 + 8*$clog2(`FHE_N)))
+  `define FHE_CROM_AW ($clog2(128 + `FHE_L*($clog2(`FHE_N)+26)))
 `endif
 
 // ---- per-bank signal groups ------------------------------------------------
@@ -106,9 +104,7 @@ interface fhe_aloha_mem_if;
   `ALOHA_MEM_SDP_SIG(64, `ALOHA_SDP_AW, fft_lower1)
   `ALOHA_MEM_SDP_SIG(64, `ALOHA_SDP_AW, fft_higher0)
   `ALOHA_MEM_SDP_SIG(64, `ALOHA_SDP_AW, fft_higher1)
-  // 1x FFTTw_RNS_ROM (crom): 128b x nextPow2(344+8*LOGN). Content is a function of
-  // LOGN but NOT proportional to N (408 words @N=256, 448 @N=8192); the addr width
-  // is 9b (512 words) for all N up to 2^21, then auto-grows.
+  // CROM depth is nextPow2(128 + FHE_L*(LOGN+26)).
   `ALOHA_MEM_ROM_SIG(128, `FHE_CROM_AW, crom)
   // 1x FFTAllTwiddleROM : 128b x N/2 (LOGN-1 addr), stored FFT twiddles.
   `ALOHA_MEM_ROM_SIG(128, `ALOHA_SDP_AW, ftwrom)

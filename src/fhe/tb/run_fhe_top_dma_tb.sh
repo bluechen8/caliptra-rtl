@@ -34,19 +34,18 @@ LOG="$BUILD/${TOP}.log"
 mkdir -p "$MIF"
 
 echo "== [N=$N / LOGN=$LOGN] regenerating ROM tables + plaintext =="
-if [[ "$N" == 8192 ]]; then
-  MIF="$ALOHA_SRC/Aloha-HE_Common/MemoryInitializationFiles"
-else
-  python3 "$ALOHA_PORT/vendor/Scripts/GenerateConstantsROM.py"        "$LOGN" "$MIF/TwFctrCache_RNSConsts.coe"
-  python3 "$ALOHA_PORT/vendor/Scripts/GenerateStoredFFTTwiddleFct.py" "$LOGN" "$MIF/FFTStoredTwiddleFactors.coe"
-fi
+# Generate both tables locally for every N; never use a checked-in CROM.
+python3 "$ALOHA_PORT/vendor/Scripts/GenerateConstantsROM.py"        "$LOGN" "$MIF/TwFctrCache_RNSConsts.coe"
+python3 "$ALOHA_PORT/vendor/Scripts/GenerateStoredFFTTwiddleFct.py" "$LOGN" "$MIF/FFTStoredTwiddleFactors.coe"
+
 python3 "$ALOHA_PORT/tvgen/gen_roundtrip.py" "$LOGN" "$WORK" >/dev/null
 
 # KV_ONLY=1 builds the secure config (FHE_KV_SEED_ONLY): the plaintext KGSEED
 # register path is compiled out and KeyVault is forced as the sole keygen-seed
 # source. It implies +KVSEED (must provision + read the KV seed to work).
 EXTRA_DEF=""
-[[ "${LOCAL_STREAM:-0}" == 1 ]] && EXTRA_DEF="-DFHE_LOCAL_STREAM"
+[[ "${FFT_ON_THE_FLY:-0}" == 1 ]] && EXTRA_DEF="-DFHE_FFT_ON_THE_FLY"
+[[ "${LOCAL_STREAM:-0}" == 1 ]] && EXTRA_DEF="$EXTRA_DEF -DFHE_LOCAL_STREAM"
 if [[ -n "${KV_ONLY:-}" ]]; then EXTRA_DEF="$EXTRA_DEF -DFHE_KV_SEED_ONLY"; export KVSEED=1; fi
 
 echo "=== build $TOP (N=$N) ${EXTRA_DEF:+[$EXTRA_DEF]} ==="
@@ -68,7 +67,7 @@ echo "=== build $TOP (N=$N) ${EXTRA_DEF:+[$EXTRA_DEF]} ==="
 RUNDIR="$BUILD/.run_$TOP/a/b/c/d"
 mkdir -p "$RUNDIR"
 coe2mem() {
-  [[ -f "$1" ]] || return 0
+  [[ -f "$1" ]] || { echo "ERROR: missing ROM table: $1" >&2; return 1; }
   sed -e 's/memory_initialization_radix.*//I' \
       -e 's/memory_initialization_vector[[:space:]]*=//I' \
       -e 's/[;,]//g' "$1" | grep -viE '[^0-9a-fx[:space:]]' | grep -vE '^[[:space:]]*$' > "$2"
@@ -97,6 +96,7 @@ fi
 [[ -n "${LIMBS2:-}" ]] && PLUSARGS="$PLUSARGS +LIMBS2"
 [[ -n "${KVSEED:-}" ]]  && PLUSARGS="$PLUSARGS +KVSEED"
 [[ -n "${FREERUN:-}" ]] && PLUSARGS="$PLUSARGS +FREERUN"   # C'-2 free-run PRNG test
+[[ "${STREAM_STALLS:-0}" == 1 ]] && PLUSARGS="$PLUSARGS +STREAM_STALLS"
 ( cd "$RUNDIR" && "$OBJ_DIR/V$TOP" +TVDIR="$WORK" $PLUSARGS ) 2>&1 | tee -a "$LOG"
 
 echo "=== verdict ==="

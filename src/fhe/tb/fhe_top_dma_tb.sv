@@ -142,6 +142,45 @@ module fhe_top_dma_tb
   fhe_aloha_mem_if aloha_mem();
   fhe_aloha_mem_top #(.PHASED(1), .SRAM_REUSE(1)) u_aloha_mem (.clk_i(clk), .m(aloha_mem.resp));
 
+  fhe_completion_checker completion_check (
+    .clk(clk), .rst_b(rst_b), .zeroize(dut.zeroize),
+    .cmd_accept(dut.cmd_accept), .ready(dut.ready),
+    .status_valid(dut.status_valid), .completions()
+  );
+
+`ifdef FHE_LOCAL_STREAM
+  // Match the full-SoC monitor's legal backpressure injection. Never suppress
+  // ext_dout_we after issue: it is a registered beat and the walker advanced.
+  bit input_stall_checked = 0, output_stall_checked = 0;
+  initial if ($test$plusargs("STREAM_STALLS")) begin
+    wait (rst_b);
+    @(negedge clk);
+    while (!(dut.cmd_q == FHE_ENCRYPT && dut.w_busy && dut.w_rd_valid)) @(negedge clk);
+    force dut.w_rd_valid = 0;
+    force dut.w_rd_pop = 0;
+    repeat (64) @(negedge clk);
+    release dut.w_rd_valid;
+    release dut.w_rd_pop;
+    input_stall_checked = 1;
+  end
+  initial if ($test$plusargs("STREAM_STALLS")) begin
+    wait (rst_b);
+    @(negedge clk);
+    while (!(dut.cmd_q == FHE_ENCRYPT && dut.w_busy &&
+             dut.i_local_stream.active && dut.i_local_stream.direction &&
+             !dut.w_wr_push && !dut.i_local_stream.full)) @(negedge clk);
+    force dut.w_wr_ready = 0;
+    repeat (64) @(negedge clk);
+    release dut.w_wr_ready;
+    output_stall_checked = 1;
+  end
+  final if ($test$plusargs("STREAM_STALLS")) begin
+    assert (input_stall_checked && output_stall_checked)
+      else $error("stream stall injections did not execute");
+    $display("PASS legal input/output stream backpressure injection");
+  end
+`endif
+
   // Banked resident keys are transformed in place and never written by
   // application commands. Count only final representation-conversion writes.
   // Independent refresh oracle: record the sampler's committed signed errors,
@@ -568,6 +607,14 @@ module fhe_top_dma_tb
   task automatic check_fft(input longint res[], input longint gold[0:N],
                            input int ndbl, input string name, input real eps);
     int i, nerr = 0;
+    real max_abs_error = 0.0;
+    for (i = 0; i < ndbl; i++) begin
+      real delta;
+      delta = $bitstoreal(res[i]) - $bitstoreal(gold[i]);
+      if (delta < 0.0) delta = -delta;
+      if (delta > max_abs_error) max_abs_error = delta;
+    end
+    $display("FHE_PRECISION %s max_abs_error=%.12g", name, max_abs_error);
     for (i = 0; i < ndbl; i++)
       if (!close(res[i], gold[i], eps)) begin
         if (nerr < 8) $display("  %s[%0d]: got %h (%g) exp %h (%g)", name, i,
@@ -664,10 +711,35 @@ module fhe_top_dma_tb
       int op, count;
       logic [31:0] addr, value, rdata;
       bit err;
+      bit refresh_aborted = 0, abort_acknowledged = 0;
+      int abort_polls = 0;
       forever begin
         count = $fscanf(32'h80000000, "%d %h %h", op, addr, value);
         if (count != 3) $finish;
         else begin
+`ifdef FHE_LOCAL_STREAM
+          // Cancel once, at a firmware status read between coefficient pairs.
+          // Use a real CSR write so the regression covers actual ZEROIZE
+          // semantics, without racing an in-flight STREAM_DATA bus access.
+          if ($test$plusargs("RPC_ZEROIZE_REFRESH") && !refresh_aborted &&
+              op == 0 && addr == A_STREAM_STATUS && dut.cmd_q == FHE_REFRESH &&
+              dut.i_local_stream.active && !dut.i_local_stream.direction &&
+              dut.i_local_stream.left < N && !dut.i_local_stream.half) begin
+            ahb_write(A_CTRL, 32'h8);
+            refresh_aborted = 1;
+            $display("FHE_FAULT injected ZEROIZE during refresh");
+          end
+          if (refresh_aborted && !abort_acknowledged) begin
+            if (op == 1 && addr == A_CTRL && value == 8) begin
+              abort_acknowledged = 1;
+              $display("PASS firmware noticed cancelled refresh and cleared controller");
+            end else if (op == 0 && addr == A_STATUS) begin
+              abort_polls++;
+              if (abort_polls > 16)
+                $fatal(1, "firmware kept polling idle aborted refresh without completion");
+            end
+          end
+`endif
           // Reply "RPC <read data> <1 if AHB ERROR>"; the emulator raises a
           // load/store access fault for an ERROR response.
           ahb_access(op == 1, addr, value, rdata, err);
@@ -761,7 +833,9 @@ module fhe_top_dma_tb
     ahb_write64(A_PTR3_LO, 64'(ADDR_C1));
     run_cmd(FHE_ENCRYPT, "ENCRYPT");
     dump_state(0);
-    check_baseline(0);
+`ifndef FHE_FFT_ON_THE_FLY
+    check_baseline(0); // floating recurrence can change rounded ciphertext values
+`endif
     for (int limb=0; limb < ($test$plusargs("LIMBS2") ? 2 : 1); limb++) begin
       assert (key_reads[limb] >= N)
         else $fatal(1, "key limb %0d: expected %0d reads, got %0d", limb, N, key_reads[limb]);
@@ -781,6 +855,27 @@ module fhe_top_dma_tb
       check_fft(reco, g_input, N, "fhe_top+DMA round-trip (recovered vs input)", 1.0e-3);
     end
 
+`ifdef FHE_FFT_ON_THE_FLY
+    // Interoperate with the stored-FFT reference, not just an OTF round trip.
+    begin
+      string dir;
+      logic [63:0] reference [0:4*N-1], saved0 [0:2*N-1], saved1 [0:2*N-1];
+      longint reco[];
+      if ($value$plusargs("GOLDEN_DIR=%s",dir)) begin
+        $readmemh({dir,"/ciphertext.hex"},reference);
+        for(int i=0;i<2*N;i++) begin
+          saved0[i]=dram[ADDR_C0/8+i]; saved1[i]=dram[ADDR_C1/8+i];
+          dram[ADDR_C0/8+i]=reference[2*i]; dram[ADDR_C1/8+i]=reference[2*i+1];
+        end
+        run_cmd(FHE_DECRYPT,"OTF decode stored-FFT golden ciphertext");
+        reco=new[N]; capture_slots(reco,ADDR_OUT);
+        check_fft(reco,g_input,N,"OTF / stored-table ciphertext interoperability",1.0e-3);
+        for(int i=0;i<2*N;i++) begin
+          dram[ADDR_C0/8+i]=saved0[i]; dram[ADDR_C1/8+i]=saved1[i];
+        end
+      end
+    end
+`endif
 
     // Coefficient recovery exercises both key/modulus limbs without decoding.
     // First use the real encrypted input, then an independent constant-polynomial

@@ -274,12 +274,14 @@ module fhe_top
   assign fhe_aloha_mem.phase_read = mem_read;
   assign fhe_aloha_mem.phase_execute = core_step;
   assign fhe_aloha_mem.phase_write = mem_write;
-  assign fhe_aloha_mem.table_load_ready = rst_b && !zeroize && !ctrl_busy && !cmd_accept;
+  assign fhe_aloha_mem.table_load_ready = rst_b && !zeroize && ready && !cmd_accept;
 `endif
 
-  assign ready  = ~ctrl_busy;
-  // Keep the parent awake until the registered completion is consumed.
-  assign busy_o = ctrl_busy | ctrl_done;
+  // Accept new work only after the completion pulse has been latched into
+  // VALID/ERROR. READY and the completion status then become visible together.
+  // Include cmd_valid for the stub's command-acceptance cycle too.
+  assign busy_o = ctrl_busy | cmd_valid | ctrl_done;
+  assign ready  = ~busy_o;
 
   logic ctrl_wr;
   assign ctrl_wr = wr_en & (word_sel == OFF_CTRL);
@@ -593,7 +595,11 @@ module fhe_top
 
   ComputeCoreWrapper #(
     .SRAM_REUSE                (1),
+`ifdef FHE_FFT_ON_THE_FLY
+    .FFT_ON_THE_FLY_GENERATION (1),
+`else
     .FFT_ON_THE_FLY_GENERATION (0),
+`endif
     .PROVIDE_DEBUG_IO          (1),
     .LOGN                      (FHE_LOGN),
     .N                         (FHE_N),

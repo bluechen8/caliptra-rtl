@@ -39,4 +39,5 @@ $ALOHA_PORT/../rtl/fhe_mem_top.sv
 $ALOHA_PORT/../rtl/fhe_aloha_mem_top.sv
 $ALOHA_PORT/../rtl/fhe_ahb_slv_sif.sv
 $ALOHA_PORT/../rtl/fhe_top.sv
+$ALOHA_PORT/../tb/fhe_completion_checker.sv
 $ALOHA_PORT/../tb/fhe_top_dma_tb.sv
