@@ -119,8 +119,11 @@ module tb_ckks_roundtrip;
   wire  [63:0] w_dout;
   logic        w_rst_b = 1'b0, w_cmd_valid = 1'b0;
   fhe_cmd_e    w_cmd = FHE_NONE;
-  logic [31:0] w_rns_kg, w_rns_enc, w_i2f;
-  logic [63:0] w_kg_seed, w_a_seed, w_err_seed;
+  // The walker carries one per-command scale field and no seeds: in fhe_top the
+  // sampler seed arrives on a sideband. This core keeps the dina seed path
+  // (SEED_SIDEBAND=0) with reseed tied high, so walker mode samples from seed 0;
+  // the secret-key round trip is independent of the key and noise values.
+  logic [11:0] w_scale;
   logic [63:0] w_r2 [0:FHE_L-1];
 
   // TB DRAM model, split into single-writer halves to avoid multidriven memory:
@@ -146,8 +149,7 @@ module tb_ckks_roundtrip;
     .step(1'b1),
     .clk(clk), .rst_b(w_rst_b), .zeroize(1'b0),
     .cmd_valid(w_cmd_valid), .cmd(w_cmd),
-    .keygen_seed(w_kg_seed), .a_seed(w_a_seed), .err_seed(w_err_seed),
-    .rns_scale_kg(w_rns_kg), .rns_scale_enc(w_rns_enc), .i2f_scale_dec(w_i2f),
+    .scale(w_scale), .reseed_en(),
     .num_limbs(4'd1), .r2modq(w_r2),
     .control_low_word(w_cl), .control_high_word(w_ch), .dina_low(w_dl), .dina_high(w_dh),
     .dout_low(dout_low), .dout_high(dout_high), .status(status),
@@ -564,10 +566,8 @@ module tb_ckks_roundtrip;
     rr = (128'd1 << 72) % q0; rr = (rr * rr) % q0; r2 = longint'(rr);
     for (i = 0; i < FHE_L; i++) w_r2[i] = 64'd0;
     w_r2[0]    = r2;
-    w_kg_seed  = KEYGEN_SEED; w_a_seed = A_SEED; w_err_seed = ERR_SEED;
     s = RT_SCALE - 52 - 1023 - LOGN; if (s < 0) s += 4096;
-    w_rns_kg = s; w_rns_enc = s;             // run_skscheme_hw uses this scale for both
-    w_i2f    = -RT_SCALE;                     // signed decode scale
+    w_scale  = 12'(s);                        // RNS field for KEYGEN and ENCRYPT
     // preload the plaintext into ptr0 (encrypt's DMA_IN msg source)
     to_q(plain_q, g_input, N);
     for (i = 0; i < N; i++) dram_src[0][i] = plain_q[i];
@@ -580,6 +580,7 @@ module tb_ckks_roundtrip;
     // firmware hands the ct pointers to decrypt: enc wrote c0->ptr2, c1->ptr3;
     // dec reads c0<-ptr0, c1<-ptr1.
     for (i = 0; i < N; i++) begin dram_src[0][i] = dram_cap[2][i]; dram_src[1][i] = dram_cap[3][i]; end
+    w_scale = 12'(-RT_SCALE);                 // signed I2F decode field
     fire_cmd(FHE_DECRYPT, "DECRYPT");
 
     begin longint reco[]; reco = new[N];

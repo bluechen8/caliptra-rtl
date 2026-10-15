@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-# Stage-B' 2c-step-2: build + run the fhe_top + FHE-DMA round-trip unit TB.
+# Build + run the fhe_top unit TB (register map v2, firmware-forward stream).
 #
 #   ./run_fhe_top_dma_tb.sh [LOGN]      # default LOGN=8 (N=256)
 #
-# fhe_top is built with +define+FHE_WALKER so it instantiates fhe_microseq +
-# ComputeCore + fhe_dma (the dedicated DMA reusing axi_mgr_rd/axi_mgr_wr) and
-# exposes an AXI4 manager port. The TB drives the AHB register block (seeds /
-# scales / CONFIG / 4 DMA pointer regs + CMD) and backs the manager with a
-# behavioral AXI subordinate DRAM model; keygen->encrypt->decrypt round-trips
-# the ciphertext through real AXI bursts and checks recovered ~= input.
+# fhe_top is built with +define+FHE_WALKER. The TB plays firmware: KeyVault
+# seed read, CONFIG and slot bases, commands, and the XFER_* stream against a
+# TB memory. It checks round trips, recovery, refresh, the single-seed stream
+# and command preconditions. Options: LIMBS2=1 (two-limb ciphertexts and the
+# N=256 key golden), FFT_ON_THE_FLY=1, STREAM_STALLS=1, MNIST_DIR=<dir>.
 #
 # Expect: "fhe_top_dma_tb RESULT: PASS".
 set -euo pipefail
@@ -40,13 +39,8 @@ python3 "$ALOHA_PORT/vendor/Scripts/GenerateStoredFFTTwiddleFct.py" "$LOGN" "$MI
 
 python3 "$ALOHA_PORT/tvgen/gen_roundtrip.py" "$LOGN" "$WORK" >/dev/null
 
-# KV_ONLY=1 builds the secure config (FHE_KV_SEED_ONLY): the plaintext KGSEED
-# register path is compiled out and KeyVault is forced as the sole keygen-seed
-# source. It implies +KVSEED (must provision + read the KV seed to work).
 EXTRA_DEF=""
 [[ "${FFT_ON_THE_FLY:-0}" == 1 ]] && EXTRA_DEF="-DFHE_FFT_ON_THE_FLY"
-[[ "${LOCAL_STREAM:-0}" == 1 ]] && EXTRA_DEF="$EXTRA_DEF -DFHE_LOCAL_STREAM"
-if [[ -n "${KV_ONLY:-}" ]]; then EXTRA_DEF="$EXTRA_DEF -DFHE_KV_SEED_ONLY"; export KVSEED=1; fi
 
 echo "=== build $TOP (N=$N) ${EXTRA_DEF:+[$EXTRA_DEF]} ==="
 [[ -n "${CLEAN:-}" ]] && rm -rf "$OBJ_DIR"
@@ -82,8 +76,6 @@ if [[ "${BUILD_ONLY:-0}" == 1 ]]; then
 fi
 
 echo "=== running (cwd=$RUNDIR) ==="
-# KVSEED=1 sources the keygen root seed from a modeled KeyVault (C'-1b) and
-# asserts the walker's effective seed == the KV value (KGSEED regs held wrong).
 PLUSARGS=""
 if [[ "$N" == 256 ]]; then
   python3 "$ALOHA_PORT/tvgen/gen_recovery.py" "$WORK"
@@ -94,8 +86,6 @@ if [[ "$N" == 256 && -n "${LIMBS2:-}" ]]; then
 fi
 [[ -n "${MNIST_DIR:-}" ]] && PLUSARGS="$PLUSARGS +MNIST=$MNIST_DIR"
 [[ -n "${LIMBS2:-}" ]] && PLUSARGS="$PLUSARGS +LIMBS2"
-[[ -n "${KVSEED:-}" ]]  && PLUSARGS="$PLUSARGS +KVSEED"
-[[ -n "${FREERUN:-}" ]] && PLUSARGS="$PLUSARGS +FREERUN"   # C'-2 free-run PRNG test
 [[ "${STREAM_STALLS:-0}" == 1 ]] && PLUSARGS="$PLUSARGS +STREAM_STALLS"
 ( cd "$RUNDIR" && "$OBJ_DIR/V$TOP" +TVDIR="$WORK" $PLUSARGS ) 2>&1 | tee -a "$LOG"
 

@@ -32,19 +32,14 @@ ${CALIPTRA_ROOT}/src/fhe/rtl/fhe_nettype_wire.v
 -f ${CALIPTRA_ROOT}/src/fhe/aloha/sim/aloha_core.f
 ${CALIPTRA_ROOT}/src/fhe/rtl/fhe_nettype_none.v
 
-// 3) The FHE outer sequencer + dedicated DMA engine (instantiated by fhe_top
-//    under `ifdef FHE_WALKER). Both reuse only in-tree prims/AXI already in the
-//    base filelist, plus the Aloha core above.
+// 3) The FHE walker and firmware-forward stream (instantiated by fhe_top under
+//    `ifdef FHE_WALKER), plus the Aloha core above.
 ${CALIPTRA_ROOT}/src/fhe/rtl/fhe_microseq.sv
-${CALIPTRA_ROOT}/src/fhe/rtl/fhe_dma.sv
+${CALIPTRA_ROOT}/src/fhe/rtl/fhe_local_stream.sv
 
 // C'-1b: KeyVault keygen-seed reader (instantiated by fhe_top under `ifdef
 //   FHE_WALKER). Imports kv_defines_pkg, already compiled by the base filelist.
 ${CALIPTRA_ROOT}/src/fhe/rtl/fhe_kv_seed.sv
-
-// 4) TB-only: behavioral AXI DRAM model + round-trip checker that backs the FHE
-//    DMA manager (instantiated by caliptra_top_tb.sv under `ifdef FHE_WALKER).
-${CALIPTRA_ROOT}/src/integration/tb/fhe_axi_dram_model.sv
 
 // C'-3: behavioral storage banks backing the lifted fhe_aloha_mem_if
 //   (instantiated by caliptra_top_tb.sv under `ifdef FHE_WALKER). Uses the

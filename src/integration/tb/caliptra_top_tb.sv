@@ -93,18 +93,6 @@ module caliptra_top_tb (
         .UW(CPTRA_AXI_DMA_USER_WIDTH)
     ) m_axi_if (.clk(core_clk), .rst_n(cptra_rst_b));
 
-`ifdef FHE_WALKER
-    // Stage-B' 2c-step-3: dedicated FHE DMA AXI manager (64-bit data). Backed by
-    // a behavioral AXI subordinate DRAM model below (TB-only memory, separate from
-    // VeeR's address space). Geometry matches caliptra_top's fhe_m_axi_* port.
-    localparam int FHE_DMA_DW = 64;
-    axi_if #(
-        .AW(`CALIPTRA_AXI_DMA_ADDR_WIDTH),
-        .DW(FHE_DMA_DW),
-        .IW(CPTRA_AXI_DMA_ID_WIDTH),
-        .UW(CPTRA_AXI_DMA_USER_WIDTH)
-    ) fhe_m_axi_if (.clk(core_clk), .rst_n(cptra_rst_b));
-`endif
 
     logic ready_for_fuses;
     logic ready_for_mb_processing;
@@ -258,11 +246,6 @@ caliptra_top caliptra_top_dut (
     .m_axi_w_if(m_axi_if.w_mgr),
     .m_axi_r_if(m_axi_if.r_mgr),
 
-`ifdef FHE_WALKER
-    // Dedicated FHE DMA manager -> behavioral DRAM model (B' 2c-step-3a/3b).
-    .fhe_m_axi_w_if(fhe_m_axi_if.w_mgr),
-    .fhe_m_axi_r_if(fhe_m_axi_if.r_mgr),
-`endif
 
     .el2_mem_export(el2_mem_export.veer_sram_src),
 `ifndef CALIPTRA_NO_ADAMS_BRIDGE
@@ -434,31 +417,20 @@ caliptra_top_tb_axi_complex tb_axi_complex_i (
 );
 
 `ifdef FHE_WALKER
-    // Stage-B' 2c-step-3: back the dedicated FHE DMA manager with a behavioral AXI
-    // subordinate DRAM model that also backdoor-preloads the golden plaintext and
-    // checks the recovered-slots round-trip. See src/integration/tb/fhe_axi_dram_model.sv.
-    // (fhe_m_axi_if is declared with the other AXI interfaces above and wired to
-    // caliptra_top's fhe_m_axi_* ports at the DUT instance.)
-    fhe_axi_dram_model #(.N(`FHE_N)) fhe_dram_model_i (
-        .clk   (core_clk),
-        .rst_n (cptra_rst_b),
-        .axi   (fhe_m_axi_if)
-    );
 `ifdef CALIPTRA_NO_ADAMS_BRIDGE
-    // C'-1c decisive check: with the FHE KeyVault client connected (NoABR),
-    // prove the keygen root seed the walker consumes came from KeyVault
-    // (0xDEADBEEF_CAFEBABE, injected by tb_services opcode 0xc6) and NOT the
-    // KGSEED regs. The sk-scheme round-trip cancels for any key, so recovery
-    // alone can't prove the source -- this seed-value check is the real gate.
+    // With the FHE KeyVault client connected (NoABR), prove the 160-bit seed
+    // the sampler receives is the KeyVault entry injected by tb_services
+    // opcode 0xc6. The sk-scheme round trip cancels for any key, so recovery
+    // alone cannot prove the source.
     logic fhe_kv_seed_checked = 1'b0;
     always @(posedge core_clk) begin
         if (caliptra_top_dut.fhe_inst.kv_seed_valid && !fhe_kv_seed_checked) begin
             fhe_kv_seed_checked <= 1'b1;
-            if (caliptra_top_dut.fhe_inst.kv_seed !== 64'hDEADBEEF_CAFEBABE)
-                $display("[FHE-KV-TB] FAIL: keygen seed 0x%016x != KeyVault 0xDEADBEEFCAFEBABE",
+            if (caliptra_top_dut.fhe_inst.kv_seed !== 160'h0BADF00D_89ABCDEF_01234567_DEADBEEF_CAFEBABE)
+                $display("[FHE-KV-TB] FAIL: keygen seed 0x%040x != KeyVault entry",
                          caliptra_top_dut.fhe_inst.kv_seed);
             else
-                $display("[FHE-KV-TB] PASS: keygen seed 0x%016x sourced from KeyVault (kv_read[6])",
+                $display("[FHE-KV-TB] PASS: keygen seed 0x%040x sourced from KeyVault (kv_read[2])",
                          caliptra_top_dut.fhe_inst.kv_seed);
         end
     end

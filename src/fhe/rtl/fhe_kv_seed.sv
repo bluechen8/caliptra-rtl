@@ -13,15 +13,12 @@
 // limitations under the License.
 //
 // Description:
-//   Stage-C' KeyVault seed reader for the FHE accelerator.
+//   KeyVault seed reader for the FHE accelerator.
 //
-//   The CKKS secret key (sk) is derived on-chip from a small persistent root
-//   seed (the 64-bit ternary keygen seed). For C' that root is stored in the
-//   KeyVault -- a protected, per-client key store whose contents NEVER cross
-//   the AHB bus -- rather than written in the clear to the AHB KGSEED
-//   registers. This module reads the seed out of a firmware-provisioned KV
-//   entry over a single kv_read/kv_rd_resp port and assembles it into the
-//   64-bit value the microsequencer's keygen EXE step consumes.
+//   Aloha's Trivium sampler is seeded from a 160-bit KeyVault entry that
+//   firmware derives without ever seeing it; the seed never crosses the AHB
+//   bus. This module reads the entry over a single kv_read/kv_rd_resp port and
+//   assembles the SEED_DWORDS dwords into the seed the core consumes.
 //
 //   The KV read datapath is combinational (kv_rd_resp.read_data is valid the
 //   same cycle read_entry/read_offset are presented -- see kv.sv keyvault_read
@@ -34,9 +31,8 @@
 module fhe_kv_seed
   import kv_defines_pkg::*;
 #(
-  // 64-bit keygen seed = 2 dwords. Parameterizable in case a wider root seed
-  // is adopted later (a KV entry holds up to KV_NUM_DWORDS=16 dwords).
-  parameter int SEED_DWORDS = 2
+  // Seed width in dwords (a KV entry holds up to KV_NUM_DWORDS=16 dwords).
+  parameter int SEED_DWORDS = 5
 )(
   input  logic clk,
   input  logic rst_b,
@@ -53,7 +49,7 @@ module fhe_kv_seed
   // Result.
   output logic [SEED_DWORDS*32-1:0]   seed,
   output logic                        seed_valid,   // 1-cycle pulse: seed ready
-  output logic                        seed_error,   // held with seed_valid on fail
+  output logic                        seed_error,   // held until the next start/zeroize
   output logic                        busy
 );
 
@@ -101,6 +97,7 @@ module fhe_kv_seed
             off     <= '0;
             seed_q  <= '0;
             err_q   <= 1'b0;
+            seed_error <= 1'b0;
             state   <= S_READ;
           end
         end

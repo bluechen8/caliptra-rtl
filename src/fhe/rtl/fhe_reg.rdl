@@ -12,14 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// CKKS FHE accelerator register map. Modeled on abr_reg.rdl.
+// CKKS FHE (Aloha) accelerator register map, version 2.
+// Specification: docs/fhe/16-register-map-v2.md in the Chipyard checkout.
 //
-// NOTE: The generated fhe_reg.sv / fhe_reg_pkg.sv must be produced with
+// Regenerate fhe_reg.sv / fhe_reg_pkg.sv / fhe_reg_uvm.sv with
 //   python3 tools/scripts/reg_gen.py src/fhe/rtl/fhe_reg.rdl
-// in an environment with peakrdl-regblock installed (add this block to
-// tools/scripts/reg_gen.sh). The Stage-0 integration stub (fhe_top.sv)
-// implements an equivalent register block by hand so the build does not
-// depend on the generator; this RDL is the canonical spec to converge on.
+// using the tool versions pinned in README.md.
 
 addrmap fhe_reg {
     desc = "address map for the CKKS FHE accelerator register space";
@@ -29,112 +27,147 @@ addrmap fhe_reg {
 
     default hw = na;
     signal {activelow; async; cpuif_reset; field_reset;} reset_b;
-    signal {activelow; async;} hard_reset_b;
+    // Asserted while no command is accepted or running; gates parameter writes.
     signal {} fhe_ready;
 
-    /* ---- FHE Component Name (RO) ---- */
+    /* ---- Identity (RO) ---- */
     reg {
         name = "FHE component name";
         default sw = r;
         default hw = w;
         field {desc = "Name field";} NAME[32];
-    } FHE_NAME[2];
+    } FHE_NAME[2] @ 0x0;
 
-    /* ---- FHE Component Version (RO) ---- */
     reg {
         name = "FHE component version";
         default sw = r;
         default hw = w;
         field {desc = "Version field";} VERSION[32];
-    } FHE_VERSION[2];
+    } FHE_VERSION[2] @ 0x8;
 
-    /* ---- FHE Control ---- */
-    reg {
+    /* ---- Control (external: decoded in fhe_top, reads 0) ---- */
+    external reg {
         name = "FHE control";
-        desc = "Selects the FHE operation. Self-clearing after each SW write.";
+        desc = "Command issue, zeroize and input commit. Reads return 0.";
         default sw = w;
         default hw = r;
-        default resetsignal = reset_b;
-        field {desc = "Command:
-                [br] 000 NONE
-                [br] 001 ENCRYPT  (svc1: encode + encrypt -> fresh L-limb ct @ DST_ADDR)
-                [br] 010 KEYGEN   (svc2: sk -> KeyVault, emit pk + evk @ KEY_DST_ADDR)
-                [br] 011 REENC    (svc3: decrypt @ SRC_ADDR + re-encrypt to TARGET_LEVEL @ DST_ADDR)
-                [br] 100 DECRYPT  (test hook)
-                [br] Hardware erases the field after each write.";
-                swwe = fhe_ready; hwclr;} CTRL[3] = 3'b0;
-        field {desc = "Zeroize all internal registers and memories.";
-                singlepulse;} ZEROIZE = 1'b0;
-    } FHE_CTRL;
+        field {desc = "Command: 001 ENCRYPT, 010 KEYGEN, 100 DECRYPT, 101 RECOVER,
+                       110 REFRESH. Accepted only while READY. 011 and 111 complete
+                       with ERROR.";} CMD[3] = 3'b0;
+        field {desc = "Abort any command, clear registers, key-valid state and the
+                       latched KeyVault seed. Does not scrub SRAM.";} ZEROIZE = 1'b0;
+        field {desc = "Release the ENCRYPT input-commit barrier. Effective only
+                       while STATUS.COMMIT_WAIT.";} INPUT_COMMIT = 1'b0;
+        field {desc = "Reserved";} RSVD[27] = 27'b0;
+    } FHE_CTRL @ 0x10;
 
-    /* ---- FHE Status (RO) ---- */
+    /* ---- Status (RO) ---- */
     reg {
         name = "FHE status";
-        desc = "READY: core idle/ready for a command.
-                [br] VALID: last operation complete, result valid.
-                [br] DMA_REQ: core is requesting a DMA transfer (firmware programs soc_ifc AXI DMA).
-                [br] ERROR: operation ended in error (bad param-set / level / KV fault).";
         default sw = r;
         default hw = w;
         default resetsignal = reset_b;
-        field {desc = "Ready";}                 READY   = 1'b0;
-        field {hw = rw; desc = "Valid";}        VALID   = 1'b0;
-        field {hw = rw; desc = "DMA request";}  DMA_REQ = 1'b0;
-        field {hw = rw; desc = "Error";}        ERROR   = 1'b0;
-    } FHE_STATUS;
+        field {desc = "Idle; a command or parameter write is accepted.";} READY = 1'b0;
+        field {desc = "The last command completed. Becomes visible in the same cycle as READY.";} VALID = 1'b0;
+        field {desc = "The last command failed; see ERR_CAUSE.";} ERROR = 1'b0;
+        field {desc = "A secret key from a successful KEYGEN is resident.";} KEY_VALID = 1'b0;
+        field {desc = "Error cause: 0 none, 1 no key, 2 L out of range, 3 illegal opcode,
+                       4 no fresh seed, 5 KeyVault read error, 6 DMA busy, 7 LOGN mismatch,
+                       8 bad input word, 9 bad slot address, 10 transport error,
+                       11 aborted by ZEROIZE.";} ERR_CAUSE[4] = 4'b0;
+        field {desc = "ENCRYPT inputs are loaded; waiting for CTRL.INPUT_COMMIT.";} COMMIT_WAIT = 1'b0;
+        field {desc = "Aloha holds the DMA lease.";} DMA_LEASED = 1'b0;
+        field {desc = "Reserved";} RSVD[22] = 22'b0;
+    } FHE_STATUS @ 0x14;
 
-    /* ---- DRAM source pointer (ciphertext in) ---- */
+    /* ---- Command parameters ---- */
     reg {
-        name = "FHE source DRAM address";
-        desc = "64-bit DRAM pointer to the input ciphertext (REENC/DECRYPT).";
-        default sw = w;
+        name = "FHE command configuration";
+        default sw = rw;
         default hw = r;
+        default swwe = fhe_ready;
+        default hwclr = true;
         default resetsignal = reset_b;
-        field {desc = "Address word"; swwe = fhe_ready; hwclr;} ADDR[32] = 32'b0;
-    } FHE_SRC_ADDR[2];
+        field {desc = "Limb count: limbs emitted by ENCRYPT/RECOVER, target limbs for REFRESH.
+                       Ignored by KEYGEN and DECRYPT.";} L[4] = 4'b0;
+        field {desc = "log2 N. Must equal the built ring dimension.";} LOGN[4] = 4'b0;
+        field {desc = "Reserved"; sw = r; hw = na; swwe = false; hwclr = false;} RSVD0[8] = 8'b0;
+        field {desc = "Instruction scale field; meaning depends on the command
+                       (RNS encode field for KEYGEN/ENCRYPT, I2F field in [8:0] for DECRYPT).";} SCALE[12] = 12'b0;
+        field {desc = "Reserved"; sw = r; hw = na; swwe = false; hwclr = false;} RSVD1[4] = 4'b0;
+    } FHE_CONFIG @ 0x18;
 
-    /* ---- DRAM destination pointer (ciphertext out) ---- */
     reg {
-        name = "FHE destination DRAM address";
-        desc = "64-bit DRAM pointer for the output ciphertext (ENCRYPT/REENC).";
-        default sw = w;
-        default hw = r;
-        default resetsignal = reset_b;
-        field {desc = "Address word"; swwe = fhe_ready; hwclr;} ADDR[32] = 32'b0;
-    } FHE_DST_ADDR[2];
+        name = "FHE capabilities";
+        default sw = r;
+        default hw = w;
+        field {desc = "Ring dimension N";} N[16];
+        field {desc = "Installed limbs";} L[4];
+        field {desc = "FFT twiddles generated (no stored table)";} FFT_GENERATED = 1'b0;
+        field {desc = "Reserved";} RSVD0[3];
+        field {desc = "Direct DMA stream transport present";} DMA_STREAM = 1'b0;
+        field {desc = "Firmware-forward stream (XFER_DATA) present";} FW_STREAM = 1'b0;
+        field {desc = "Reserved";} RSVD1[2];
+        field {desc = "Register map version";} MAP_VERSION[4];
+    } FHE_CAP @ 0x1C;
 
-    /* ---- DRAM destination pointer (public keys out) ---- */
+    /* ---- KeyVault seed read (standard Caliptra KeyVault control) ---- */
+    kv_read_ctrl_reg  FHE_KV_RD_SEED_CTRL   @ 0x20;
+    kv_status_reg     FHE_KV_RD_SEED_STATUS @ 0x24;
+
+    /* ---- Transfer status (RO) ---- */
     reg {
-        name = "FHE key destination DRAM address";
-        desc = "64-bit DRAM pointer where KEYGEN emits the public key + eval keys.";
-        default sw = w;
-        default hw = r;
-        default resetsignal = reset_b;
-        field {desc = "Address word"; swwe = fhe_ready; hwclr;} ADDR[32] = 32'b0;
-    } FHE_KEY_DST_ADDR[2];
+        name = "FHE transfer status";
+        default sw = r;
+        default hw = w;
+        field {desc = "A transfer segment is open";} ACTIVE = 1'b0;
+        field {desc = "Direction: 1 = output from Aloha";} DIR = 1'b0;
+        field {desc = "Firmware-forward build: XFER_DATA may be written";} IN_READY = 1'b0;
+        field {desc = "Firmware-forward build: XFER_DATA may be read";} OUT_VALID = 1'b0;
+        field {desc = "Slot: 0 message/c0 in, 1 c1 in, 2 c0/slots/residues out, 3 c1 out";} SLOT[3] = 3'b0;
+        field {desc = "Reserved";} RSVD0 = 1'b0;
+        field {desc = "Limb";} LIMB[4] = 4'b0;
+        field {desc = "Firmware-forward build: next XFER_DATA access is the high word";} HALF = 1'b0;
+        field {desc = "Reserved";} RSVD1[19] = 19'b0;
+    } FHE_XFER_STATUS @ 0x28;
 
-    /* ---- Target level + parameter-set selector ---- */
     reg {
-        name = "FHE operation config";
-        desc = "TARGET_LEVEL: number of RNS limbs to retain for REENC (1..L).
-                [br] PARAM_SET_ID: selects a baked-in (q-set, N); ERROR if unsupported.";
-        default sw = w;
-        default hw = r;
-        default resetsignal = reset_b;
-        field {desc = "Target RNS level"; swwe = fhe_ready; hwclr;} TARGET_LEVEL[4] = 4'b0;
-        field {desc = "Parameter set id"; swwe = fhe_ready; hwclr;} PARAM_SET_ID[8] = 8'b0;
-    } FHE_CONFIG;
+        name = "FHE transfer words left";
+        default sw = r;
+        default hw = w;
+        field {desc = "64-bit words left in the current segment";} LEFT[32];
+    } FHE_XFER_LEFT @ 0x2C;
 
-    //--- KeyVault control: KEYGEN writes sk; REENC/DECRYPT read sk. ---
-    kv_read_ctrl_reg   kv_fhe_sk_rd_ctrl   @0x8000;
-    kv_status_reg      kv_fhe_sk_rd_status;
-    kv_write_ctrl_reg  kv_fhe_sk_wr_ctrl;
-    kv_status_reg      kv_fhe_sk_wr_status;
+    /* ---- Slot base addresses ---- */
+    regfile fhe_slot_t {
+        reg {
+            name = "Slot base address, low word";
+            default sw = rw;
+            default hw = r;
+            default swwe = fhe_ready;
+            default hwclr = true;
+            default resetsignal = reset_b;
+            field {desc = "Address bits [31:0]";} ADDR[32] = 32'b0;
+        } BASE_L;
+        reg {
+            name = "Slot base address, high word";
+            default sw = rw;
+            default hw = r;
+            default swwe = fhe_ready;
+            default hwclr = true;
+            default resetsignal = reset_b;
+            field {desc = "Address bits [63:32]";} ADDR[32] = 32'b0;
+        } BASE_H;
+    };
+    fhe_slot_t FHE_SLOT[4] @ 0x30;
 
-    //--- Standard Caliptra interrupt block (error + notif/cmd-done). ---
-    // Before generating, paste the canonical `regfile intr_block_t { ... }`
-    // definition from abr_reg.rdl (the error_internal / notif_cmd_done block)
-    // here verbatim, then instance it below. It is identical across all
-    // Caliptra crypto IPs, so it is not duplicated in this spec file.
-    intr_block_t intr_block_rf @0x8100;
+    /* ---- Firmware-forward data window (external; bring-up build only) ---- */
+    external reg {
+        name = "FHE transfer data";
+        desc = "Firmware-forward build: two 32-bit accesses per 64-bit word, low word first.
+                Other builds: reads 0, writes return an AHB error.";
+        default sw = rw;
+        default hw = rw;
+        field {desc = "Data";} DATA[32] = 32'b0;
+    } FHE_XFER_DATA @ 0x50;
 };

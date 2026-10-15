@@ -24,7 +24,7 @@ module fhe_kv_seed_tb
 ;
 
   localparam int SEED_DWORDS = 2;
-  localparam int FHE_CLIENT  = 6;   // reuses kv_read[6] (free when ABR off)
+  localparam int FHE_CLIENT  = 2;   // reuses kv_read[2], the ML-DSA seed client (free when ABR off)
 
   logic clk = 1'b0;
   logic rst_b = 1'b0;

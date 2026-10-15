@@ -110,6 +110,18 @@ package fhe_params_pkg;
     FHE_RECOVER = 3'b101 // coefficient residues, all selected limbs; no FFT
   } fhe_cmd_e;
 
+  // Completion error causes (STATUS.ERR_CAUSE).
+  typedef enum logic [3:0] {
+    FHE_EC_NONE       = 4'd0,
+    FHE_EC_NO_KEY     = 4'd1,
+    FHE_EC_BAD_L      = 4'd2,
+    FHE_EC_BAD_OPCODE = 4'd3,
+    FHE_EC_NO_SEED    = 4'd4,
+    FHE_EC_KV_READ    = 4'd5,
+    FHE_EC_BAD_LOGN   = 4'd7,
+    FHE_EC_ABORTED    = 4'd11
+  } fhe_err_e;
+
   parameter [63:0] FHE_CORE_NAME    = 64'h00000000_53_4B_4B_43; // "CKKS"
   parameter [63:0] FHE_CORE_VERSION = 64'h00000000_3030312e;    // "1.00"
 

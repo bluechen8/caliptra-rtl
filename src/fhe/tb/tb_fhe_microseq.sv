@@ -6,7 +6,7 @@
 // recording stub "core" that decodes the ComputeCoreWrapper debug-IO pins.
 // Checks, independently of the real core:
 //   - each command raises exactly one `done`;
-//   - the EXE-param stream (sampling seeds) is in the expected order;
+//   - only the KEYGEN sampling pass reloads the seed (reseed_en), dina is 0;
 //   - the LDINS payload stream (the patched INS words) matches the TB's own
 //     ins_* builders for the right limb chain + scale -- this is the actual
 //     trace-equivalence assertion (walker encoding == validated TB encoding);
@@ -34,10 +34,9 @@ module tb_fhe_microseq;
 
   logic        cmd_valid=0;
   fhe_cmd_e    cmd=FHE_NONE;
-  logic [63:0] keygen_seed=64'hA105_BEEF_0006_A001;
-  logic [63:0] a_seed     =64'h0006_A002_C0FF_EE77;
-  logic [63:0] err_seed   =64'h2350_e171_5239_2f72;
+  logic [11:0] scale      =12'(RNS_KG);
   logic [3:0]  num_limbs  =4'd1;
+  wire         reseed_en;
   logic [63:0] r2modq [0:FHE_L-1];
 
   wire [31:0] control_low_word, control_high_word, dina_low, dina_high;
@@ -58,10 +57,7 @@ module tb_fhe_microseq;
     .clk(clk), .rst_b(rst_b), .zeroize(zeroize),
     .cmd_valid(cmd_valid), .cmd(cmd),
     .active_limb(),
-    .keygen_seed(keygen_seed), .a_seed(a_seed), .err_seed(err_seed),
-    .freerun_en(1'b0), .entseed(64'd0), .reseed_req(1'b0),
-    .reseed_en(), .reseed_ack(), .reseed_wait(),
-    .rns_scale_kg(32'(RNS_KG)), .rns_scale_enc(32'(RNS_ENC)), .i2f_scale_dec(32'(I2F_DEC)),
+    .scale(scale), .reseed_en(reseed_en),
     .num_limbs(num_limbs), .r2modq(r2modq),
     .control_low_word(control_low_word), .control_high_word(control_high_word),
     .dina_low(dina_low), .dina_high(dina_high),
@@ -103,7 +99,8 @@ module tb_fhe_microseq;
   int   wr_n   [0:255]; int wr_bram[0:255]; int wr_ins[0:255]; longint wr_pay[0:255];
   int   nwr;
   logic run_open; int run_bram, run_ins, run_n; longint run_pay;
-  // EXE params
+  // EXE reseed gate (1 = reload the sampler seed). The seed itself arrives on
+  // fhe_top's sideband; dina must carry 0 at every EXE.
   longint exe_p [0:63]; int nexe;
   int     prev_ch;
   // dout strobes
@@ -117,7 +114,10 @@ module tb_fhe_microseq;
     if (rst_b) begin
       // EXE start edge
       if (control_high_word==32'd2 && prev_ch!=2) begin
-        exe_p[nexe] = {dina_high,dina_low}; nexe++;
+        exe_p[nexe] = longint'(reseed_en); nexe++;
+        if ({dina_high,dina_low} != 64'd0) begin
+          $display("  EXE dina=%h, expected 0 (seed is on the sideband)", {dina_high,dina_low}); errors++;
+        end
       end
       prev_ch <= control_high_word;
       // dout strobes
@@ -208,38 +208,45 @@ module tb_fhe_microseq;
     for (int i=0;i<FHE_L;i++) r2modq[i] = 64'hB2000000 + i; // distinct per-limb
     rst_b=0; repeat(4) @(negedge clk); rst_b=1; repeat(2) @(negedge clk);
 
-    // ---------------- KEYGEN (L=1) ----------------
+    // ---------------- KEYGEN: always every installed limb; only the sampling
+    // pass reloads the seed, even when CONFIG.L asks for one limb ----------------
     clr_exp();
-    e_ins(g_fft(1));                       e_exe(keygen_seed);
+    scale = 12'(RNS_KG);
+    e_ins(g_fft(1));                       e_exe(1);
     e_ins(g_rns(RNS_KG,K0,MS0,QM0));       e_exe(0);
     e_ins(g_ntt(0,K0,MS0,QM0));            e_exe(0);
     e_ins(g_pwm(K0,QM0,0,0));              e_exe(0);
+    e_ins(g_rns(RNS_KG,K1,MS1,QM1));       e_exe(0);
+    e_ins(g_ntt(0,K1,MS1,QM1));            e_exe(0);
+    e_ins(g_pwm(K1,QM1,0,0));              e_exe(0);
     run_cmd(FHE_KEYGEN, 4'd1);
-    compare("KEYGEN L=1");
+    compare("KEYGEN (L ignored)");
 
-    // ---------------- ENCRYPT (L=1) ----------------
+    // ---------------- ENCRYPT (L=1): a and e0 continue the stream ----------------
     clr_exp();
-    e_ins(g_fft(1));                       e_exe(err_seed);
+    scale = 12'(RNS_ENC);
+    e_ins(g_fft(1));                       e_exe(0);
     e_ins(g_rns(RNS_ENC,K0,MS0,QM0));      e_exe(0);
-    e_ins(g_ntt(0,K0,MS0,QM0));            e_exe(a_seed);
+    e_ins(g_ntt(0,K0,MS0,QM0));            e_exe(0);
     e_ins(g_pwm(K0,QM0,1,1));              e_exe(0);
     run_cmd(FHE_ENCRYPT, 4'd1);
     compare("ENCRYPT L=1");
 
     // ---------------- ENCRYPT (L=2) ----------------
     clr_exp();
-    e_ins(g_fft(1));                       e_exe(err_seed);
+    e_ins(g_fft(1));                       e_exe(0);
     e_ins(g_rns(RNS_ENC,K0,MS0,QM0));      e_exe(0);
-    e_ins(g_ntt(0,K0,MS0,QM0));            e_exe(a_seed);
+    e_ins(g_ntt(0,K0,MS0,QM0));            e_exe(0);
     e_ins(g_pwm(K0,QM0,1,1));              e_exe(0);
     e_ins(g_rns(RNS_ENC,K1,MS1,QM1));      e_exe(0);
-    e_ins(g_ntt(0,K1,MS1,QM1));            e_exe(a_seed);
+    e_ins(g_ntt(0,K1,MS1,QM1));            e_exe(0);
     e_ins(g_pwm(K1,QM1,1,1));              e_exe(0);
     run_cmd(FHE_ENCRYPT, 4'd2);
     compare("ENCRYPT L=2");
 
     // ---------------- DECRYPT (L=1) ----------------
     clr_exp();
+    scale = 12'(I2F_DEC);
     e_ins(g_pwm(K0,QM0,0,0));              e_exe(0);
     e_ins(g_ntt(1,K0,MS0,QM0));            e_exe(0);
     e_ins(g_i2f(I2F_DEC,K0,QM0));          e_exe(0);

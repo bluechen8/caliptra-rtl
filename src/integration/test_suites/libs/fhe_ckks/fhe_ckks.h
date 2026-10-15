@@ -23,101 +23,72 @@
 #include "caliptra_defines.h"
 #include "riscv_hw_if.h"
 
-// Internal AHB base (VeeR view) — must match CALIPTRA_SLAVE_BASE_ADDR[FHE].
+// Internal AHB base (VeeR view) -- must match CALIPTRA_SLAVE_BASE_ADDR[FHE].
 #define CLP_FHE_REG_BASE_ADDR     0x10050000
 
+// Register map v2 (src/fhe/rtl/fhe_reg.rdl).
 #define FHE_REG_NAME0             (CLP_FHE_REG_BASE_ADDR + 0x00)
 #define FHE_REG_NAME1             (CLP_FHE_REG_BASE_ADDR + 0x04)
 #define FHE_REG_VERSION0          (CLP_FHE_REG_BASE_ADDR + 0x08)
 #define FHE_REG_VERSION1          (CLP_FHE_REG_BASE_ADDR + 0x0C)
 #define FHE_REG_CTRL              (CLP_FHE_REG_BASE_ADDR + 0x10)
 #define FHE_REG_STATUS            (CLP_FHE_REG_BASE_ADDR + 0x14)
-#define FHE_REG_SRC_ADDR0         (CLP_FHE_REG_BASE_ADDR + 0x18)
-#define FHE_REG_SRC_ADDR1         (CLP_FHE_REG_BASE_ADDR + 0x1C)
-#define FHE_REG_DST_ADDR0         (CLP_FHE_REG_BASE_ADDR + 0x20)
-#define FHE_REG_DST_ADDR1         (CLP_FHE_REG_BASE_ADDR + 0x24)
-#define FHE_REG_KEY_DST_ADDR0     (CLP_FHE_REG_BASE_ADDR + 0x28)
-#define FHE_REG_KEY_DST_ADDR1     (CLP_FHE_REG_BASE_ADDR + 0x2C)
-#define FHE_REG_CONFIG            (CLP_FHE_REG_BASE_ADDR + 0x30)
-// Stage-B' 2c microsequencer inputs: program-level seeds (EXE sampling) +
-// firmware-computed scales (INS scale-field patches). See microseq doc 5.1.
-#define FHE_REG_KGSEED0           (CLP_FHE_REG_BASE_ADDR + 0x34)
-#define FHE_REG_KGSEED1           (CLP_FHE_REG_BASE_ADDR + 0x38)
-#define FHE_REG_ASEED0            (CLP_FHE_REG_BASE_ADDR + 0x3C)
-#define FHE_REG_ASEED1            (CLP_FHE_REG_BASE_ADDR + 0x40)
-#define FHE_REG_ESEED0            (CLP_FHE_REG_BASE_ADDR + 0x44)
-#define FHE_REG_ESEED1            (CLP_FHE_REG_BASE_ADDR + 0x48)
-#define FHE_REG_KGSCALE           (CLP_FHE_REG_BASE_ADDR + 0x4C)
-#define FHE_REG_ENCSCALE          (CLP_FHE_REG_BASE_ADDR + 0x50)
-#define FHE_REG_I2FSCALE          (CLP_FHE_REG_BASE_ADDR + 0x54)
-// B' 2c-step-2: four DMA base-pointer registers (byte addresses of the poly
-// buffers in DRAM), indexed by the walker's PTR index 0..3.
-#define FHE_REG_PTR0_LO           (CLP_FHE_REG_BASE_ADDR + 0x58)
-#define FHE_REG_PTR0_HI           (CLP_FHE_REG_BASE_ADDR + 0x5C)
-#define FHE_REG_PTR1_LO           (CLP_FHE_REG_BASE_ADDR + 0x60)
-#define FHE_REG_PTR1_HI           (CLP_FHE_REG_BASE_ADDR + 0x64)
-#define FHE_REG_PTR2_LO           (CLP_FHE_REG_BASE_ADDR + 0x68)
-#define FHE_REG_PTR2_HI           (CLP_FHE_REG_BASE_ADDR + 0x6C)
-#define FHE_REG_PTR3_LO           (CLP_FHE_REG_BASE_ADDR + 0x70)
-#define FHE_REG_PTR3_HI           (CLP_FHE_REG_BASE_ADDR + 0x74)
-// C'-1b: KeyVault keygen-seed control. bit0 = KV_EN (source the keygen root
-// seed from KeyVault instead of the KGSEED regs); bits[8:4] = READ_ENTRY (the
-// KV entry index holding the 64-bit ternary seed, provisioned into KeyVault).
-#define FHE_REG_KGKV_CTRL         (CLP_FHE_REG_BASE_ADDR + 0x78)
-#define FHE_KGKV_CTRL_KV_EN       (1 << 0)
-// C'-2 free-run PRNG. ENTSEED = CSRNG-sourced 64-bit seed for the per-ciphertext
-// a/e0 keystream; RNG_CTRL bit0 = FREERUN_EN, bit1 = RESEED_REQ (doorbell). After
-// keygen / cold reset the first encrypt STALLS (STATUS.RESEED_REQ_PENDING) until
-// firmware writes ENTSEED + RESEED_REQ -- enforcing fresh entropy every boot.
-#define FHE_REG_ENTSEED0          (CLP_FHE_REG_BASE_ADDR + 0x7C)
-#define FHE_REG_ENTSEED1          (CLP_FHE_REG_BASE_ADDR + 0x80)
-#define FHE_REG_RNG_CTRL          (CLP_FHE_REG_BASE_ADDR + 0x84)
-#define FHE_RNG_CTRL_FREERUN_EN   (1 << 0)
-#define FHE_RNG_CTRL_RESEED_REQ   (1 << 1)
+#define FHE_REG_CONFIG            (CLP_FHE_REG_BASE_ADDR + 0x18)
+#define FHE_REG_CAP               (CLP_FHE_REG_BASE_ADDR + 0x1C)
+#define FHE_REG_KV_RD_SEED_CTRL   (CLP_FHE_REG_BASE_ADDR + 0x20)
+#define FHE_REG_KV_RD_SEED_STATUS (CLP_FHE_REG_BASE_ADDR + 0x24)
+#define FHE_REG_XFER_STATUS       (CLP_FHE_REG_BASE_ADDR + 0x28)
+#define FHE_REG_XFER_LEFT         (CLP_FHE_REG_BASE_ADDR + 0x2C)
+#define FHE_REG_SLOT0_BASE_L      (CLP_FHE_REG_BASE_ADDR + 0x30)  // slot n at +8n
+#define FHE_REG_XFER_DATA         (CLP_FHE_REG_BASE_ADDR + 0x50)
 
 // Commands (FHE_CTRL[2:0])
 #define FHE_CMD_NONE              0x0
 #define FHE_CMD_ENCRYPT           0x1
 #define FHE_CMD_KEYGEN            0x2
-#define FHE_CMD_REENC             0x3
 #define FHE_CMD_DECRYPT           0x4
+#define FHE_CMD_RECOVER           0x5
+#define FHE_CMD_REFRESH           0x6
 #define FHE_CTRL_ZEROIZE          (1 << 3)
+#define FHE_CTRL_INPUT_COMMIT     (1 << 4)
 
-// Status bits
-#define FHE_STATUS_READY              (1 << 0)
-#define FHE_STATUS_VALID              (1 << 1)
-#define FHE_STATUS_DMA_REQ            (1 << 2)
-#define FHE_STATUS_ERROR              (1 << 3)
-#define FHE_STATUS_RESEED_REQ_PENDING (1 << 4)   // C'-2: encrypt stalled awaiting reseed
+// STATUS fields
+#define FHE_STATUS_READY          (1 << 0)
+#define FHE_STATUS_VALID          (1 << 1)
+#define FHE_STATUS_ERROR          (1 << 2)
+#define FHE_STATUS_KEY_VALID      (1 << 3)
+#define FHE_STATUS_ERR_CAUSE(s)   (((s) >> 4) & 0xF)
+#define FHE_STATUS_COMMIT_WAIT    (1 << 8)
+#define FHE_STATUS_DMA_LEASED     (1 << 9)
 
-// Expected identity values (see fhe_params_pkg.sv)
+// ERR_CAUSE values
+#define FHE_ERR_NONE              0
+#define FHE_ERR_NO_KEY            1
+#define FHE_ERR_BAD_L             2
+#define FHE_ERR_BAD_OPCODE        3
+#define FHE_ERR_NO_SEED           4
+#define FHE_ERR_KV_READ           5
+#define FHE_ERR_DMA_BUSY          6
+#define FHE_ERR_BAD_LOGN          7
+#define FHE_ERR_BAD_WORD          8
+#define FHE_ERR_BAD_ADDR          9
+#define FHE_ERR_TRANSPORT         10
+#define FHE_ERR_ABORTED           11
+
+// Expected identity values (see fhe_top.sv)
 #define FHE_NAME0_EXP             0x534B4B43   // "CKKS"
-#define FHE_VERSION0_EXP          0x3030312e   // "1.00"
+#define FHE_VERSION0_EXP          0x3030322e   // "2.00"
 
 void     fhe_zeroize(void);
 uint32_t fhe_read_status(void);
-void     fhe_set_dst_addr(uint64_t addr);
-void     fhe_set_src_addr(uint64_t addr);
-void     fhe_set_config(uint8_t target_level, uint8_t param_set_id);
-// Poll STATUS until VALID; returns the final STATUS word.
-uint32_t fhe_poll_valid(void);
+// CONFIG = {SCALE[27:16], LOGN[7:4], L[3:0]}.
+void     fhe_set_config(uint32_t limbs, uint32_t logn, uint32_t scale);
+// Write slot base address `slot` (0..3).
+void     fhe_set_slot(uint32_t slot, uint64_t addr);
+// Read the KeyVault entry into the seed register (standard kv_read_ctrl_reg /
+// kv_status_reg, see libs/keyvault); returns the final KV status.
+uint32_t fhe_kv_seed_read(uint32_t entry);
 // Issue a command and poll STATUS until VALID; returns the final STATUS word.
 uint32_t fhe_run_poll(uint32_t cmd);
-
-// Stage-B' 2c microsequencer programming (write a 64-bit value lo/hi).
-void     fhe_set_kg_seed(uint64_t seed);
-void     fhe_set_a_seed(uint64_t seed);
-void     fhe_set_err_seed(uint64_t seed);
-void     fhe_set_scales(uint32_t kg_scale, uint32_t enc_scale, uint32_t i2f_scale);
-// Write DMA base pointer reg `idx` (0..3) with a 64-bit DRAM byte address.
-void     fhe_set_ptr(uint32_t idx, uint64_t addr);
-// C'-1c: select the KeyVault entry holding the keygen root seed and enable KV
-// as the keygen-seed source (KGKV_CTRL). Pass en=0 to use the KGSEED regs.
-void     fhe_set_kgkv(uint32_t read_entry, uint32_t en);
-
-// C'-2 free-run PRNG.
-void     fhe_set_freerun(uint32_t en);           // RNG_CTRL.FREERUN_EN
-void     fhe_reseed(uint64_t entseed);           // write ENTSEED + assert FREERUN_EN|RESEED_REQ
-void     fhe_issue(uint32_t cmd);                // issue a command WITHOUT polling to completion
 
 #endif

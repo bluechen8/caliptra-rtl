@@ -57,22 +57,10 @@ module fhe_microseq
   output logic [3:0] active_limb,
   input  fhe_cmd_e    cmd,
 
-  // runtime inputs (registers in fhe_top; CSRNG/Trivium in C')
-  input  logic [63:0] keygen_seed,
-  input  logic [63:0] a_seed,
-  input  logic [63:0] err_seed,
-  // C'-2 free-run PRNG policy (from fhe_top registers).
-  input  logic        freerun_en,   // 1 => encrypt a/e0 passes free-run (no per-pass reload)
-  input  logic [63:0] entseed,      // CSRNG-sourced seed for the a/e0 stream (firmware-written)
-  input  logic        reseed_req,   // firmware doorbell: (re)seed the a/e0 stream at the next pass
-  // Scale fields. enc/dec scales are PER-COMMAND inputs: Caliptra firmware
-  // computes them (it knows Delta / level / whether the ct is a product or
-  // rescaled) and writes them when issuing the ENCRYPT / DECRYPT command. The
-  // keygen scale is service-internal (not user-facing precision) so it stays a
-  // fixed CONFIG-derived value.
-  input  logic [31:0] rns_scale_kg,   // RT_SCALE-52-1023-LOGN   (keygen RNS, internal)
-  input  logic [31:0] rns_scale_enc,  // encode RNS scale        (ENCRYPT command input)
-  input  logic [31:0] i2f_scale_dec,  // signed decode I2F scale (DECRYPT command input)
+  // Per-command instruction scale field (CONFIG.SCALE), written by firmware.
+  // KEYGEN/ENCRYPT patch it into the RNS pass (unsigned); DECRYPT patches its
+  // low bits into the I2F pass as a signed value.
+  input  logic [11:0] scale,
   input  logic [3:0]  num_limbs,      // output/active limbs; slot decrypt forced to 1
 
   // per-limb R^2 mod q_i constant for keygen Montgomery-convert (CONST R2MODQ)
@@ -108,35 +96,18 @@ module fhe_microseq
   output logic        dma_rd_pop,     // walker consumed a DMA_IN word this cycle
   input  logic        dma_wr_ready,   // DMA_OUT FIFO can accept a word
 
-  // C'-2 free-run PRNG controls to the sampler (via fhe_top -> ComputeCoreWrapper).
-  output logic        reseed_en,      // per-pass reseed gate (1 = reload seed; 0 = free-run)
-  output logic        reseed_ack,     // 1-cycle: firmware doorbell consumed (clears reseed_req)
-  output logic        reseed_wait,    // high while an encrypt pass is STALLED for a firmware
-                                      // reseed -> surfaced as a STATUS bit + notif interrupt so
-                                      // the wait is observable (not a silent busy-forever hang)
+  // Sampler reseed gate (via fhe_top -> ComputeCoreWrapper): 1 only for the
+  // KEYGEN key-sampling pass; every other pass continues the same stream.
+  output logic        reseed_en,
 
   output logic        busy,
   output logic        done,           // 1-cycle pulse
   output logic        error
 );
 
-  // C'-2 free-run seed-state:
-  //  ae_needs_seed    - the a/e0 stream is NOT yet seeded from firmware entropy.
-  //                     Set at cold reset / zeroize and after every keygen (keygen
-  //                     drives the shared Trivium with the KV seed, so a/e0 must be
-  //                     re-seeded from fresh CSRNG entropy before use). While set,
-  //                     an encrypt sampling pass STALLS until a firmware RESEED_REQ
-  //                     arrives -- this FORCES firmware to reseed after every cold
-  //                     reset / keygen (no silent encrypt with stale/default entropy).
-  //  ae_reseed_pending- a firmware doorbell (RESEED_REQ) is pending -> the next
-  //                     encrypt sampling pass injects `entseed`. Consumed by the inject.
-  logic ae_needs_seed;
-  logic ae_reseed_pending;
-  // Edge-detect the doorbell: arm on the RISING edge of reseed_req only. Arming on
-  // the level would re-arm the cycle after an inject clears it (reseed_req takes an
-  // extra cycle to clear via reseed_ack), making a SECOND pass in the same encrypt
-  // re-inject instead of free-running.
-  logic reseed_req_q;
+  // Single-seed sampling: KEYGEN's PS_KG pass loads the Trivium from the
+  // KeyVault seed (fhe_top sideband); s, then every a and e0, come from that one
+  // continuous stream. fhe_top refuses sampling commands until a KEYGEN.
 
   // =====================================================================
   // Macro-op encoding (FROZEN -- doc section 5.1)
@@ -152,7 +123,8 @@ module fhe_microseq
 
   // PARAMSEL (EXE seed source)
   localparam logic [1:0] PS_ZERO=2'd0, PS_KG=2'd1, PS_A=2'd2, PS_ERR=2'd3;
-  // SCALESEL (INS scale-field patch source)
+  // SCALESEL (INS scale-field patch source). Both RNS codes now patch from the
+  // one CONFIG.SCALE field; the two values are kept so the ROM encoding is stable.
   localparam logic [1:0] SC_NONE=2'd0, SC_RNSKG=2'd1, SC_RNSENC=2'd2, SC_I2F=2'd3;
   // write-data source for a send64 word (the cur_cid selector)
   localparam logic [1:0] C_ZEROS=2'd0, C_R2=2'd1, C_DIN=2'd3;  // C_DIN = DMA_IN (ext_din)
@@ -456,12 +428,12 @@ module fhe_microseq
     logic signed [31:0] s;
     logic [6:0] sh; logic [1:0] sm; logic [2:0] sl;
     if (sc == SC_I2F) begin
-      s  = i2f_scale_dec;
+      s  = 32'(signed'(scale));       // sign-extend the 12-bit field
       sh = (s >>> 5) & 7'h0f;          // 4-bit mask
       sm = (s >>> 3) & 2'h3;
       sl =  s        & 3'h7;
     end else begin
-      s  = (sc == SC_RNSKG) ? rns_scale_kg : rns_scale_enc;
+      s  = 32'(scale);
       sh = (s >> 5) & 7'h7f;           // 7-bit mask
       sm = (s >> 3) & 2'h3;
       sl =  s       & 3'h7;
@@ -531,24 +503,14 @@ module fhe_microseq
       ext_dout_we <= 1'b0; ext_dout <= 64'd0; cur_sk <= 1'b0;
       limb_active <= 1'b0; limb_idx <= 4'd0; limb_cnt <= 4'd1;
       widx <= '0; wn <= '0; rd_wait <= 3'd0;
-      reseed_en <= 1'b1; reseed_ack <= 1'b0; reseed_wait <= 1'b0;
-      ae_needs_seed <= 1'b1; ae_reseed_pending <= 1'b0; reseed_req_q <= 1'b0;
+      reseed_en <= 1'b0;
     end else if (zeroize) begin
       st <= S_IDLE; busy <= 1'b0; done <= 1'b0; error <= 1'b0;
       control_low_word <= 32'd0; control_high_word <= 32'd1;
       ext_dout_we <= 1'b0; limb_active <= 1'b0;
-      reseed_en <= 1'b1; reseed_ack <= 1'b0; reseed_wait <= 1'b0;
-      ae_needs_seed <= 1'b1; ae_reseed_pending <= 1'b0; reseed_req_q <= 1'b0;
+      reseed_en <= 1'b0;
     end else if (step) begin
       done <= 1'b0; ext_dout_we <= 1'b0;
-      // C'-2 free-run bookkeeping: reseed_ack is a 1-cycle pulse; a firmware
-      // doorbell arms a re-seed of the a/e0 stream on its RISING edge (the inject at
-      // OP_EXE, textually later in this block, clears it -> inject wins on a
-      // same-cycle collision).
-      reseed_ack   <= 1'b0;
-      reseed_wait  <= 1'b0;   // high only while actually blocked (set in OP_EXE below)
-      reseed_req_q <= reseed_req;
-      if (reseed_req & ~reseed_req_q) ae_reseed_pending <= 1'b1;
       unique case (st)
         // -------------------------------------------------------------
         S_IDLE: begin
@@ -559,7 +521,9 @@ module fhe_microseq
             error       <= 1'b0;
             limb_active <= 1'b0;
             limb_idx    <= 4'd0;
-            limb_cnt    <= (cmd == FHE_KEYGEN || cmd == FHE_ENCRYPT || cmd == FHE_RECOVER || cmd == FHE_REFRESH)
+            // KEYGEN always fills every installed key limb.
+            limb_cnt    <= (cmd == FHE_KEYGEN) ? 4'(FHE_L) :
+                           (cmd == FHE_ENCRYPT || cmd == FHE_RECOVER || cmd == FHE_REFRESH)
                              ? ((num_limbs==4'd0)?4'd1:num_limbs) : 4'd1;
             pc <= (cmd == FHE_KEYGEN)  ? KG_ENTRY[7:0] :
                   (cmd == FHE_ENCRYPT) ? ENC_ENTRY[7:0] :
@@ -608,51 +572,13 @@ module fhe_microseq
               st          <= S_FETCH;
             end
             OP_EXE: begin
-              logic [63:0] seed;
-              logic        is_kg, ae_freerun, inject, block;
-              is_kg      = (f_ps(op_w) == PS_KG);
-              // an encrypt sampling pass (PS_A / PS_ERR) with free-run enabled
-              ae_freerun = ((f_ps(op_w) == PS_A) || (f_ps(op_w) == PS_ERR)) & freerun_en;
-              inject     = ae_freerun & ae_reseed_pending;                  // doorbell -> reseed
-              // STALL: the first encrypt sampling pass after keygen / cold reset must
-              // wait for a firmware RESEED_REQ -- the a/e0 stream is unseeded and must
-              // NOT be used with stale/default entropy. Forces a reseed every boot.
-              block      = ae_freerun & ae_needs_seed & ~ae_reseed_pending;
-
-              if (block) begin
-                // hold here (busy stays high) until the doorbell arrives; assert
-                // reseed_wait so fhe_top can surface the wait (STATUS bit + interrupt).
-                reseed_wait <= 1'b1;
-                st <= S_DECODE;
-              end else begin
-                if (is_kg) begin
-                  // keygen: deterministic ternary s -> reload with the KV/keygen seed.
-                  // The shared Trivium is now owned by keygen, so a/e0 need a fresh
-                  // firmware reseed before the next encryption.
-                  seed = keygen_seed;
-                  reseed_en <= 1'b1;
-                  ae_needs_seed <= 1'b1;
-                end else if (inject) begin
-                  // (re)seed the a/e0 stream from entseed so a/e0 are fresh AND
-                  // independent of the long-term KV secret.
-                  seed = entseed;
-                  reseed_en <= 1'b1;
-                  ae_reseed_pending <= 1'b0;
-                  ae_needs_seed     <= 1'b0;   // stream is now firmware-seeded
-                  reseed_ack <= 1'b1;          // clear the firmware doorbell
-                end else begin
-                  // free-run continuation (reseed_en=0 -> keystream continues, a/e0
-                  // never repeat), OR legacy per-pass reload (freerun_en=0), OR a
-                  // non-sampling EXE. Same seed operand; only reseed_en differs.
-                  seed = (f_ps(op_w)==PS_A)  ? a_seed   :
-                         (f_ps(op_w)==PS_ERR)? err_seed : 64'd0;
-                  reseed_en <= ~ae_freerun;    // free-run pass => no reload
-                end
-                dina_low  <= seed[31:0];
-                dina_high <= seed[63:32];
-                control_low_word <= 32'd0;
-                st <= S_EXE_DINA;
-              end
+              // The sampler seed arrives on fhe_top's sideband; only the KEYGEN
+              // key-sampling pass reloads it. dina carries no seed.
+              reseed_en <= (f_ps(op_w) == PS_KG);
+              dina_low  <= 32'd0;
+              dina_high <= 32'd0;
+              control_low_word <= 32'd0;
+              st <= S_EXE_DINA;
             end
             OP_CONST: begin
               cur_bank <= f_bank(op_w); cur_ins <= 1'b0; cur_sk <= 1'b0;
@@ -803,7 +729,7 @@ module fhe_microseq
       endcase
     end else begin
       // Bus-facing event pulses must not stretch across held engine cycles.
-      done <= 1'b0; ext_dout_we <= 1'b0; reseed_ack <= 1'b0;
+      done <= 1'b0; ext_dout_we <= 1'b0;
     end
   end
 

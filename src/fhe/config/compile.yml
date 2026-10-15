@@ -13,6 +13,7 @@ targets:
       - $COMPILE_ROOT/rtl/fhe_mem_if.sv
       - $COMPILE_ROOT/rtl/fhe_mem_top.sv
       - $COMPILE_ROOT/rtl/fhe_ahb_slv_sif.sv
-      - $COMPILE_ROOT/rtl/fhe_ctrl.sv
+      - $COMPILE_ROOT/rtl/fhe_reg_pkg.sv
+      - $COMPILE_ROOT/rtl/fhe_reg.sv
       - $COMPILE_ROOT/rtl/fhe_top.sv
     tops: [fhe_top]

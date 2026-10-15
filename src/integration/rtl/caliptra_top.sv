@@ -58,17 +58,6 @@ module caliptra_top
     axi_if.w_mgr m_axi_w_if,
     axi_if.r_mgr m_axi_r_if,
 
-`ifdef FHE_WALKER
-    // Dedicated FHE DMA AXI manager (B' 2c-step-3a). 64-bit data, distinct from
-    // the 32-bit soc_ifc m_axi above (fhe_dma is fixed DW=64), so it gets its own
-    // top-level manager port rather than sharing/arbitrating onto m_axi. The
-    // wrapper attaches it to FBUS via a (deferred) Chisel TLClientNode; in the
-    // native caliptra_top_tb flow it is backed by a behavioral AXI DRAM model.
-    // Only present in the FHE_WALKER build (the SoC/stub build omits it entirely).
-    axi_if.w_mgr fhe_m_axi_w_if,
-    axi_if.r_mgr fhe_m_axi_r_if,
-`endif
-
     // Caliptra Memory Export Interface
     el2_mem_if.veer_sram_src           el2_mem_export,
 `ifndef CALIPTRA_NO_ADAMS_BRIDGE
@@ -1165,10 +1154,10 @@ abr_top #(
     assign responder_inst[`CALIPTRA_SLAVE_SEL_MLDSA].hrdata    = '0;
     // KeyVault tie-offs: ABR used kv_read[7:6], kv_read[2], kv_write[1]
     assign kv_read[7]  = '0;
+    assign kv_read[6]  = '0;
 `ifndef FHE_WALKER
-    assign kv_read[6]  = '0;   // C'-1b: driven by fhe_inst's KV seed reader when FHE_WALKER
+    assign kv_read[2]  = '0;   // driven by fhe_inst's KV seed reader when FHE_WALKER
 `endif
-    assign kv_read[2]  = '0;
     assign kv_write[1] = '0;
 `endif
 
@@ -1176,13 +1165,6 @@ abr_top #(
 fhe_top #(
     .AHB_DATA_WIDTH(`CALIPTRA_AHB_HDATA_SIZE),
     .AHB_ADDR_WIDTH(`CALIPTRA_SLAVE_ADDR_WIDTH(`CALIPTRA_SLAVE_SEL_FHE))
-`ifdef FHE_WALKER
-    // FHE DMA AXI manager geometry: matches the soc_ifc DMA manager's addr/id/user
-    // widths (data is fixed 64-bit inside fhe_dma).
-    , .FHE_AXI_AW(`CALIPTRA_AXI_DMA_ADDR_WIDTH)
-    , .FHE_AXI_UW(CPTRA_AXI_DMA_USER_WIDTH)
-    , .FHE_AXI_IW(CPTRA_AXI_DMA_ID_WIDTH)
-`endif
 ) fhe_inst (
      .clk               (clk_cg),
      .clock_live        (clk_cg_en),
@@ -1202,29 +1184,18 @@ fhe_top #(
      .notif_intr        (fhe_notif_intr),
      .fhe_memory_export (fhe_memory_export)
 `ifdef FHE_WALKER
-     // B' 2c-step-3a: the real datapath drives a dedicated FHE DMA AXI manager,
-     // brought straight up to the caliptra_top boundary (no merge with m_axi).
-     , .fhe_axi_r_if    (fhe_m_axi_r_if)
-     , .fhe_axi_w_if    (fhe_m_axi_w_if)
-     // C'-1b: KeyVault keygen-seed read. FHE claims kv_read[6] -- but only when
-     // Adams Bridge is compiled out (ABR owns [6] otherwise). With ABR present
-     // the FHE KV port is left idle and firmware must leave KGKV_CTRL.KV_EN=0.
+     // KeyVault seed read. FHE claims kv_read[2] (Adams Bridge's ML-DSA seed
+     // client) only when Adams Bridge is compiled out; with ABR present the FHE
+     // port is idle and every seed read fails, so KEYGEN is refused.
   `ifdef CALIPTRA_NO_ADAMS_BRIDGE
-     , .fhe_kv_read     (kv_read[6])
-     , .fhe_kv_rd_resp  (kv_rd_resp[6])
+     , .fhe_kv_read     (kv_read[2])
+     , .fhe_kv_rd_resp  (kv_rd_resp[2])
   `else
-     , .fhe_kv_read     (/* unconnected: kv_read[6] owned by Adams Bridge */)
-     , .fhe_kv_rd_resp  ('0)
+     , .fhe_kv_read     (/* unconnected: kv_read[2] owned by Adams Bridge */)
+     , .fhe_kv_rd_resp  ('{error: 1'b1, last: 1'b1, read_data: '0})
   `endif
      // C'-3: storage banks lifted to the top boundary (real SRAM attached there)
      , .fhe_aloha_mem   (fhe_aloha_memory_export)
-`else
-     // Stage-0/SoC stub: transitional ptr-indexed word-stream, tied idle.
-     , .fhe_dma_sel     (/* unconnected */)
-     , .fhe_dma_idx     (/* unconnected */)
-     , .fhe_dma_din     (64'd0)
-     , .fhe_dma_dout_we (/* unconnected */)
-     , .fhe_dma_dout    (/* unconnected */)
 `endif
 );
 `else

@@ -13,18 +13,15 @@
 // limitations under the License.
 //
 // Description:
-//   Stage-B' 2c-step-2 unit testbench: fhe_top with the REAL datapath AND the
-//   dedicated FHE DMA engine moving polynomials over a real AXI4 manager port.
-//   Built with +define+FHE_WALKER, so fhe_top instantiates fhe_microseq +
-//   ComputeCore + fhe_dma and exposes the AXI manager (fhe_axi_r_if/w_if).
+//   Unit testbench for fhe_top with register map v2 (docs/fhe/16 in the
+//   Chipyard checkout) and the real datapath (+define+FHE_WALKER).
 //
-//   The TB plays *firmware* (AHB writes: seeds/scales/CONFIG + the 4 DMA pointer
-//   registers + CMD) and backs the DMA's manager port with a small behavioral
-//   AXI4 subordinate DRAM model (TB-level array, so the plaintext can be
-//   preloaded and the recovered output read back directly). It runs
-//   keygen -> encrypt -> decrypt as three AHB commands, with the ciphertext
-//   round-tripping through actual AXI bursts to/from DRAM, and checks
-//   recovered ~= input. Seed/scale constants mirror the green 2b round-trip.
+//   The TB plays firmware: it provisions a modeled KeyVault entry, reads the
+//   160-bit seed through KV_RD_SEED_CTRL, writes CONFIG and the slot bases,
+//   issues commands, and services the firmware-forward stream (XFER_*) against
+//   a TB memory array. It checks keygen -> encrypt -> decrypt round trips,
+//   coefficient recovery, level refresh, single-seed stream behaviour and the
+//   command preconditions.
 //
 //   Run: tb/run_fhe_top_dma_tb.sh [LOGN]   (default LOGN=8 / N=256)
 //   Expect: "fhe_top_dma_tb RESULT: PASS".
@@ -32,7 +29,6 @@
 `timescale 1ns/1ps
 module fhe_top_dma_tb
   import fhe_params_pkg::*;
-  import axi_pkg::*;
   import kv_defines_pkg::*;   // C'-1b: KeyVault seed model types
 ;
   localparam int N    = FHE_N;
@@ -40,54 +36,48 @@ module fhe_top_dma_tb
   localparam int AHW  = 15;            // FHE 32KB AHB window -> 15-bit client address
   localparam int DW   = 64;
 
-  // AXI manager / DRAM model geometry (small so the SRAM array is TB-sized).
-  localparam int AXI_AW = 20;          // 1 MB DRAM model
-  localparam int AXI_UW = 32;
-  localparam int AXI_IW = 1;
-  localparam int DEPTH  = 1 << (AXI_AW - 3);   // 64-bit words
+  // Firmware memory model (1 MB of 64-bit words) for the forwarded stream.
+  localparam int MEM_AW = 20;
+  localparam int DEPTH  = 1 << (MEM_AW - 3);
 
-  // Poly-buffer layout in DRAM (byte addresses), >=2KB-aligned per the AXI
-  // chunking rule. STRIDE = max(N*8, 2KB).
+  // Poly-buffer layout (byte addresses). STRIDE = max(N*8, 2KB).
   localparam int STRIDE = (N*8 > 2048) ? N*8 : 2048;
   localparam int ADDR_P   = 0*STRIDE;  // plaintext
   localparam int ADDR_C0  = 1*STRIDE;  // ciphertext c0
   localparam int ADDR_C1  = (1+FHE_L)*STRIDE;  // ciphertext c1
   localparam int ADDR_OUT = (1+2*FHE_L)*STRIDE;  // recovered slots
 
-  // Register byte offsets (match fhe_top OFF_*).
-  localparam logic [AHW-1:0] A_CTRL     = 'h10;
-  localparam logic [AHW-1:0] A_STATUS   = 'h14;
-  localparam logic [AHW-1:0] A_CONFIG   = 'h30;
-  localparam logic [AHW-1:0] A_KGSEED0  = 'h34;
-  localparam logic [AHW-1:0] A_KGSEED1  = 'h38;
-  localparam logic [AHW-1:0] A_ASEED0   = 'h3C;
-  localparam logic [AHW-1:0] A_ASEED1   = 'h40;
-  localparam logic [AHW-1:0] A_ESEED0   = 'h44;
-  localparam logic [AHW-1:0] A_ESEED1   = 'h48;
-  localparam logic [AHW-1:0] A_KGSCALE  = 'h4C;
-  localparam logic [AHW-1:0] A_ENCSCALE = 'h50;
-  localparam logic [AHW-1:0] A_I2FSCALE = 'h54;
-  localparam logic [AHW-1:0] A_PTR0_LO  = 'h58;
-  localparam logic [AHW-1:0] A_PTR1_LO  = 'h60;
-  localparam logic [AHW-1:0] A_PTR2_LO  = 'h68;
-  localparam logic [AHW-1:0] A_PTR3_LO  = 'h70;
-  localparam logic [AHW-1:0] A_KGKV_CTRL = 'h78;   // C'-1b KeyVault seed ctrl
-  localparam logic [AHW-1:0] A_ENTSEED0  = 'h7C;   // C'-2 a/e0 stream seed [31:0]
-  localparam logic [AHW-1:0] A_ENTSEED1  = 'h80;   // C'-2 a/e0 stream seed [63:32]
-  localparam logic [AHW-1:0] A_RNG_CTRL  = 'h84;   // C'-2 bit0=FREERUN_EN bit1=RESEED_REQ
-  localparam logic [AHW-1:0] A_STREAM_STATUS = 'h88; // private stream (FHE_LOCAL_STREAM)
-  localparam logic [AHW-1:0] A_STREAM_LEFT   = 'h8C;
-  localparam logic [AHW-1:0] A_STREAM_DATA   = 'h90;
-  localparam logic [AHW-1:0] A_STREAM_CAP    = 'h94;
-  localparam logic [31:0]    CTRL_ZEROIZE    = 32'h8;
+  // Register byte offsets (register map v2).
+  localparam logic [AHW-1:0] A_CTRL        = 'h10;
+  localparam logic [AHW-1:0] A_STATUS      = 'h14;
+  localparam logic [AHW-1:0] A_CONFIG      = 'h18;
+  localparam logic [AHW-1:0] A_CAP         = 'h1C;
+  localparam logic [AHW-1:0] A_KV_CTRL     = 'h20;
+  localparam logic [AHW-1:0] A_KV_STATUS   = 'h24;
+  localparam logic [AHW-1:0] A_XFER_STATUS = 'h28;
+  localparam logic [AHW-1:0] A_XFER_LEFT   = 'h2C;
+  localparam logic [AHW-1:0] A_SLOT0       = 'h30;   // slot n at 0x30 + 8n
+  localparam logic [AHW-1:0] A_XFER_DATA   = 'h50;
+  localparam logic [31:0]    CTRL_ZEROIZE  = 32'h8;
+  // STATUS fields.
+  localparam int ST_READY = 0, ST_VALID = 1, ST_ERROR = 2, ST_KEY_VALID = 3;
+`ifdef FHE_FFT_ON_THE_FLY
+  localparam logic [31:0] CAP_EXPECTED = 32'(N) | (32'(FHE_L) << 16) | (32'd1 << 20) | (32'd1 << 25) | (32'd2 << 28);
+`else
+  localparam logic [31:0] CAP_EXPECTED = 32'(N) | (32'(FHE_L) << 16) | (32'd1 << 25) | (32'd2 << 28);
+`endif
   // Aloha limb moduli (profile 0xa108).
   localparam logic [63:0] Q_LIMB [2] = '{(64'd1<<46)-(64'd9<<24)+1, (64'd1<<47)-(64'd1<<24)+1};
 
   localparam int     RT_SCALE    = 17 + LOGN;
+  // The pre-reuse golden key was sampled from this 64-bit seed with IV 0, which
+  // is the 160-bit seed {96'b0, KEYGEN_SEED}.
   localparam longint KEYGEN_SEED = 64'hA105_BEEF_0006_A001;
-  localparam longint A_SEED      = 64'h0006_A002_C0FF_EE77;
-  localparam longint ERR_SEED    = 64'h2350_e171_5239_2f72;
-  localparam longint ENT_SEED    = 64'hC5A9_1234_FEED_0FF1;  // CSRNG-sourced a/e0 stream seed
+  localparam logic [159:0] SEED_A = {96'd0, KEYGEN_SEED};
+  localparam logic [159:0] SEED_B = 160'h0BADF00D_89ABCDEF_01234567_DEADBEEF_CAFEBABE;
+  // v1 per-pass ENCRYPT seeds used to capture the pre-reuse ciphertext golden.
+  localparam longint REPLAY_A_SEED   = 64'h0006_A002_C0FF_EE77;
+  localparam longint REPLAY_ERR_SEED = 64'h2350_e171_5239_2f72;
 
   // ------------------------------------------------------------------
   logic clk = 1'b0;
@@ -115,12 +105,8 @@ module fhe_top_dma_tb
 
   fhe_mem_if mem_if();
 
-  // AXI manager interface driven by fhe_top's FHE DMA, serviced by the TB sub.
-  axi_if #(.AW(AXI_AW), .DW(DW), .IW(AXI_IW), .UW(AXI_UW)) axi (.clk(clk), .rst_n(rst_b));
-
   fhe_top #(
-    .AHB_DATA_WIDTH(DW), .AHB_ADDR_WIDTH(AHW),
-    .FHE_AXI_AW(AXI_AW), .FHE_AXI_UW(AXI_UW), .FHE_AXI_IW(AXI_IW)
+    .AHB_DATA_WIDTH(DW), .AHB_ADDR_WIDTH(AHW)
   ) dut (
     .clock_live(parent_clock_live),
     .clk(parent_clk), .rst_b(rst_b),
@@ -129,10 +115,7 @@ module fhe_top_dma_tb
     .hresp_o(hresp), .hreadyout_o(hreadyout), .hrdata_o(hrdata),
     .busy_o(busy_o), .error_intr(error_intr), .notif_intr(notif_intr),
     .fhe_memory_export(mem_if),
-    .fhe_axi_r_if(axi), .fhe_axi_w_if(axi),
-    // C'-1b: KeyVault seed port. Default run leaves KGKV_CTRL.KV_EN=0 (AHB
-    // KGSEED register path); the +KVSEED run provisions dut_kv_* below and
-    // enables KV so the keygen root comes from the (modeled) KeyVault instead.
+    // KeyVault seed port, backed by the single-entry model below.
     .fhe_kv_read(dut_kv_read), .fhe_kv_rd_resp(dut_kv_rd_resp),
     // C'-3: Aloha ComputeCore storage banks lifted to the top; the TB supplies
     // them via the behavioral fhe_aloha_mem_top (real SRAM at the SoC level).
@@ -144,11 +127,10 @@ module fhe_top_dma_tb
 
   fhe_completion_checker completion_check (
     .clk(clk), .rst_b(rst_b), .zeroize(dut.zeroize),
-    .cmd_accept(dut.cmd_accept), .ready(dut.ready),
+    .cmd_accept(dut.cmd_write), .ready(dut.ready),
     .status_valid(dut.status_valid), .completions()
   );
 
-`ifdef FHE_LOCAL_STREAM
   // Match the full-SoC monitor's legal backpressure injection. Never suppress
   // ext_dout_we after issue: it is a registered beat and the walker advanced.
   bit input_stall_checked = 0, output_stall_checked = 0;
@@ -179,7 +161,6 @@ module fhe_top_dma_tb
       else $error("stream stall injections did not execute");
     $display("PASS legal input/output stream backpressure injection");
   end
-`endif
 
   // Banked resident keys are transformed in place and never written by
   // application commands. Count only final representation-conversion writes.
@@ -243,7 +224,7 @@ module fhe_top_dma_tb
     if ($value$plusargs("STATE_DUMP=%s", state_dump_dir)) begin
       fd=$fopen({state_dump_dir, keys ? "/key.hex" : "/ciphertext.hex"},"w");
       assert(fd!=0) else $fatal(1,"cannot open state dump");
-      for(int limb=0;limb<($test$plusargs("LIMBS2")?2:1);limb++)
+      for(int limb=0;limb<tb_limbs();limb++)
         for(int i=0;i<N;i++) begin
           if(keys) begin
             if(i%2==0) $fdisplay(fd,"%014h",u_aloha_mem.ntt_v0.mem[limb*(N/2)+i/2]);
@@ -291,114 +272,57 @@ module fhe_top_dma_tb
     end
   end
 
-  // ---- C'-1b: behavioral single-entry KeyVault model ----
-  localparam int    KV_ENTRY = 5;
+  // ---- Testbench-only v1 seed replay (no RTL support, nothing to synthesize) ----
+  // v1 reloaded the sampler on every ENCRYPT sampling pass from per-pass seeds
+  // (ERR_SEED for e0, A_SEED for each limb's a). Forcing the walker's reseed gate
+  // and the 160-bit seed (at its source register) reproduces that, so the pre-reuse ciphertext
+  // golden can still be checked bit-exact.
+  localparam logic [3:0] OP_EXE_CODE = 4'd5;
+  localparam logic [1:0] PS_A_CODE = 2'd2, PS_ERR_CODE = 2'd3;
+  bit replay_on = 0;
+  // Re-force constants every clock (a force with a changing expression is not
+  // re-evaluated by every simulator). The walker holds op_w for the whole EXE,
+  // and the sampler's reseed pulse comes several cycles after decode.
+  always @(posedge clk) begin
+    if (replay_on) begin
+      if (dut.walker.op_w[31:28] == OP_EXE_CODE && dut.walker.op_w[27:26] == PS_A_CODE) begin
+        force dut.i_fhe_kv_seed.seed_q = {96'd0, REPLAY_A_SEED};
+        force dut.w_reseed_en = 1'b1;
+      end else if (dut.walker.op_w[31:28] == OP_EXE_CODE && dut.walker.op_w[27:26] == PS_ERR_CODE) begin
+        force dut.i_fhe_kv_seed.seed_q = {96'd0, REPLAY_ERR_SEED};
+        force dut.w_reseed_en = 1'b1;
+      end else begin
+        force dut.w_reseed_en = 1'b0;
+      end
+    end
+  end
+  task automatic replay_v1_seeds(input bit on);
+    replay_on = on;
+    if (!on) begin
+      @(posedge clk); #1;
+      release dut.w_reseed_en;
+      // A released variable keeps the forced value until its next assignment;
+      // the following KeyVault read clears and reloads seed_q.
+      release dut.i_fhe_kv_seed.seed_q;
+    end
+  endtask
+
+  // ---- Behavioral single-entry KeyVault model (slot 9, the FHE seed slot) ----
+  localparam int    KV_ENTRY = 9;
   kv_read_t         dut_kv_read;
   kv_rd_resp_t      dut_kv_rd_resp;
   logic [31:0]      kv_ent [0:KV_NUM_DWORDS-1];
+  bit               kv_deny = 0;   // model a missing dest_valid / lock_use
   always_comb begin
     dut_kv_rd_resp.read_data = kv_ent[dut_kv_read.read_offset];
-    dut_kv_rd_resp.error     = 1'b0;   // authorization covered by fhe_kv_seed_tb
-    dut_kv_rd_resp.last      = (dut_kv_read.read_offset == KV_ENTRY_SIZE_W'(1));
+    dut_kv_rd_resp.error     = kv_deny || (dut_kv_read.read_entry != KV_ENTRY_ADDR_W'(KV_ENTRY));
+    dut_kv_rd_resp.last      = (dut_kv_read.read_offset == KV_ENTRY_SIZE_W'(4));
   end
 
   fhe_mem_top mem_inst (.clk_i(clk), .fhe_memory_export(mem_if));
 
-  // ------------------------------------------------------------------
-  // Behavioral AXI4 subordinate DRAM model (single outstanding; the FHE DMA
-  // serializes one <=256-beat burst at a time). TB-level array for preload/peek.
-  // ------------------------------------------------------------------
+  // Firmware memory: plaintext, ciphertext and output buffers.
   logic [63:0] dram [0:DEPTH-1];
-
-  // read channel
-  typedef enum logic {R_IDLE, R_DATA} r_st_e;
-  r_st_e         rst_q;
-  logic [AXI_AW-4:0] r_word;   // word index
-  logic [8:0]    r_rem;        // beats remaining (arlen+1, up to 256)
-
-  // write channel
-  typedef enum logic [1:0] {W_IDLE, W_DATA, W_RESP} w_st_e;
-  w_st_e         wst_q;
-  logic [AXI_AW-4:0] w_word;
-
-  always_ff @(posedge clk or negedge rst_b) begin
-    if (!rst_b) begin
-      rst_q <= R_IDLE; r_word <= '0; r_rem <= '0;
-      axi.arready <= 1'b0; axi.rvalid <= 1'b0; axi.rlast <= 1'b0;
-      axi.rdata <= '0; axi.rresp <= '0; axi.rid <= '0; axi.ruser <= '0;
-      wst_q <= W_IDLE; w_word <= '0;
-      axi.awready <= 1'b0; axi.wready <= 1'b0;
-      axi.bvalid <= 1'b0; axi.bresp <= '0; axi.bid <= '0; axi.buser <= '0;
-    end else begin
-      // -------- read --------
-      unique case (rst_q)
-        R_IDLE: begin
-          axi.rvalid <= 1'b0; axi.rlast <= 1'b0;
-          axi.arready <= 1'b1;
-          if (axi.arvalid && axi.arready) begin
-            axi.arready <= 1'b0;
-            r_word <= axi.araddr[AXI_AW-1:3];
-            r_rem  <= {1'b0, axi.arlen} + 9'd1;
-            rst_q  <= R_DATA;
-          end
-        end
-        R_DATA: begin
-          // Present the current beat; advance only when it is accepted.
-          axi.rvalid <= 1'b1;
-          axi.rdata  <= dram[r_word];
-          axi.rresp  <= '0;
-          axi.rlast  <= (r_rem == 9'd1);
-          if (axi.rvalid && axi.rready) begin
-            if (r_rem == 9'd1) begin
-              axi.rvalid <= 1'b0;
-              axi.rlast  <= 1'b0;
-              rst_q      <= R_IDLE;
-            end else begin
-              r_word    <= r_word + 1'b1;
-              r_rem     <= r_rem - 1'b1;
-              axi.rdata <= dram[r_word + 1'b1];
-              axi.rlast <= (r_rem == 9'd2);
-            end
-          end
-        end
-        default: rst_q <= R_IDLE;
-      endcase
-
-      // -------- write --------
-      unique case (wst_q)
-        W_IDLE: begin
-          axi.bvalid <= 1'b0;
-          axi.wready <= 1'b0;
-          axi.awready <= 1'b1;
-          if (axi.awvalid && axi.awready) begin
-            axi.awready <= 1'b0;
-            w_word <= axi.awaddr[AXI_AW-1:3];
-            wst_q  <= W_DATA;
-          end
-        end
-        W_DATA: begin
-          axi.wready <= 1'b1;
-          if (axi.wvalid && axi.wready) begin
-            dram[w_word] <= axi.wdata;
-            w_word <= w_word + 1'b1;
-            if (axi.wlast) begin
-              axi.wready <= 1'b0;
-              wst_q <= W_RESP;
-            end
-          end
-        end
-        W_RESP: begin
-          axi.bvalid <= 1'b1;
-          axi.bresp  <= '0;
-          if (axi.bvalid && axi.bready) begin
-            axi.bvalid <= 1'b0;
-            wst_q <= W_IDLE;
-          end
-        end
-        default: wst_q <= W_IDLE;
-      endcase
-    end
-  end
 
   // ------------------------------------------------------------------
   int notif_count;
@@ -409,6 +333,7 @@ module fhe_top_dma_tb
   int    errors = 0;
   string tvdir;
   longint g_input [0:N];
+  logic [63:0] first_a [0:N-1];   // c1 (= uniform a, limb 0) of the first ENCRYPT after KEYGEN
   real   fft_abs_floor = 1.0e-4;
 
   // AHB-Lite single 32-bit register access. The data phase (and HWDATA) is
@@ -459,12 +384,56 @@ module fhe_top_dma_tb
     end
   end
 
-  // write a 64-bit DMA pointer register (lo @ a, hi @ a+4)
+  // write a 64-bit register pair (lo @ a, hi @ a+4)
   task automatic ahb_write64(input logic [AHW-1:0] a, input logic [63:0] v);
     begin ahb_write(a, v[31:0]); ahb_write(a + 'h4, v[63:32]); end
   endtask
 
-`ifdef FHE_LOCAL_STREAM
+  // Slot base addresses: firmware's copy, used to service the stream.
+  logic [63:0] slot_base [0:3];
+  task automatic set_slot(input int slot, input logic [63:0] base);
+    slot_base[slot] = base;
+    ahb_write64(A_SLOT0 + AHW'(8*slot), base);
+  endtask
+  // ENCRYPT: message in slot 0, c0/c1 out in slots 2/3.
+  task automatic enc_slots();
+    set_slot(0, 64'(ADDR_P)); set_slot(2, 64'(ADDR_C0)); set_slot(3, 64'(ADDR_C1));
+  endtask
+  // DECRYPT: c0/c1 in slots 0/1, decoded slots out in slot 2.
+  task automatic dec_slots();
+    set_slot(0, 64'(ADDR_C0)); set_slot(1, 64'(ADDR_C1)); set_slot(2, 64'(ADDR_OUT));
+  endtask
+  function automatic int tb_limbs();
+    return $test$plusargs("LIMBS2") ? 2 : 1;
+  endfunction
+
+  // CONFIG = {SCALE[27:16], LOGN[7:4], L[3:0]}; LOGN defaults to the built value.
+  task automatic cfg(input int l, input logic [11:0] scale, input int logn = LOGN);
+    ahb_write(A_CONFIG, {4'd0, scale, 8'd0, 4'(logn), 4'(l)});
+  endtask
+
+  // Provision the KeyVault model and read the seed through KV_RD_SEED_CTRL.
+  task automatic provision_kv(input logic [159:0] seed);
+    for (int i = 0; i < KV_NUM_DWORDS; i++) kv_ent[i] = (i < 5) ? seed[32*i +: 32] : 32'd0;
+  endtask
+  task automatic kv_seed_read(input int entry, output logic [7:0] kv_err);
+    logic [31:0] d;
+    int guard = 0;
+    ahb_write(A_KV_CTRL, {26'd0, 5'(entry), 1'b1});
+    do begin ahb_read(A_KV_STATUS, d); guard++; end while (!(d[0] && d[1]) && guard < 1000);
+    if (!(d[0] && d[1])) begin $display("FAIL: KeyVault seed read never completed"); errors++; end
+    kv_err = d[9:2];
+  endtask
+  task automatic load_seed(input logic [159:0] seed);
+    logic [7:0] kv_err;
+    provision_kv(seed);
+    kv_seed_read(KV_ENTRY, kv_err);
+    if (kv_err != 0) begin $display("FAIL: KeyVault seed read error %0d", kv_err); errors++; end
+    if (dut.kv_seed !== seed) begin
+      $display("FAIL: fhe_kv_seed holds %h, expected %h", dut.kv_seed, seed); errors++;
+    end
+  endtask
+
   // Directed bus-level checks of the private stream while the walker is idle.
   // Illegal DATA accesses must return ERROR without changing stream state.
   // The race case forces a walker push into the first ERROR cycle: the access
@@ -477,20 +446,20 @@ module fhe_top_dma_tb
     logic [31:0] d, lo, hi;
     bit err;
     int start_errors = errors;
-    ahb_read(A_STREAM_CAP, d);
-    stream_check(d == (32'h80000000 | N), $sformatf("CAP=0x%08h", d));
-    ahb_access(1'b0, A_STREAM_DATA, '0, d, err);
+    ahb_read(A_CAP, d);
+    stream_check(d == CAP_EXPECTED, $sformatf("CAP=0x%08h expected 0x%08h", d, CAP_EXPECTED));
+    ahb_access(1'b0, A_XFER_DATA, '0, d, err);
     stream_check(err, "idle DATA read accepted");
-    ahb_access(1'b1, A_STREAM_DATA, 32'h1234_5678, d, err);
+    ahb_access(1'b1, A_XFER_DATA, 32'h1234_5678, d, err);
     stream_check(err, "idle DATA write accepted");
-    ahb_read(A_STREAM_STATUS, d);
+    ahb_read(A_XFER_STATUS, d);
     stream_check(d == 0, $sformatf("rejected access changed STATUS=0x%08h", d));
     // Keep the next address valid through ERROR completion: no idle bubble
     // between the rejected transfers. Exercise both read and write errors,
     // followed immediately by a legal CAP read to check recovery.
     for (int write_access = 0; write_access < 2; write_access++) begin
       @(negedge clk);
-      hsel = 1; htrans = 2'b10; haddr = A_STREAM_DATA;
+      hsel = 1; htrans = 2'b10; haddr = A_XFER_DATA;
       hwrite = 1'(write_access); hsize = 3'b010; hwdata = 64'h1234_5678;
       @(negedge clk);
       stream_check(hresp && !hreadyout, "first access skipped ERROR wait cycle");
@@ -498,17 +467,17 @@ module fhe_top_dma_tb
       stream_check(hresp && hreadyout, "first ERROR did not complete");
       @(negedge clk);
       stream_check(hresp && !hreadyout, "back-to-back access skipped ERROR wait cycle");
-      haddr = A_STREAM_CAP; hwrite = 0;
+      haddr = A_CAP; hwrite = 0;
       @(negedge clk);
       stream_check(hresp && hreadyout, "second ERROR did not complete");
       @(negedge clk);
       stream_check(!hresp && hreadyout, "legal access after ERROR did not complete OKAY");
-      stream_check(hrdata[63:32] == (32'h80000000 | N), "CAP read after ERROR returned wrong data");
+      stream_check(hrdata[63:32] == CAP_EXPECTED, "CAP read after ERROR returned wrong data");
       hsel = 0; htrans = 0; hwdata = 0;
       @(negedge clk);
       stream_check(!hresp && hreadyout, "spurious ERROR after final access");
     end
-    ahb_read(A_STREAM_STATUS, d);
+    ahb_read(A_XFER_STATUS, d);
     stream_check(d == 0, "back-to-back errors changed stream state");
     // Open an output descriptor without running the walker.
     @(negedge clk);
@@ -517,7 +486,7 @@ module fhe_top_dma_tb
     @(negedge clk);
     release dut.w_desc_valid; release dut.w_desc_wr; release dut.w_desc_ptr; release dut.w_desc_limb;
     fork
-      ahb_access(1'b0, A_STREAM_DATA, '0, d, err);
+      ahb_access(1'b0, A_XFER_DATA, '0, d, err);
       begin
         @(negedge clk); @(posedge clk); #1;   // data phase, first ERROR cycle
         force dut.w_wr_push = 1'b1; force dut.w_wr_data = 64'hfeed_beef_0bad_cafe;
@@ -526,73 +495,86 @@ module fhe_top_dma_tb
       end
     join
     stream_check(err, "DATA read completed after its ERROR cycle");
-    ahb_read(A_STREAM_STATUS, d);
+    ahb_read(A_XFER_STATUS, d);
     stream_check(d[3:0] == 4'b1011 && !d[12], $sformatf("race changed STATUS=0x%08h", d));
-    ahb_read(A_STREAM_DATA, lo); ahb_read(A_STREAM_DATA, hi);
+    ahb_read(A_XFER_DATA, lo); ahb_read(A_XFER_DATA, hi);
     stream_check({hi, lo} == 64'hfeed_beef_0bad_cafe, $sformatf("word=0x%08h%08h", hi, lo));
-    ahb_read(A_STREAM_LEFT, d);
+    ahb_read(A_XFER_LEFT, d);
     stream_check(d == N-1, $sformatf("LEFT=%0d after one word", d));
     ahb_write(A_CTRL, CTRL_ZEROIZE);   // discards the open descriptor
-    ahb_read(A_STREAM_STATUS, d);
+    ahb_read(A_XFER_STATUS, d);
     stream_check(d == 0, $sformatf("ZEROIZE left STATUS=0x%08h", d));
     if (errors == start_errors) $display("PASS local-stream AHB errors, back-to-back errors/recovery, error-cycle race, ZEROIZE");
   endtask
-`endif
 
   // Firmware model: private memory <-> AHB stream, no FHE AXI traffic.
   task automatic service_local_stream();
-`ifdef FHE_LOCAL_STREAM
     logic [31:0] status, left, lo, hi;
     int idx;
-    ahb_read(A_STREAM_STATUS, status);
+    ahb_read(A_XFER_STATUS, status);
     if (status[2] || status[3]) begin   // input ready / output valid (both imply active)
-      ahb_read(A_STREAM_LEFT, left);
-      idx = int'(dut.dma_ptr[status[6:4]]/8) + int'(status[11:8])*N + N-int'(left);
+      ahb_read(A_XFER_LEFT, left);
+      idx = int'(slot_base[status[6:4]]/8) + int'(status[11:8])*N + N-int'(left);
       if (status[1]) begin
-        ahb_read(A_STREAM_DATA, lo); ahb_read(A_STREAM_DATA, hi);
+        ahb_read(A_XFER_DATA, lo); ahb_read(A_XFER_DATA, hi);
         dram[idx] = {hi,lo};
       end else begin
-        ahb_write(A_STREAM_DATA, dram[idx][31:0]); ahb_write(A_STREAM_DATA, dram[idx][63:32]);
+        ahb_write(A_XFER_DATA, dram[idx][31:0]); ahb_write(A_XFER_DATA, dram[idx][63:32]);
       end
     end
-`else
-    @(posedge clk);
-`endif
   endtask
-`ifdef FHE_LOCAL_STREAM
-  always @(posedge clk) if (rst_b)
-    assert (!axi.arvalid && !axi.awvalid && !axi.wvalid)
-      else $fatal(1, "private stream leaked external AXI request");
-`endif
 
   task automatic run_cmd(input fhe_cmd_e c, input string nm);
     int base, guard;
     base = notif_count;
     ahb_write(A_CTRL, {29'd0, c});
-    cpu_sleep = 1; // parent must stay awake through DMA and completion delivery
+    cpu_sleep = 1; // parent must stay awake through the stream and completion delivery
     guard = 0;
     while ((notif_count == base) && (guard < 50_000_000)) begin service_local_stream(); guard++; end
     if (notif_count == base) begin $display("  FAIL: %s never completed (timeout)", nm); errors++; end
-    else                          $display("  [dma] %s done (%0d polling iterations)", nm, guard);
+    else                          $display("  [fhe] %s done (%0d polling iterations)", nm, guard);
     @(negedge clk);
     cpu_sleep = 0;
+    begin
+      logic [31:0] st;
+      ahb_read(A_STATUS, st);
+      if (st[ST_ERROR]) begin
+        $display("  FAIL: %s completed with ERROR cause %0d", nm, st[7:4]); errors++;
+      end
+    end
   endtask
 
-  // C'-2 free-run helpers ------------------------------------------------------
-  // read N words from DRAM at `base` (e.g. the ciphertext c1 = uniform `a`, or the
-  // recovered OUT slots) into dst.
+  // Issue a command expected to be refused, and check the reported cause.
+  task automatic expect_reject(input logic [2:0] c, input logic [3:0] cause, input string nm);
+    logic [31:0] st;
+    int guard = 0;
+    ahb_write(A_CTRL, {29'd0, c});
+    do begin ahb_read(A_STATUS, st); guard++; end while (!(st[ST_READY] && st[ST_VALID]) && guard < 1000);
+    if (st[ST_ERROR] && st[7:4] == cause) $display("PASS precondition: %s -> ERROR cause %0d", nm, cause);
+    else begin
+      $display("FAIL precondition: %s -> STATUS 0x%08h, expected ERROR cause %0d", nm, st, cause); errors++;
+    end
+  endtask
+
+  // Read N words of firmware memory at `base` (e.g. the ciphertext c1 = uniform
+  // `a`, or the recovered OUT slots) into dst.
   task automatic capture_slots(ref longint dst [], input int base);
     for (int i = 0; i < N; i++) dst[i] = dram[(base/8) + i];
   endtask
-  function automatic int diff_count(ref longint x [], ref longint y []);
-    diff_count = 0;
-    for (int i = 0; i < N; i++) if (x[i] !== y[i]) diff_count++;
-  endfunction
-  // firmware doorbell: write the CSRNG-sourced ENTSEED + assert RESEED_REQ.
-  task automatic doorbell(input longint s);
-    ahb_write64(A_ENTSEED0, s);
-    ahb_write(A_RNG_CTRL, 32'h3);                  // FREERUN_EN=1, RESEED_REQ=1
+
+  // Resident key snapshot, to compare a later KEYGEN against.
+  logic [53:0] key0 [0:N*FHE_L/2-1], key1 [0:N*FHE_L/2-1];
+  task automatic save_key();
+    for (int i = 0; i < N*FHE_L/2; i++) begin
+      key0[i] = u_aloha_mem.ntt_v0.mem[i];
+      key1[i] = u_aloha_mem.ntt_v1.mem[i];
+    end
   endtask
+  function automatic int key_diff();
+    key_diff = 0;
+    for (int i = 0; i < N*FHE_L/2; i++)
+      if (u_aloha_mem.ntt_v0.mem[i] !== key0[i] || u_aloha_mem.ntt_v1.mem[i] !== key1[i]) key_diff++;
+  endfunction
 
   function automatic bit close(input longint ab, input longint bb, input real eps);
     real a = $bitstoreal(ab);
@@ -625,6 +607,9 @@ module fhe_top_dma_tb
     else        $display("PASS %s (%0d doubles, relative tolerance=%g, absolute floor=%g)", name, ndbl, eps, fft_abs_floor);
   endtask
 
+  int          rns_scale;
+  logic [31:0] i2f_val;
+
   // Independent public integer evaluator: scalar multiply/add only, using
   // unbounded-domain model weights and canonical modular reduction per term.
   // An encrypted constant-one channel supplies bias without assuming an NTT
@@ -640,15 +625,11 @@ module fhe_top_dma_tb
     foreach (acc[i]) acc[i] = 0;
     $readmemh({directory, "/weights.mem"}, weights);
     $readmemh({directory, "/expected.mem"}, expected);
-    ahb_write(A_CONFIG, 2);
-    ahb_write(A_RNG_CTRL, 1);
+    cfg(2, 12'(rns_scale));
     for (int feature_idx=0; feature_idx<197; feature_idx++) begin
       $readmemh($sformatf("%s/input_%03d.mem", directory, feature_idx), slots);
       for (int i=0;i<N;i++) dram[ADDR_P/8+i] = slots[i];
-      ahb_write64(A_PTR0_LO, 64'(ADDR_P));
-      ahb_write64(A_PTR2_LO, 64'(ADDR_C0));
-      ahb_write64(A_PTR3_LO, 64'(ADDR_C1));
-      doorbell(ENT_SEED + 64'(feature_idx));
+      enc_slots();
       run_cmd(FHE_ENCRYPT, $sformatf("MNIST ingress %0d", feature_idx));
       for (int k=0;k<10;k++) begin
         weight = int'(weights[k*197+feature_idx]);
@@ -672,9 +653,8 @@ module fhe_top_dma_tb
         dram[ADDR_C0/8+i] = acc[k*4*N+i];
         dram[ADDR_C1/8+i] = acc[k*4*N+2*N+i];
       end
-      ahb_write64(A_PTR0_LO, 64'(ADDR_C0));
-      ahb_write64(A_PTR1_LO, 64'(ADDR_C1));
-      ahb_write64(A_PTR2_LO, 64'(ADDR_OUT));
+      cfg(2, 12'(i2f_val));
+      dec_slots();
       run_cmd(FHE_DECRYPT, $sformatf("MNIST egress %0d",k));
       for (int image_idx=0;image_idx<2;image_idx++) begin
         error = $bitstoreal(dram[ADDR_OUT/8+2*image_idx]) - $bitstoreal(expected[image_idx*10+k]);
@@ -689,11 +669,9 @@ module fhe_top_dma_tb
       end
     end
     $display("MNIST two-image max absolute logit error=%g", max_error);
+    cfg(2, 12'(rns_scale));
   endtask
 
-  // ------------------------------------------------------------------
-  int          rns_scale;
-  logic [31:0] i2f_val;
 
   initial begin
     if (!$value$plusargs("TVDIR=%s", tvdir)) tvdir = ".";
@@ -717,12 +695,11 @@ module fhe_top_dma_tb
         count = $fscanf(32'h80000000, "%d %h %h", op, addr, value);
         if (count != 3) $finish;
         else begin
-`ifdef FHE_LOCAL_STREAM
           // Cancel once, at a firmware status read between coefficient pairs.
           // Use a real CSR write so the regression covers actual ZEROIZE
           // semantics, without racing an in-flight STREAM_DATA bus access.
           if ($test$plusargs("RPC_ZEROIZE_REFRESH") && !refresh_aborted &&
-              op == 0 && addr == A_STREAM_STATUS && dut.cmd_q == FHE_REFRESH &&
+              op == 0 && addr == A_XFER_STATUS && dut.cmd_q == FHE_REFRESH &&
               dut.i_local_stream.active && !dut.i_local_stream.direction &&
               dut.i_local_stream.left < N && !dut.i_local_stream.half) begin
             ahb_write(A_CTRL, 32'h8);
@@ -739,7 +716,6 @@ module fhe_top_dma_tb
                 $fatal(1, "firmware kept polling idle aborted refresh without completion");
             end
           end
-`endif
           // Reply "RPC <read data> <1 if AHB ERROR>"; the emulator raises a
           // load/store access fault for an ERROR response.
           ahb_access(op == 1, addr, value, rdata, err);
@@ -750,9 +726,7 @@ module fhe_top_dma_tb
       end
     end
 
-`ifdef FHE_LOCAL_STREAM
     check_local_stream_bus();
-`endif
 
     // Pause the parent clock in each idle phase while lifted SRAMs continue
     // to receive base-clock edges. No repeated requests/response shifts allowed.
@@ -774,77 +748,75 @@ module fhe_top_dma_tb
     end
     $display("PASS idle parent-clock pause/resume in all three phases");
 
-    $display("== Stage-B' 2c-step-2: fhe_top + FHE DMA round-trip (AXI), N=%0d ==", N);
+    $display("== fhe_top register map v2 round trip (firmware-forward stream), N=%0d ==", N);
 
-    // plaintext -> DRAM (the ENCRYPT DMA_IN source @ PTR0)
+    // plaintext -> firmware memory (ENCRYPT slot 0 source)
     $readmemh({tvdir, "/input.txt"}, g_input);
     for (int i = 0; i < N; i++) dram[(ADDR_P/8) + i] = g_input[i];
 
-    // ---- firmware: seeds + scales + CONFIG.L ----
-    // C'-1b: in +KVSEED mode the keygen root comes from the KeyVault. Provision
-    // the KV entry with the correct seed, enable KGKV_CTRL, and deliberately
-    // write the WRONG value to the AHB KGSEED regs. (The sk-scheme round-trip
-    // cancels for ANY key blob -- Rung-6 fact -- so recovery alone can't prove
-    // the source; the decisive check is the hierarchical assert on the walker's
-    // effective keygen seed after KEYGEN, below.)
-    if ($test$plusargs("KVSEED")) begin
-      kv_ent[0] = KEYGEN_SEED[31:0];
-      kv_ent[1] = KEYGEN_SEED[63:32];
-      ahb_write(A_KGKV_CTRL, {23'd0, 5'(KV_ENTRY), 3'd0, 1'b1}); // entry, KV_EN=1
-      ahb_write(A_KGSEED0, 32'hDEAD_0000); ahb_write(A_KGSEED1, 32'h0000_BEEF); // wrong on purpose
-      $display("  [dma] +KVSEED: keygen seed sourced from KeyVault entry %0d", KV_ENTRY);
-    end else begin
-      ahb_write(A_KGSEED0, KEYGEN_SEED[31:0]); ahb_write(A_KGSEED1, KEYGEN_SEED[63:32]);
-    end
-    ahb_write(A_ASEED0,  A_SEED[31:0]);      ahb_write(A_ASEED1,  A_SEED[63:32]);
-    ahb_write(A_ESEED0,  ERR_SEED[31:0]);    ahb_write(A_ESEED1,  ERR_SEED[63:32]);
     rns_scale = RT_SCALE - 52 - 1023 - LOGN; if (rns_scale < 0) rns_scale += 4096;
     i2f_val   = -RT_SCALE;
-    ahb_write(A_KGSCALE,  rns_scale[31:0]);
-    ahb_write(A_ENCSCALE, rns_scale[31:0]);
-    ahb_write(A_I2FSCALE, i2f_val);
-    ahb_write(A_CONFIG, $test$plusargs("LIMBS2") ? 32'd2 : 32'd1);
 
-    // ---- KEYGEN (no DMA) ----
+    begin
+      logic [31:0] d;
+      ahb_read(A_CAP, d);
+      if (d != CAP_EXPECTED) begin $display("FAIL: CAP=0x%08h expected 0x%08h", d, CAP_EXPECTED); errors++; end
+      ahb_read(A_STATUS, d);
+      if (!d[ST_READY] || d[ST_KEY_VALID]) begin $display("FAIL: reset STATUS=0x%08h", d); errors++; end
+    end
+
+    // ---- firmware: KeyVault seed, then KEYGEN ----
+    load_seed(SEED_A);
+    cfg(2, 12'(rns_scale));
     run_cmd(FHE_KEYGEN, "KEYGEN");
     dump_state(1);
     check_baseline(1);
-
-    // C'-1b decisive check: the walker's effective keygen seed must equal the
-    // KeyVault-provisioned value (NOT the deliberately-wrong KGSEED registers).
-    if ($test$plusargs("KVSEED")) begin
-      if (dut.kg_seed_eff !== KEYGEN_SEED) begin
-        $display("FAIL[KVSEED]: kg_seed_eff=%h expected %h (KV seed did not reach walker)",
-                 dut.kg_seed_eff, KEYGEN_SEED);
-        errors++;
-      end else begin
-        $display("  [dma] +KVSEED: walker keygen seed = %h (from KeyVault) OK", dut.kg_seed_eff);
-      end
+    begin
+      logic [31:0] d;
+      ahb_read(A_STATUS, d);
+      if (!d[ST_KEY_VALID]) begin $display("FAIL: KEY_VALID not set after KEYGEN"); errors++; end
+      ahb_read(A_KV_STATUS, d);
+      if (d[1]) begin $display("FAIL: seed still valid after KEYGEN consumed it"); errors++; end
+      if (dut.kv_seed !== '0) begin $display("FAIL: seed copy not wiped after KEYGEN"); errors++; end
     end
 
-    for (int limb=0; limb < ($test$plusargs("LIMBS2") ? 2 : 1); limb++) begin
+    // KEYGEN always fills every installed limb.
+    for (int limb=0; limb < FHE_L; limb++) begin
       assert (key_writes[limb] == N)
         else $fatal(1, "key limb %0d: expected %0d writes, got %0d", limb, N, key_writes[limb]);
     end
 
-    // ---- ENCRYPT: msg<-PTR0(P), c0->PTR2(C0), c1->PTR3(C1) ----
-    ahb_write64(A_PTR0_LO, 64'(ADDR_P));
-    ahb_write64(A_PTR2_LO, 64'(ADDR_C0));
-    ahb_write64(A_PTR3_LO, 64'(ADDR_C1));
-    run_cmd(FHE_ENCRYPT, "ENCRYPT");
-    dump_state(0);
+    // ---- ENCRYPT: msg <- slot 0, c0 -> slot 2, c1 -> slot 3 ----
+    cfg(tb_limbs(), 12'(rns_scale));
+    enc_slots();
+    begin
+      string golden;
+      if ($value$plusargs("GOLDEN_DIR=%s", golden) || $test$plusargs("STATE_DUMP")) begin
+        // Replay v1's per-pass seeds for one ENCRYPT, check the pre-reuse
+        // ciphertext golden, then re-run KEYGEN so the key's own stream restarts.
+        replay_v1_seeds(1);
+        run_cmd(FHE_ENCRYPT, "ENCRYPT (testbench v1 seed replay)");
+        replay_v1_seeds(0);
+        dump_state(0);
 `ifndef FHE_FFT_ON_THE_FLY
-    check_baseline(0); // floating recurrence can change rounded ciphertext values
+        check_baseline(0); // floating recurrence can change rounded ciphertext values
 `endif
-    for (int limb=0; limb < ($test$plusargs("LIMBS2") ? 2 : 1); limb++) begin
+        load_seed(SEED_A);
+        cfg(2, 12'(rns_scale));
+        run_cmd(FHE_KEYGEN, "KEYGEN (restart stream after replay)");
+        cfg(tb_limbs(), 12'(rns_scale));
+      end
+    end
+    run_cmd(FHE_ENCRYPT, "ENCRYPT");
+    for (int i = 0; i < N; i++) first_a[i] = dram[ADDR_C1/8 + i];
+    for (int limb=0; limb < tb_limbs(); limb++) begin
       assert (key_reads[limb] >= N)
         else $fatal(1, "key limb %0d: expected %0d reads, got %0d", limb, N, key_reads[limb]);
     end
 
-    // ---- DECRYPT: c0<-PTR0(C0), c1<-PTR1(C1), out->PTR2(OUT) ----
-    ahb_write64(A_PTR0_LO, 64'(ADDR_C0));
-    ahb_write64(A_PTR1_LO, 64'(ADDR_C1));
-    ahb_write64(A_PTR2_LO, 64'(ADDR_OUT));
+    // ---- DECRYPT: c0 <- slot 0, c1 <- slot 1, slots -> slot 2 ----
+    cfg(tb_limbs(), 12'(i2f_val));
+    dec_slots();
     run_cmd(FHE_DECRYPT, "DECRYPT");
 
     // recovered slots read back from DRAM @ OUT
@@ -852,7 +824,7 @@ module fhe_top_dma_tb
       longint reco [];
       reco = new[N];
       capture_slots(reco, ADDR_OUT);
-      check_fft(reco, g_input, N, "fhe_top+DMA round-trip (recovered vs input)", 1.0e-3);
+      check_fft(reco, g_input, N, "fhe_top round-trip (recovered vs input)", 1.0e-3);
     end
 
 `ifdef FHE_FFT_ON_THE_FLY
@@ -888,13 +860,14 @@ module fhe_top_dma_tb
       int limbs;
       string recovery_dir;
       logic [63:0] reference_ntt [0:2*N-1], reference_coeff [0:2*N-1];
-      limbs = $test$plusargs("LIMBS2") ? 2 : 1;
+      limbs = tb_limbs();
       q[0] = (64'd1 << 46) - (64'd9 << 24) + 1;
       q[1] = (64'd1 << 47) - (64'd1 << 24) + 1;
       for (int i=0;i<limbs*N;i++) begin
         saved_c0[i] = dram[ADDR_C0/8+i];
         saved_c1[i] = dram[ADDR_C1/8+i];
       end
+      cfg(limbs, 12'(rns_scale));
       run_cmd(FHE_RECOVER, "RECOVER encrypted coefficients");
       for (int i=0;i<N;i++) begin
         assert (dram[ADDR_OUT/8+i] < q[0]) else $fatal(1,"noncanonical recovery limb 0");
@@ -943,13 +916,13 @@ module fhe_top_dma_tb
       for (int invalid=0;invalid<2;invalid++) begin
         logic [31:0] status;
         int guard;
-        ahb_write(A_CONFIG, invalid == 0 ? 0 : FHE_L+1);
+        cfg(invalid == 0 ? 0 : FHE_L+1, 12'(rns_scale));
         ahb_write(A_CTRL, 32'(command_case == 0 ? FHE_RECOVER : FHE_REFRESH));
         guard=0;
-        do begin ahb_read('h14,status); guard++; end while (!(status[0] && status[1]) && guard<1000);
-        assert (status[0] && status[3]) else $fatal(1,"invalid recovery limb count accepted");
+        do begin ahb_read(A_STATUS,status); guard++; end while (!(status[ST_READY] && status[ST_VALID]) && guard<1000);
+        assert (status[ST_READY] && status[ST_ERROR] && status[7:4] == FHE_EC_BAD_L) else $fatal(1,"invalid recovery limb count accepted");
       end
-      ahb_write(A_CONFIG, limbs);
+      cfg(limbs, 12'(rns_scale));
       // Rejection must leave the controller usable without destroying the key.
       run_cmd(FHE_RECOVER, "RECOVER after invalid count");
       $display("PASS coefficient recovery: encrypted input and signed constant polynomials, %0d limbs, no floating decode",limbs);
@@ -964,14 +937,11 @@ module fhe_top_dma_tb
       longint unsigned q [0:1];
       longint signed got, delta;
       int limbs, changed;
-      limbs = $test$plusargs("LIMBS2") ? 2 : 1;
+      limbs = tb_limbs();
       q[0]=64'd70368593182721; q[1]=64'd140737471578113;
       for (int i=0;i<limbs*N;i++) begin
         original0[i]=dram[ADDR_C0/8+i]; original1[i]=dram[ADDR_C1/8+i];
       end
-      ahb_write(A_RNG_CTRL, 1);
-      ahb_write64(A_ENTSEED0,64'h123456789abcdef0);
-      ahb_write(A_RNG_CTRL, 3);
       // Real ciphertext, then known positive/negative/center-boundary constants.
       for (int trial=0;trial<6;trial++) begin
         if (trial>=2) begin
@@ -986,14 +956,14 @@ module fhe_top_dma_tb
             dram[ADDR_C0/8+i]=c; dram[ADDR_C1/8+i]=0;
           end
         end
-        ahb_write64(A_PTR2_LO,64'(ADDR_OUT));
-        ahb_write(A_CONFIG,1);
+        set_slot(2,64'(ADDR_OUT));
+        cfg(1, 12'(rns_scale));
         run_cmd(FHE_RECOVER,"pre-refresh single-limb recovery");
         for (int i=0;i<N;i++)
           before_coeff[i] = dram[ADDR_OUT/8+i]>q[0]/2 ? dram[ADDR_OUT/8+i]-q[0] : dram[ADDR_OUT/8+i];
-        ahb_write(A_CONFIG,limbs);
-        ahb_write64(A_PTR2_LO,64'(ADDR_C0));
-        ahb_write64(A_PTR3_LO,64'(ADDR_C1));
+        cfg(limbs, 12'(rns_scale));
+        set_slot(2,64'(ADDR_C0));
+        set_slot(3,64'(ADDR_C1));
         refresh_samples=0; refresh_snapshots=0; refresh_lifts=0;
         run_cmd(FHE_REFRESH,"REFRESH q0 to target chain");
         assert(refresh_samples==N && refresh_snapshots==N && refresh_lifts==limbs*N)
@@ -1006,7 +976,7 @@ module fhe_top_dma_tb
           previous_a[i]=dram[ADDR_C1/8+i];
         end
         if(trial==1) assert(changed>0) else $fatal(1,"refresh reused uniform randomness");
-        ahb_write64(A_PTR2_LO,64'(ADDR_OUT));
+        set_slot(2,64'(ADDR_OUT));
         run_cmd(FHE_RECOVER,"recover refreshed coefficients");
         for (int i=0;i<N;i++) begin
           longint signed first_delta;
@@ -1028,99 +998,93 @@ module fhe_top_dma_tb
       $display("PASS level refresh: real ciphertext, repeated refresh, signed center boundaries, common noise, no FFT");
     end
 
-    // ---- C'-2 free-run PRNG test (+FREERUN) ----
-    // Enable free-run, then: (1) two back-to-back encrypts with NO doorbell must
-    // produce DIFFERENT c1(=a) -> the keystream continues, a never repeats;
-    // (2) a doorbell reseed with the SAME ENTSEED must restart the stream and
-    // reproduce encrypt#1's c1 -> the inject is deterministic; (3) a free-run
-    // ciphertext still decrypts to the input.
-    if ($test$plusargs("FREERUN")) begin
-      longint a1 [], a2 [], a3 [];
-      int diff12, diff13, base, guard;
-      logic [31:0] sdata;
-      a1 = new[N]; a2 = new[N]; a3 = new[N];
-      $display("== C'-2 free-run PRNG test ==");
+    // ---- Single-seed stream and command preconditions ----
+    begin
+      logic [31:0] d;
+      logic [7:0]  kv_err;
+      int          diff, guard, limbs;
+      longint      reco [];
+      reco  = new[N];
+      limbs = tb_limbs();
+      $display("== single-seed stream and command preconditions ==");
+      save_key();
 
-      ahb_write(A_RNG_CTRL, 32'h1);                 // FREERUN_EN=1 (NO doorbell yet)
+      // (1) A later ENCRYPT continues the key's stream: fresh a, never repeated.
+      cfg(limbs, 12'(rns_scale));
+      enc_slots();
+      run_cmd(FHE_ENCRYPT, "ENCRYPT (stream continues)");
+      diff = 0;
+      for (int i = 0; i < N; i++) if (dram[ADDR_C1/8 + i] !== first_a[i]) diff++;
+      if (diff == 0) begin $display("FAIL: second ENCRYPT reused a"); errors++; end
+      else $display("PASS stream continues: c1 differs in %0d/%0d coefficients", diff, N);
 
-      // KEYGEN marks the a/e0 stream unseeded -> the first encrypt MUST wait for a
-      // firmware RESEED_REQ (enforced fresh entropy after keygen / cold reset).
-      run_cmd(FHE_KEYGEN, "KEYGEN(freerun)");
-      ahb_write64(A_PTR0_LO, 64'(ADDR_P));
-      ahb_write64(A_PTR2_LO, 64'(ADDR_C0));
-      ahb_write64(A_PTR3_LO, 64'(ADDR_C1));
+      // (2) Preconditions, each refused without running a pass.
+      expect_reject(FHE_KEYGEN, FHE_EC_NO_SEED, "KEYGEN without a fresh seed read");
+      expect_reject(3'b011, FHE_EC_BAD_OPCODE, "opcode 011 (former REENC)");
+      expect_reject(3'b111, FHE_EC_BAD_OPCODE, "opcode 111");
+      cfg(limbs, 12'(rns_scale), LOGN + 1);
+      expect_reject(FHE_ENCRYPT, FHE_EC_BAD_LOGN, "ENCRYPT with LOGN mismatch");
+      cfg(limbs, 12'(rns_scale));
+      kv_deny = 1;
+      kv_seed_read(KV_ENTRY, kv_err);
+      if (kv_err != 8'h01) begin $display("FAIL: denied KeyVault read reported error %0d", kv_err); errors++; end
+      expect_reject(FHE_KEYGEN, FHE_EC_KV_READ, "KEYGEN after a refused KeyVault read");
+      kv_deny = 0;
+      ahb_read(A_STATUS, d);
+      if (!d[ST_KEY_VALID]) begin $display("FAIL: refused KEYGEN destroyed KEY_VALID"); errors++; end
 
-      // (0) ENFORCEMENT + OBSERVABILITY: the first encrypt with NO reseed must
-      //     STALL (not complete), raise a NOTIF interrupt, and set the bus-readable
-      //     STATUS.RESEED_REQ_PENDING (bit4) -- an observable wait, not a silent hang.
-      base = notif_count;
+      // (3) The same seed reproduces the same key and the same stream position.
+      load_seed(SEED_A);
+      run_cmd(FHE_KEYGEN, "KEYGEN (same seed)");
+      diff = key_diff();
+      if (diff != 0) begin $display("FAIL: same seed gave a different key (%0d words)", diff); errors++; end
+      run_cmd(FHE_ENCRYPT, "ENCRYPT after re-KEYGEN");
+      diff = 0;
+      for (int i = 0; i < N; i++) if (dram[ADDR_C1/8 + i] !== first_a[i]) diff++;
+      if (diff != 0) begin $display("FAIL: same seed did not reproduce a (%0d diffs)", diff); errors++; end
+      else $display("PASS same KeyVault seed reproduces the key and the first a");
+
+      // (4) A different 160-bit seed gives a different key that still round-trips.
+      load_seed(SEED_B);
+      run_cmd(FHE_KEYGEN, "KEYGEN (seed B, nonzero IV)");
+      diff = key_diff();
+      if (diff == 0) begin $display("FAIL: seed B produced the seed-A key"); errors++; end
+      run_cmd(FHE_ENCRYPT, "ENCRYPT (seed B)");
+      cfg(limbs, 12'(i2f_val));
+      dec_slots();
+      run_cmd(FHE_DECRYPT, "DECRYPT (seed B)");
+      capture_slots(reco, ADDR_OUT);
+      check_fft(reco, g_input, N, "seed-B round-trip (recovered vs input)", 1.0e-3);
+
+      // (5) ZEROIZE while idle clears KEY_VALID; a key-dependent command is refused.
+      ahb_write(A_CTRL, CTRL_ZEROIZE);
+      ahb_read(A_STATUS, d);
+      if (d[ST_KEY_VALID] || d[ST_VALID]) begin $display("FAIL: idle ZEROIZE left STATUS=0x%08h", d); errors++; end
+      cfg(limbs, 12'(i2f_val));
+      expect_reject(FHE_DECRYPT, FHE_EC_NO_KEY, "DECRYPT after ZEROIZE (no key)");
+
+      // (6) ZEROIZE during a command completes it as aborted (cause 11).
+      load_seed(SEED_B);
+      cfg(limbs, 12'(rns_scale));
+      run_cmd(FHE_KEYGEN, "KEYGEN before abort");
+      enc_slots();
       ahb_write(A_CTRL, {29'd0, FHE_ENCRYPT});
-      // Reach the entropy wait after the N-dependent load/conversion prefix.
-      // A fixed 20k-cycle delay is too short for the phased full-size engine.
       guard = 0;
-      while (!dut.ctrl_wait_entropy && !dut.status_valid && guard < 50_000_000) begin
+      while (!(dut.i_local_stream.active && dut.i_local_stream.left < N/2) && guard < 100000) begin
         service_local_stream(); guard++;
       end
-      repeat (200) @(posedge clk); // prove it remains blocked without the doorbell
-      ahb_read(A_STATUS, sdata);                     // sdata[1]=VALID, sdata[4]=RESEED_REQ_PENDING
-      if (dut.status_valid) begin
-        $display("FAIL[FREERUN]: first encrypt completed with NO reseed (enforcement broken)"); errors++;
-      end else if (!dut.ctrl_wait_entropy) begin
-        $display("FAIL[FREERUN]: encrypt neither completed nor in reseed-wait (wedged?)"); errors++;
-      end else
-        $display("  [freerun] enforcement OK: first encrypt STALLED in reseed-wait");
-      if (notif_count == base) begin
-        $display("FAIL[FREERUN]: no NOTIF interrupt raised on entering reseed-wait"); errors++;
-      end else
-        $display("  [freerun] wait-notify OK: NOTIF raised on entering reseed-wait");
-      if (!sdata[4]) begin
-        $display("FAIL[FREERUN]: STATUS.RESEED_REQ_PENDING (bit4) not readable over AHB (read=%08h)", sdata); errors++;
-      end else
-        $display("  [freerun] STATUS OK: RESEED_REQ_PENDING readable over AHB (bit4=1)");
+      ahb_write(A_CTRL, CTRL_ZEROIZE);
+      ahb_read(A_STATUS, d);
+      if (d[ST_READY] && d[ST_VALID] && d[ST_ERROR] && d[7:4] == FHE_EC_ABORTED && !d[ST_KEY_VALID])
+        $display("PASS ZEROIZE mid-ENCRYPT reports an aborted completion and clears KEY_VALID");
+      else begin $display("FAIL: ZEROIZE mid-ENCRYPT left STATUS=0x%08h", d); errors++; end
+      ahb_read(A_XFER_STATUS, d);
+      if (d != 0) begin $display("FAIL: ZEROIZE left XFER_STATUS=0x%08h", d); errors++; end
 
-      // release: deliver the doorbell WHILE the command is busy/stalled.
-      doorbell(ENT_SEED);
-      guard = 0;
-      while (!dut.status_valid && (guard < 50_000_000)) begin service_local_stream(); guard++; end
-      ahb_read(A_STATUS, sdata);
-      if (!dut.status_valid) begin
-        $display("FAIL[FREERUN]: stalled encrypt never released after RESEED_REQ"); errors++;
-      end else if (sdata[4]) begin
-        $display("FAIL[FREERUN]: RESEED_REQ_PENDING still set after release"); errors++;
-      end else
-        $display("  [freerun] release OK: encrypt#1 completed after RESEED_REQ (~%0d cyc)", guard);
-      @(negedge clk);
-      capture_slots(a1, ADDR_C1);
-
-      run_cmd(FHE_ENCRYPT, "ENCRYPT#2 (freerun: continue stream)");
-      capture_slots(a2, ADDR_C1);
-
-      diff12 = diff_count(a1, a2);
-      if (diff12 == 0) begin
-        $display("FAIL[FREERUN]: encrypt#1 and #2 produced IDENTICAL c1 -- a was REUSED"); errors++;
-      end else
-        $display("  [freerun] non-repeat OK: c1(=a) differs in %0d/%0d coeffs across two encrypts", diff12, N);
-
-      // doorbell: re-seed the stream with the SAME ENTSEED -> must reproduce a1.
-      doorbell(ENT_SEED);
-      run_cmd(FHE_ENCRYPT, "ENCRYPT#3 (freerun: doorbell reseed)");
-      capture_slots(a3, ADDR_C1);
-      diff13 = diff_count(a1, a3);
-      if (diff13 != 0) begin
-        $display("FAIL[FREERUN]: doorbell reseed (same ENTSEED) did not reproduce c1 (%0d diffs)", diff13); errors++;
-      end else
-        $display("  [freerun] reseed-determinism OK: same ENTSEED -> identical c1");
-
-      // functional: the last free-run ciphertext still decrypts to the input.
-      ahb_write64(A_PTR0_LO, 64'(ADDR_C0));
-      ahb_write64(A_PTR1_LO, 64'(ADDR_C1));
-      ahb_write64(A_PTR2_LO, 64'(ADDR_OUT));
-      run_cmd(FHE_DECRYPT, "DECRYPT(freerun)");
-      begin
-        longint reco []; reco = new[N];
-        capture_slots(reco, ADDR_OUT);
-        check_fft(reco, g_input, N, "freerun round-trip (recovered vs input)", 1.0e-3);
-      end
+      // Restore the seed-A key for the optional MNIST run.
+      load_seed(SEED_A);
+      cfg(2, 12'(rns_scale));
+      run_cmd(FHE_KEYGEN, "KEYGEN (restore seed A)");
     end
 
     begin

@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
-# Stage-C' 1c: end-to-end FHE KeyVault-seed smoke at the caliptra_top_tb level.
+# FHE KeyVault-seed smoke at the caliptra_top_tb level (register map v2).
 #
-#   Like run_smoke_fhe.sh, but the keygen root seed comes from the KeyVault
-#   instead of the KGSEED registers. VeeR firmware (smoke_test_kv_fhe) triggers
-#   the TB KV backdoor (opcode 0xc6 -> known seed into a KV entry, authorized
-#   for read-client 6), points KGKV_CTRL at it, enables KV, then runs
-#   KEYGEN -> ENCRYPT -> DECRYPT. The TB checks recovered ~= input AND asserts
-#   the walker's keygen seed == the KeyVault value (the decisive check, since the
-#   sk-scheme round-trip cancels for any key).
+#   VeeR firmware (smoke_test_kv_fhe) triggers the TB KeyVault backdoor
+#   (opcode 0xc6: a known 160-bit seed into slot 9, readable by client 2), reads
+#   it through KV_RD_SEED_CTRL, runs KEYGEN and checks KEY_VALID and the command
+#   preconditions. The TB asserts the seed the sampler receives equals the
+#   KeyVault value.
 #
-#   Requires a NoABR build: the FHE KV client uses kv_read[6], which Adams Bridge
+#   Requires a NoABR build: the FHE KV client uses kv_read[2], which Adams Bridge
 #   owns unless compiled out. So this build adds +define+CALIPTRA_NO_ADAMS_BRIDGE
 #   (also exercises the newly NoABR-capable caliptra_top_tb).
 #
@@ -74,7 +72,7 @@ echo "=== verdict ==="
 if grep -q "\[FHE-KV-TB\] FAIL" "$LOG"; then
   echo "smoke_test_kv_fhe RESULT: FAIL (KV seed did not reach walker; see $LOG)"; exit 1
 fi
-if grep -q "\[FHE-KV-TB\] PASS" "$LOG" && grep -q "FHE DMA round-trip: PASS" "$LOG" && grep -q "TESTCASE PASSED" "$LOG"; then
+if grep -q "\[FHE-KV-TB\] PASS" "$LOG" && grep -q "TESTCASE PASSED" "$LOG"; then
   echo "smoke_test_kv_fhe RESULT: PASS"
 else
   echo "smoke_test_kv_fhe RESULT: FAIL (see $LOG)"; exit 1

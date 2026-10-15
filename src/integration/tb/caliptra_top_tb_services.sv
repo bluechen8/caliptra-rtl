@@ -187,9 +187,10 @@ module caliptra_top_tb_services
     logic                       inject_random_data;
     logic                       release_kv_inject_flags;
 `ifdef FHE_WALKER
-    // C'-1c: known 64-bit FHE keygen root seed injected into a KeyVault entry
-    // (opcode 0xc6). dwords 0/1 hold the seed; assembled = {[1],[0]}.
-    logic [31:0]                fhe_kv_seed_tb [0:15] = '{0:32'hCAFEBABE, 1:32'hDEADBEEF, default:32'd0};
+    // Known 160-bit FHE seed injected into a KeyVault entry (opcode 0xc6).
+    // Dwords 0..4 hold the seed; assembled = {[4],[3],[2],[1],[0]}.
+    logic [31:0]                fhe_kv_seed_tb [0:15] = '{0:32'hCAFEBABE, 1:32'hDEADBEEF, 2:32'h01234567,
+                                                          3:32'h89ABCDEF, 4:32'h0BADF00D, default:32'd0};
 `endif
     logic                       check_pcr_ecc_signing;
     logic                       check_pcr_mldsa_signing;
@@ -835,15 +836,15 @@ module caliptra_top_tb_services
                         end
                     end
 `ifdef FHE_WALKER
-                    //C'-1c: inject a known 64-bit FHE keygen seed into KV entry
-                    //WriteData[12:8], authorized for read-client 6 (kv_read[6]=FHE).
+                    //Inject a known 160-bit FHE seed into KV entry
+                    //WriteData[12:8], authorized for read-client 2 (kv_read[2]=FHE).
                     else if((WriteData[7:0] == 8'hc6) && mailbox_write) begin
                         release_kv_inject_flags <= '0;
                         if (WriteData[12:8] == slot_id) begin
                             force `CPTRA_TOP_PATH.key_vault1.kv_reg_hwif_in.KEY_CTRL[slot_id].dest_valid.we = 1'b1;
-                            force `CPTRA_TOP_PATH.key_vault1.kv_reg_hwif_in.KEY_CTRL[slot_id].dest_valid.next = 9'b0_0100_0000; // bit6 = FHE seed read client
+                            force `CPTRA_TOP_PATH.key_vault1.kv_reg_hwif_in.KEY_CTRL[slot_id].dest_valid.next = 9'b0_0000_0100; // bit2 = ML-DSA seed client = FHE seed reader
                             force `CPTRA_TOP_PATH.key_vault1.kv_reg_hwif_in.KEY_CTRL[slot_id].last_dword.we = 1'b1;
-                            force `CPTRA_TOP_PATH.key_vault1.kv_reg_hwif_in.KEY_CTRL[slot_id].last_dword.next = 'd1; // 64-bit seed = 2 dwords
+                            force `CPTRA_TOP_PATH.key_vault1.kv_reg_hwif_in.KEY_CTRL[slot_id].last_dword.next = 'd4; // 160-bit seed = 5 dwords
                             force `CPTRA_TOP_PATH.key_vault1.kv_reg_hwif_in.KEY_ENTRY[slot_id][dword_i].data.we = 1'b1;
                             force `CPTRA_TOP_PATH.key_vault1.kv_reg_hwif_in.KEY_ENTRY[slot_id][dword_i].data.next = fhe_kv_seed_tb[dword_i];
                         end

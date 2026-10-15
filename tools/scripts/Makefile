@@ -150,7 +150,7 @@ AUX_LIB_DIR ?=
 VPATH = $(TEST_DIR) $(BUILD_DIR) $(TBDIR) $(RISCV_HW_IF_DIR) $(ISR_DIR) $(PRINTF_DIR) $(COMP_LIBS) $(AUX_LIB_DIR)
 
 # Top-level testbench filelist. Overridable so the FHE_WALKER build can select
-# caliptra_top_tb_fhe.vf (base tb.vf + Aloha core + fhe_microseq/fhe_dma):
+# caliptra_top_tb_fhe.vf (base tb.vf + Aloha core + fhe_microseq/fhe_local_stream):
 #   make ... TB_VF=$CALIPTRA_ROOT/src/integration/config/caliptra_top_tb_fhe.vf \
 #            EXTRA_DEFS="+define+FHE_WALKER +define+CALIPTRA_NO_ADAMS_BRIDGE +define+FHE_N=256"
 TB_VF ?= $(TBDIR)/../config/caliptra_top_tb.vf
