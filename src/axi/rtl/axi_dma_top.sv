@@ -84,7 +84,11 @@ import kv_defines_pkg::*;
 
     // Interrupt
     output logic notif_intr,
-    output logic error_intr
+    output logic error_intr,
+
+    // Hardware requester (FHE stream bridge); tie hw_req to '0 when unused
+    input  axi_dma_hw_req_t  hw_req,
+    output axi_dma_hw_resp_t hw_resp
 
 );
 
@@ -179,7 +183,10 @@ import kv_defines_pkg::*;
 
         // Interrupt
         .notif_intr(notif_intr),
-        .error_intr(error_intr)
+        .error_intr(error_intr),
+
+        .hw_req    (hw_req    ),
+        .hw_resp   (hw_resp   )
 
     );
 

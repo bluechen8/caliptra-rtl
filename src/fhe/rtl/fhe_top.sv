@@ -15,8 +15,14 @@
 // Description:
 //   Top wrapper for the CKKS (Aloha-HE) accelerator: an AHB-Lite responder with
 //   the register map v2 block (fhe_reg, generated from fhe_reg.rdl), the
-//   microsequencer ("walker"), the Aloha ComputeCore and the firmware-forward
-//   stream. Specification: docs/fhe/16-register-map-v2.md (Chipyard checkout).
+//   microsequencer ("walker"), the Aloha ComputeCore and its transports.
+//   Specification: docs/fhe/16-register-map-v2.md (Chipyard checkout).
+//
+//   Transports: the firmware-forward stream (XFER_DATA) carries every segment,
+//   unless FHE_DMA_STREAM is defined. Then segments that bypass AES move through
+//   Caliptra's axi_dma (fhe_dma_stream_bridge, under a per-command lease), and
+//   only the AES routes (ENCRYPT message in, DECRYPT slots out) stay on the
+//   firmware-forward stream until the AES routes exist.
 //
 //   The datapath is compiled only with FHE_WALKER; otherwise the block ties
 //   off its bus and outputs. The former stage-0 stub and the dedicated fhe_dma
@@ -26,7 +32,8 @@ module fhe_top
   import fhe_params_pkg::*;
 #(
   parameter AHB_DATA_WIDTH = 64,
-  parameter AHB_ADDR_WIDTH = 32
+  parameter AHB_ADDR_WIDTH = 32,
+  parameter DMA_AW         = 48  // axi_dma address width (slot address checks)
 )(
   input  logic clk,
   input  logic clock_live, // parent gate enable, for ungated lifted SRAMs
@@ -56,6 +63,12 @@ module fhe_top
   input  kv_defines_pkg::kv_rd_resp_t fhe_kv_rd_resp,
   // Aloha ComputeCore storage banks, lifted to real SRAM at the SoC level.
   fhe_aloha_mem_if.req fhe_aloha_mem
+`ifdef FHE_DMA_STREAM
+  ,
+  // Hardware requester port of Caliptra's axi_dma
+  output axi_pkg::axi_dma_hw_req_t  fhe_dma_req,
+  input  axi_pkg::axi_dma_hw_resp_t fhe_dma_resp
+`endif
 `endif
 );
 
@@ -68,6 +81,11 @@ module fhe_top
   localparam bit FFT_GEN = 1'b1;
 `else
   localparam bit FFT_GEN = 1'b0;
+`endif
+`ifdef FHE_DMA_STREAM
+  localparam bit DMA_STREAM = 1'b1;
+`else
+  localparam bit DMA_STREAM = 1'b0;
 `endif
 
   //----------------------------------------------------------------
@@ -138,7 +156,10 @@ module fhe_top
   logic        key_valid;
   logic        done, done_error;
   logic        w_busy, w_done, w_error;
-  logic        abort_done;
+  logic        abort_done, abort_wait;
+  logic [3:0]  done_cause;
+  // DMA stream bridge state (constant 0 without FHE_DMA_STREAM)
+  logic        br_lease, br_word_error, br_xfer_error;
 
   // CTRL is an external register: decode the write in its request cycle, so a
   // command is accepted in the same cycle as the AHB data phase (v1 timing).
@@ -181,7 +202,7 @@ module fhe_top
 
   // READY rises only after a completion has latched VALID/ERROR, so firmware
   // sees READY and the completion status together.
-  assign busy_o = w_busy | cmd_valid | reject_pending | done;
+  assign busy_o = w_busy | cmd_valid | reject_pending | done | abort_wait | br_lease;
   assign ready  = ~busy_o;
 
   //----------------------------------------------------------------
@@ -238,6 +259,28 @@ module fhe_top
   assign cfg_logn  = hwif_out.FHE_CONFIG.LOGN.value;
   assign cfg_scale = hwif_out.FHE_CONFIG.SCALE.value;
 
+  // DMA-routed slots of a command must be 16-byte aligned and must not run
+  // past the DMA's address space: BASE + limbs*N*8 <= 2^DMA_AW.
+  logic [63:0] slot_base [0:3];
+  logic        slots_ok, dma_idle;
+  function automatic logic slot_ok(input logic [63:0] base, input logic [3:0] limbs);
+    logic [DMA_AW:0] slot_end;
+    slot_end = (DMA_AW+1)'(base[DMA_AW-1:0]) + (DMA_AW+1)'(limbs) * (DMA_AW+1)'(FHE_N * 8);
+    return (base[3:0] == 4'd0) && (base[63:DMA_AW] == '0) && (slot_end <= (DMA_AW+1)'(1) << DMA_AW);
+  endfunction
+  always_comb begin
+    slots_ok = 1'b1;
+    for (int s = 0; s < 4; s++) begin
+      logic [3:0] limbs;
+      limbs = fhe_slot_limbs(cmd_in, 3'(s), cfg_l);
+      if (fhe_slot_dma(cmd_in, 3'(s)) && !slot_ok(slot_base[s], limbs))
+        slots_ok = 1'b0;
+    end
+  end
+  always_comb
+    for (int s = 0; s < 4; s++)
+      slot_base[s] = {hwif_out.FHE_SLOT[s].BASE_H.ADDR.value, hwif_out.FHE_SLOT[s].BASE_L.ADDR.value};
+
   logic [3:0] precheck;
   always_comb begin
     precheck = FHE_EC_NONE;
@@ -252,6 +295,10 @@ module fhe_top
       if (!key_valid) precheck = FHE_EC_NO_KEY;
       else if (cmd_in != FHE_DECRYPT && (cfg_l == 4'd0 || cfg_l > 4'(FHE_L)))
         precheck = FHE_EC_BAD_L;
+      else if (DMA_STREAM && !slots_ok)
+        precheck = FHE_EC_BAD_ADDR;
+      else if (DMA_STREAM && !dma_idle)
+        precheck = FHE_EC_DMA_BUSY;
     end
   end
   assign cmd_accept = cmd_write & (precheck == FHE_EC_NONE);
@@ -284,10 +331,18 @@ module fhe_top
   wire reject_done = reject_pending & core_step;
 
   assign done       = w_done | reject_done;
-  assign done_error = reject_done | w_error;
+  assign done_error = reject_done | w_error | (w_done & (br_word_error | br_xfer_error));
+  always_comb begin
+    if (reject_done)                done_cause = reject_cause;
+    else if (w_done & br_xfer_error) done_cause = FHE_EC_TRANSPORT;
+    else if (w_done & br_word_error) done_cause = FHE_EC_BAD_WORD;
+    else                            done_cause = FHE_EC_NONE;
+  end
 
-  // A ZEROIZE that interrupts a command reports it as an aborted completion.
-  assign abort_done = zeroize & (w_busy | cmd_valid | reject_pending);
+  // A ZEROIZE that interrupts a command reports it as an aborted completion,
+  // once the DMA segment in flight (if any) has drained and the lease is back.
+  wire abort_now  = zeroize & (w_busy | cmd_valid | reject_pending);
+  assign abort_done = ~br_lease & (abort_now | (abort_wait & ~zeroize));
 
   //----------------------------------------------------------------
   // Completion status and resident-key state
@@ -297,12 +352,14 @@ module fhe_top
       status_valid <= 1'b0;
       status_error <= 1'b0;
       status_cause <= FHE_EC_NONE;
+      abort_wait   <= 1'b0;
       key_valid    <= 1'b0;
-    end else if (zeroize) begin
+    end else if (abort_done || zeroize) begin
       status_valid <= abort_done;
       status_error <= abort_done;
       status_cause <= abort_done ? FHE_EC_ABORTED : FHE_EC_NONE;
-      key_valid    <= 1'b0;
+      abort_wait   <= ~abort_done & (abort_wait | abort_now);
+      if (zeroize) key_valid <= 1'b0;
     end else begin
       if (cmd_write) begin
         status_valid <= 1'b0;
@@ -311,7 +368,7 @@ module fhe_top
       end else if (done) begin
         status_valid <= 1'b1;
         status_error <= done_error;
-        status_cause <= reject_done ? reject_cause : FHE_EC_NONE;
+        status_cause <= done_cause;
       end
       if (cmd_accept && cmd_in == FHE_KEYGEN) key_valid <= 1'b0;
       else if (w_done && cmd_q == FHE_KEYGEN) key_valid <= ~w_error;
@@ -346,7 +403,7 @@ module fhe_top
     hwif_in.FHE_STATUS.KEY_VALID.next   = key_valid;
     hwif_in.FHE_STATUS.ERR_CAUSE.next   = status_cause;
     hwif_in.FHE_STATUS.COMMIT_WAIT.next = 1'b0;
-    hwif_in.FHE_STATUS.DMA_LEASED.next  = 1'b0;
+    hwif_in.FHE_STATUS.DMA_LEASED.next  = br_lease;
     hwif_in.FHE_STATUS.RSVD.next        = '0;
 
     hwif_in.FHE_CONFIG.L.hwclr     = zeroize;
@@ -357,7 +414,7 @@ module fhe_top
     hwif_in.FHE_CAP.L.next             = 4'(FHE_L);
     hwif_in.FHE_CAP.FFT_GENERATED.next = FFT_GEN;
     hwif_in.FHE_CAP.RSVD0.next         = '0;
-    hwif_in.FHE_CAP.DMA_STREAM.next    = 1'b0;
+    hwif_in.FHE_CAP.DMA_STREAM.next    = DMA_STREAM;
     hwif_in.FHE_CAP.FW_STREAM.next     = 1'b1;
     hwif_in.FHE_CAP.RSVD1.next         = '0;
     hwif_in.FHE_CAP.MAP_VERSION.next   = MAP_VERSION;
@@ -484,19 +541,78 @@ module fhe_top
     .m_aloha_mem        (fhe_aloha_mem)
   );
 
-  // Firmware-forward stream (bring-up transport): VeeR moves each 64-bit word
-  // through XFER_DATA, using SLOT/LIMB from XFER_STATUS.
+  //----------------------------------------------------------------
+  // Transports: route each walker segment by (command, slot)
+  //----------------------------------------------------------------
+  // AES-route slots (ENCRYPT message in, DECRYPT slots out) stay on the
+  // firmware-forward stream; with FHE_DMA_STREAM every other slot of the
+  // command goes through the DMA bridge (fhe_params_pkg route table).
+  logic seg_dma, seg_dma_q;
+  assign seg_dma = DMA_STREAM && fhe_slot_dma(cmd_q, w_desc_ptr);
+  always_ff @(posedge clk or negedge rst_b) begin
+    if (!rst_b)            seg_dma_q <= 1'b0;
+    else if (w_desc_valid) seg_dma_q <= seg_dma;
+  end
+
+  logic        ls_ready, ls_rd_valid, ls_wr_ready;
+  logic [63:0] ls_rd_data;
+  logic [31:0] ls_status, ls_left;
+  logic        br_ready, br_rd_valid, br_wr_ready, br_active;
+  logic [63:0] br_rd_data;
+  logic [31:0] br_status, br_left;
+
+  assign w_dma_ready = ls_ready & br_ready;
+  assign w_rd_valid  = seg_dma_q ? br_rd_valid : ls_rd_valid;
+  assign w_rd_data   = seg_dma_q ? br_rd_data  : ls_rd_data;
+  assign w_wr_ready  = seg_dma_q ? br_wr_ready : ls_wr_ready;
+  assign stream_status = br_active ? br_status : ls_status;
+  assign stream_left   = br_active ? br_left   : ls_left;
+
+  // Firmware-forward stream: VeeR moves each 64-bit word through XFER_DATA,
+  // using SLOT/LIMB from XFER_STATUS.
   fhe_local_stream #(.N(FHE_N)) i_local_stream (
     .clk(clk), .rst_n(rst_b), .clear(zeroize),
-    .desc_valid(w_desc_valid), .desc_wr(w_desc_wr),
-    .desc_ptr(w_desc_ptr), .desc_limb(w_desc_limb), .dma_ready(w_dma_ready),
-    .rd_valid(w_rd_valid), .rd_data(w_rd_data), .rd_ready(w_rd_pop),
-    .wr_valid(w_wr_push), .wr_data(w_wr_data), .wr_ready(w_wr_ready),
+    .desc_valid(w_desc_valid & ~seg_dma), .desc_wr(w_desc_wr),
+    .desc_ptr(w_desc_ptr), .desc_limb(w_desc_limb), .dma_ready(ls_ready),
+    .rd_valid(ls_rd_valid), .rd_data(ls_rd_data), .rd_ready(w_rd_pop & ~seg_dma_q),
+    .wr_valid(w_wr_push & ~seg_dma_q), .wr_data(w_wr_data), .wr_ready(ls_wr_ready),
     .data_read (xfer_rd),
     .data_write(xfer_wr),
     .data_wdata(hwif_out.FHE_XFER_DATA.wr_data), .data_rdata(stream_data),
-    .status(stream_status), .remaining(stream_left), .access_error(stream_access_error)
+    .status(ls_status), .remaining(ls_left), .access_error(stream_access_error)
   );
+
+`ifdef FHE_DMA_STREAM
+  // Every command with a DMA-routed slot takes the lease (all but KEYGEN).
+  logic cmd_uses_dma;
+  always_comb begin
+    cmd_uses_dma = 1'b0;
+    for (int s = 0; s < 4; s++)
+      if (fhe_slot_dma(cmd_in, 3'(s))) cmd_uses_dma = 1'b1;
+  end
+  fhe_dma_stream_bridge #(.N(FHE_N)) i_dma_bridge (
+    .clk(clk), .rst_b(rst_b),
+    .lease_start(cmd_accept & cmd_uses_dma),
+    .lease_end  (w_done),
+    .abort      (zeroize),
+    .lease      (br_lease),
+    .word_error (br_word_error),
+    .xfer_error (br_xfer_error),
+    .desc_valid(w_desc_valid & seg_dma), .desc_wr(w_desc_wr),
+    .desc_ptr(w_desc_ptr), .desc_limb(w_desc_limb), .dma_ready(br_ready),
+    .rd_valid(br_rd_valid), .rd_data(br_rd_data), .rd_ready(w_rd_pop & seg_dma_q),
+    .wr_valid(w_wr_push & seg_dma_q), .wr_data(w_wr_data), .wr_ready(br_wr_ready),
+    .slot_base(slot_base),
+    .seg_active(br_active), .status(br_status), .remaining(br_left),
+    .hw_req(fhe_dma_req), .hw_resp(fhe_dma_resp)
+  );
+  assign dma_idle = fhe_dma_resp.idle;
+`else
+  assign {br_lease, br_word_error, br_xfer_error, br_active} = '0;
+  assign {br_ready, br_rd_valid, br_wr_ready} = 3'b100;
+  assign {br_rd_data, br_status, br_left} = '0;
+  assign dma_idle = 1'b1;
+`endif
 
 `else
   // No datapath in this build: complete every bus access OKAY with zero data.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build + run the fhe_top unit TB (register map v2, firmware-forward stream).
+# Build + run the fhe_top unit TB (register map v2).
 #
 #   ./run_fhe_top_dma_tb.sh [LOGN]      # default LOGN=8 (N=256)
 #
@@ -7,7 +7,9 @@
 # seed read, CONFIG and slot bases, commands, and the XFER_* stream against a
 # TB memory. It checks round trips, recovery, refresh, the single-seed stream
 # and command preconditions. Options: LIMBS2=1 (two-limb ciphertexts and the
-# N=256 key golden), FFT_ON_THE_FLY=1, STREAM_STALLS=1, MNIST_DIR=<dir>.
+# N=256 key golden), FFT_ON_THE_FLY=1, STREAM_STALLS=1, MNIST_DIR=<dir>,
+# DMA_STREAM=1 (bypass-AES segments through Caliptra's axi_dma and an AXI
+# memory over the same TB memory; adds the lease/address/error/abort tests).
 #
 # Expect: "fhe_top_dma_tb RESULT: PASS".
 set -euo pipefail
@@ -41,6 +43,7 @@ python3 "$ALOHA_PORT/tvgen/gen_roundtrip.py" "$LOGN" "$WORK" >/dev/null
 
 EXTRA_DEF=""
 [[ "${FFT_ON_THE_FLY:-0}" == 1 ]] && EXTRA_DEF="-DFHE_FFT_ON_THE_FLY"
+[[ "${DMA_STREAM:-0}" == 1 ]] && EXTRA_DEF="$EXTRA_DEF -DFHE_DMA_STREAM"
 
 echo "=== build $TOP (N=$N) ${EXTRA_DEF:+[$EXTRA_DEF]} ==="
 [[ -n "${CLEAN:-}" ]] && rm -rf "$OBJ_DIR"

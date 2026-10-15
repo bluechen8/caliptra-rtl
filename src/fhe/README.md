@@ -250,11 +250,18 @@ reads the 160-bit seed through `KV_RD_SEED_CTRL`, writes `CONFIG` and the slot b
 issues commands and services `XFER_*` against a TB memory. Specification:
 `docs/fhe/16-register-map-v2.md` in the Chipyard checkout.
 
+With `+define+FHE_DMA_STREAM` (`DMA_STREAM=1` below) the segments that bypass AES move
+through Caliptra's `axi_dma` instead (`fhe_dma_stream_bridge`, on the DMA's hardware
+requester port, under a per-command lease); the TB then builds the real `axi_dma_top` and
+an AXI memory over the same TB memory, and adds lease, slot-address, input-check,
+transport-error and abort tests.
+
 ```bash
 # from src/fhe/ — default LOGN=8 (N=256). CLEAN=1 forces a rebuild.
 LIMBS2=1 ./tb/run_fhe_top_dma_tb.sh 8          # two limbs + the N=256 key golden
 FFT_ON_THE_FLY=1 LIMBS2=1 ./tb/run_fhe_top_dma_tb.sh 8
 STREAM_STALLS=1 ./tb/run_fhe_top_dma_tb.sh 8
+DMA_STREAM=1 LIMBS2=1 ./tb/run_fhe_top_dma_tb.sh 8   # bypass-AES segments via axi_dma
 # -> "fhe_top_dma_tb RESULT: PASS"
 ```
 

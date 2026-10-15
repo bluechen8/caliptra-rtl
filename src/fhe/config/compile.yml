@@ -3,6 +3,7 @@ provides: [fhe_top]
 schema_version: 2.4.0
 requires:
   - libs
+  - axi_pkg
 targets:
   rtl:
     directories:

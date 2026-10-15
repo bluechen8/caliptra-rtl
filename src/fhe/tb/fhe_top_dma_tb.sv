@@ -62,12 +62,17 @@ module fhe_top_dma_tb
   // STATUS fields.
   localparam int ST_READY = 0, ST_VALID = 1, ST_ERROR = 2, ST_KEY_VALID = 3;
 `ifdef FHE_FFT_ON_THE_FLY
-  localparam logic [31:0] CAP_EXPECTED = 32'(N) | (32'(FHE_L) << 16) | (32'd1 << 20) | (32'd1 << 25) | (32'd2 << 28);
+  localparam logic [31:0] CAP_FFT = 32'd1 << 20;
 `else
-  localparam logic [31:0] CAP_EXPECTED = 32'(N) | (32'(FHE_L) << 16) | (32'd1 << 25) | (32'd2 << 28);
+  localparam logic [31:0] CAP_FFT = 32'd0;
 `endif
-  // Aloha limb moduli (profile 0xa108).
-  localparam logic [63:0] Q_LIMB [2] = '{(64'd1<<46)-(64'd9<<24)+1, (64'd1<<47)-(64'd1<<24)+1};
+`ifdef FHE_DMA_STREAM
+  localparam logic [31:0] CAP_DMA = 32'd1 << 24;
+`else
+  localparam logic [31:0] CAP_DMA = 32'd0;
+`endif
+  localparam int DMA_AW = 48;   // axi_dma address width (slot range checks)
+  localparam logic [31:0] CAP_EXPECTED = 32'(N) | (32'(FHE_L) << 16) | CAP_FFT | CAP_DMA | (32'd1 << 25) | (32'd2 << 28);
 
   localparam int     RT_SCALE    = 17 + LOGN;
   // The pre-reuse golden key was sampled from this 64-bit seed with IV 0, which
@@ -104,9 +109,13 @@ module fhe_top_dma_tb
   logic busy_o, error_intr, notif_intr;
 
   fhe_mem_if mem_if();
+`ifdef FHE_DMA_STREAM
+  axi_pkg::axi_dma_hw_req_t  dma_req;
+  axi_pkg::axi_dma_hw_resp_t dma_resp;
+`endif
 
   fhe_top #(
-    .AHB_DATA_WIDTH(DW), .AHB_ADDR_WIDTH(AHW)
+    .AHB_DATA_WIDTH(DW), .AHB_ADDR_WIDTH(AHW), .DMA_AW(DMA_AW)
   ) dut (
     .clock_live(parent_clock_live),
     .clk(parent_clk), .rst_b(rst_b),
@@ -120,6 +129,9 @@ module fhe_top_dma_tb
     // C'-3: Aloha ComputeCore storage banks lifted to the top; the TB supplies
     // them via the behavioral fhe_aloha_mem_top (real SRAM at the SoC level).
     .fhe_aloha_mem(aloha_mem.req)
+`ifdef FHE_DMA_STREAM
+    , .fhe_dma_req(dma_req), .fhe_dma_resp(dma_resp)
+`endif
   );
 
   fhe_aloha_mem_if aloha_mem();
@@ -148,9 +160,14 @@ module fhe_top_dma_tb
   initial if ($test$plusargs("STREAM_STALLS")) begin
     wait (rst_b);
     @(negedge clk);
+`ifdef FHE_DMA_STREAM
+    while (!(dut.cmd_q == FHE_ENCRYPT && dut.w_busy && dut.br_active && dut.br_status[1] &&
+             !dut.w_wr_push && dut.w_wr_ready)) @(negedge clk);
+`else
     while (!(dut.cmd_q == FHE_ENCRYPT && dut.w_busy &&
              dut.i_local_stream.active && dut.i_local_stream.direction &&
              !dut.w_wr_push && !dut.i_local_stream.full)) @(negedge clk);
+`endif
     force dut.w_wr_ready = 0;
     repeat (64) @(negedge clk);
     release dut.w_wr_ready;
@@ -323,6 +340,78 @@ module fhe_top_dma_tb
 
   // Firmware memory: plaintext, ciphertext and output buffers.
   logic [63:0] dram [0:DEPTH-1];
+
+`ifdef FHE_DMA_STREAM
+`include "caliptra_reg_field_defines.svh"
+  // ---- Caliptra axi_dma with an AXI memory over the same `dram` ----
+  axi_if #(.AW(DMA_AW), .DW(32), .IW(1), .UW(32)) dma_axi (.clk(clk), .rst_n(rst_b));
+  logic                       dma_dv = 1'b0, dma_hold, dma_err, dma_notif, dma_error_intr;
+  logic [31:0]                dma_rdata;
+  soc_ifc_pkg::soc_ifc_req_t  dma_reg_req = '0;
+  axi_dma_top #(.AW(DMA_AW), .DW(32), .UW(32), .IW(1)) i_dma (
+    .clk(clk), .cptra_pwrgood(rst_b), .rst_n(rst_b),
+    .recovery_data_avail(1'b0), .recovery_image_activated(1'b0),
+    .mbox_lock(1'b0), .sha_lock(1'b0), .debugUnlock_or_scan_mode_switch(1'b0),
+    .ocp_lock_in_progress(1'b0), .key_release_addr('0), .key_release_size('0),
+    .aes_input_ready(1'b0), .aes_output_valid(1'b0), .aes_status_idle(1'b1),
+    .aes_req_dv(), .aes_req_hold(1'b0), .aes_req_data(), .aes_rdata('0), .aes_err(1'b0),
+    .kv_read(), .kv_rd_resp('0), .axuser('0),
+    .m_axi_w_if(dma_axi.w_mgr), .m_axi_r_if(dma_axi.r_mgr),
+    .dv(dma_dv), .req_data(dma_reg_req), .hold(dma_hold), .rdata(dma_rdata), .error(dma_err),
+    .mb_dv(), .mb_hold(1'b0), .mb_error(1'b0), .mb_data(), .mb_rdata('0),
+    .notif_intr(dma_notif), .error_intr(dma_error_intr),
+    .hw_req(dma_req), .hw_resp(dma_resp)
+  );
+  logic              mem_dv, mem_write, mem_hld = 1'b0, mem_rd_err = 1'b0;
+  logic [DMA_AW-1:0] mem_addr;
+  logic [31:0]       mem_wdata, mem_rdata;
+  axi_sub #(.AW(DMA_AW), .DW(32), .UW(32), .IW(1), .EX_EN(0), .C_LAT(0)) i_axi_mem (
+    .clk(clk), .rst_n(rst_b), .s_axi_w_if(dma_axi.w_sub), .s_axi_r_if(dma_axi.r_sub),
+    .dv(mem_dv), .addr(mem_addr), .write(mem_write), .user(), .id(),
+    .wdata(mem_wdata), .wstrb(), .size(), .rdata(mem_rdata), .last(),
+    .hld(mem_hld), .rd_err(mem_rd_err), .wr_err(1'b0)
+  );
+  assign mem_rdata = mem_addr[2] ? dram[mem_addr[MEM_AW-1:3]][63:32] : dram[mem_addr[MEM_AW-1:3]][31:0];
+  always @(posedge clk)
+    if (mem_dv && !mem_hld && mem_write) begin
+      if (mem_addr[2]) dram[mem_addr[MEM_AW-1:3]][63:32] = mem_wdata;
+      else             dram[mem_addr[MEM_AW-1:3]][31:0]  = mem_wdata;
+    end
+  // Memory backpressure under STREAM_STALLS.
+  bit stream_stalls;
+  initial stream_stalls = $test$plusargs("STREAM_STALLS");
+  always @(negedge clk) if (stream_stalls) mem_hld <= ($urandom_range(0, 3) == 0);
+
+  // Firmware view of the DMA registers (generated axi_dma_reg offsets and fields).
+  localparam logic [31:0] DMA_GO_AXI_COPY = `AXI_DMA_REG_CTRL_GO_MASK |
+      (32'(axi_dma_reg_pkg::axi_dma_reg__ctrl__rd_route__rd_route_e__AXI_WR) << `AXI_DMA_REG_CTRL_RD_ROUTE_LOW) |
+      (32'(axi_dma_reg_pkg::axi_dma_reg__ctrl__wr_route__wr_route_e__AXI_RD) << `AXI_DMA_REG_CTRL_WR_ROUTE_LOW);
+  task automatic dma_fw_access(input bit write, input logic [31:0] a, input logic [31:0] wd,
+                               output logic [31:0] rd);
+    @(negedge clk);
+    dma_reg_req = '0;
+    dma_reg_req.addr = 18'(a); dma_reg_req.wdata = wd; dma_reg_req.wstrb = '1; dma_reg_req.write = write;
+    dma_dv = 1'b1;
+    do @(posedge clk); while (dma_hold);
+    rd = dma_rdata;
+    @(negedge clk);
+    dma_dv = 1'b0;
+  endtask
+  task automatic dma_fw_write(input logic [31:0] a, input logic [31:0] wd);
+    logic [31:0] unused;
+    dma_fw_access(1'b1, a, wd, unused);
+  endtask
+  task automatic dma_fw_read(input logic [31:0] a, output logic [31:0] rd);
+    dma_fw_access(1'b0, a, '0, rd);
+  endtask
+  // Firmware memory-to-memory DMA copy (no wait for completion).
+  task automatic dma_fw_copy_start(input int src, input int dst, input int bytes);
+    dma_fw_write(`AXI_DMA_REG_SRC_ADDR_L, 32'(src)); dma_fw_write(`AXI_DMA_REG_SRC_ADDR_H, 0);
+    dma_fw_write(`AXI_DMA_REG_DST_ADDR_L, 32'(dst)); dma_fw_write(`AXI_DMA_REG_DST_ADDR_H, 0);
+    dma_fw_write(`AXI_DMA_REG_BYTE_COUNT, 32'(bytes));
+    dma_fw_write(`AXI_DMA_REG_CTRL, DMA_GO_AXI_COPY);
+  endtask
+`endif
 
   // ------------------------------------------------------------------
   int notif_count;
@@ -524,7 +613,8 @@ module fhe_top_dma_tb
     end
   endtask
 
-  task automatic run_cmd(input fhe_cmd_e c, input string nm);
+  // Run a command to completion; it must end with `cause` (ERROR unless NONE).
+  task automatic run_cmd(input fhe_cmd_e c, input string nm, input logic [3:0] cause = FHE_EC_NONE);
     int base, guard;
     base = notif_count;
     ahb_write(A_CTRL, {29'd0, c});
@@ -538,9 +628,10 @@ module fhe_top_dma_tb
     begin
       logic [31:0] st;
       ahb_read(A_STATUS, st);
-      if (st[ST_ERROR]) begin
-        $display("  FAIL: %s completed with ERROR cause %0d", nm, st[7:4]); errors++;
-      end
+      if (st[ST_ERROR] != (cause != FHE_EC_NONE) || st[7:4] != cause) begin
+        $display("  FAIL: %s completed with STATUS 0x%08h, expected cause %0d", nm, st, cause); errors++;
+      end else if (cause != FHE_EC_NONE)
+        $display("PASS %s -> ERROR cause %0d", nm, cause);
     end
   endtask
 
@@ -610,6 +701,116 @@ module fhe_top_dma_tb
   int          rns_scale;
   logic [31:0] i2f_val;
 
+`ifdef FHE_DMA_STREAM
+  task automatic expect_dma_released(input string nm);
+    if (!dma_resp.idle || dut.br_lease) begin
+      $display("FAIL: %s left the DMA busy or leased", nm); errors++;
+    end
+  endtask
+
+  // DMA stream: lease conflicts, slot checks, input checks, transport errors
+  // and an abort that drains a segment in flight. Ends with KEY_VALID = 0.
+  localparam int SCRATCH = 'h40000, COPY_DST = 'h60000, MARK_DST = 'h70000;
+  bit saw_abort_drain = 0;
+  always @(posedge clk) if (dut.abort_wait && dut.br_active) saw_abort_drain = 1;
+  task automatic dma_stream_tests();
+    logic [31:0] d;
+    logic [63:0] saved;
+    bit          saw_lease, fw_go_landed;
+    int          guard, diff;
+    int          limbs = tb_limbs();
+    $display("== DMA stream: lease, checks, errors, abort ==");
+    load_seed(SEED_A);
+    cfg(2, 12'(rns_scale));
+    run_cmd(FHE_KEYGEN, "KEYGEN (DMA stream tests)");
+    cfg(limbs, 12'(rns_scale));
+    enc_slots();
+    run_cmd(FHE_ENCRYPT, "ENCRYPT (DMA outputs)");
+    expect_dma_released("ENCRYPT");
+
+    // (1) A firmware DMA transfer in progress refuses the command (cause 6);
+    //     the firmware copy completes intact.
+    for (int i = 0; i < 8192; i++) dram[SCRATCH/8 + i] = {32'(i), 32'hA5A5_0000 | 32'(i)};
+    dma_fw_copy_start(SCRATCH, COPY_DST, 64 * 1024);
+    expect_reject(FHE_ENCRYPT, FHE_EC_DMA_BUSY, "ENCRYPT while a firmware DMA copy runs");
+    guard = 0;
+    do begin dma_fw_read(`AXI_DMA_REG_STATUS0, d); guard++; end while ((d & `AXI_DMA_REG_STATUS0_BUSY_MASK) && guard < 100000);
+    diff = 0;
+    for (int i = 0; i < 8192; i++) if (dram[COPY_DST/8 + i] !== dram[SCRATCH/8 + i]) diff++;
+    if (d[0] || diff != 0) begin $display("FAIL: firmware DMA copy (busy=%0d, %0d bad words)", d[0], diff); errors++; end
+    else $display("PASS firmware DMA copy completed alongside the refused command");
+
+    // (2) Slot addresses: 16-byte alignment and the DMA address range (cause 9).
+    set_slot(2, 64'(ADDR_C0 + 8));
+    expect_reject(FHE_ENCRYPT, FHE_EC_BAD_ADDR, "ENCRYPT with a misaligned output slot");
+    enc_slots();
+    set_slot(3, (64'd1 << DMA_AW) - 64'(N * 8));
+    if (limbs == 2) expect_reject(FHE_ENCRYPT, FHE_EC_BAD_ADDR, "ENCRYPT whose c1 slot runs past the DMA range");
+    enc_slots();
+
+    // (3) Firmware DMA register writes during the lease are dropped.
+    for (int i = 0; i < 512; i++) dram[MARK_DST/8 + i] = 64'hDEAD_0000_0000_0000 | 64'(i);
+    saw_lease = 0; fw_go_landed = 0;
+    fork
+      run_cmd(FHE_ENCRYPT, "ENCRYPT (firmware DMA writes during the lease)");
+      begin
+        wait (dut.br_lease);
+        saw_lease = dut.hwif_in.FHE_STATUS.DMA_LEASED.next;
+        dma_fw_copy_start(SCRATCH, MARK_DST, 4096);
+        fw_go_landed = i_dma.i_axi_dma_ctrl.hwif_out_reg.ctrl.go.value;
+      end
+    join
+    diff = 0;
+    for (int i = 0; i < 512; i++) if (dram[MARK_DST/8 + i] !== (64'hDEAD_0000_0000_0000 | 64'(i))) diff++;
+    dma_fw_read(`AXI_DMA_REG_STATUS0, d);
+    if (!saw_lease || fw_go_landed || diff != 0 || d[0]) begin
+      $display("FAIL: lease leaked a firmware transfer (leased=%0d go=%0d diff=%0d busy=%0d)",
+               saw_lease, fw_go_landed, diff, d[0]); errors++;
+    end else $display("PASS STATUS.DMA_LEASED during the command; firmware DMA writes dropped");
+    expect_dma_released("ENCRYPT under lease");
+
+    // (4) An inbound residue not below its prime taints the command (cause 8).
+    cfg(limbs, 12'(i2f_val));
+    dec_slots();
+    saved = dram[ADDR_C0/8 + 5];
+    dram[ADDR_C0/8 + 5] = FHE_Q[0];
+    run_cmd(FHE_DECRYPT, "DECRYPT with c0[5] = q0", FHE_EC_BAD_WORD);
+    dram[ADDR_C0/8 + 5] = saved;
+    expect_dma_released("tainted DECRYPT");
+
+    // (5) An AXI read error fails the command (cause 10); the DMA is flushed
+    //     and the next command runs normally.
+    mem_rd_err = 1'b1;
+    run_cmd(FHE_DECRYPT, "DECRYPT with AXI read errors", FHE_EC_TRANSPORT);
+    mem_rd_err = 1'b0;
+    expect_dma_released("DECRYPT transport error");
+    run_cmd(FHE_DECRYPT, "DECRYPT after a transport error");
+    begin
+      longint reco [];
+      reco = new[N];
+      capture_slots(reco, ADDR_OUT);
+      check_fft(reco, g_input, N, "DECRYPT after transport error (recovered vs input)", 1.0e-3);
+    end
+
+    // (6) ZEROIZE in the middle of a DMA output segment: the segment drains,
+    //     then the command completes as aborted and the lease is released.
+    cfg(limbs, 12'(rns_scale));
+    enc_slots();
+    ahb_write(A_CTRL, {29'd0, FHE_ENCRYPT});
+    guard = 0;
+    while (!(dut.br_active && dut.br_status[1] && dut.br_left < N/2) && guard < 100000) begin
+      service_local_stream(); guard++;
+    end
+    ahb_write(A_CTRL, CTRL_ZEROIZE);
+    guard = 0;
+    do begin ahb_read(A_STATUS, d); guard++; end while (!d[ST_VALID] && guard < 10000);
+    if (d[ST_READY] && d[ST_ERROR] && d[7:4] == FHE_EC_ABORTED && !d[9] && dma_resp.idle && saw_abort_drain)
+      $display("PASS ZEROIZE mid DMA segment drains, then reports an aborted completion (%0d polls)", guard);
+    else begin $display("FAIL: ZEROIZE mid DMA segment left STATUS=0x%08h", d); errors++; end
+    expect_dma_released("abort");
+  endtask
+`endif
+
   // Independent public integer evaluator: scalar multiply/add only, using
   // unbounded-domain model weights and canonical modular reduction per term.
   // An encrypted constant-one channel supplies bias without assuming an NTT
@@ -635,7 +836,7 @@ module fhe_top_dma_tb
         weight = int'(weights[k*197+feature_idx]);
         for (int component=0;component<2;component++)
           for (int li=0;li<2;li++) begin
-            q = Q_LIMB[li];
+            q = FHE_Q[li];
             for (int i=0;i<N;i++) begin
               int a;
               a = k*4*N + (component*2+li)*N+i;
@@ -1080,6 +1281,10 @@ module fhe_top_dma_tb
       else begin $display("FAIL: ZEROIZE mid-ENCRYPT left STATUS=0x%08h", d); errors++; end
       ahb_read(A_XFER_STATUS, d);
       if (d != 0) begin $display("FAIL: ZEROIZE left XFER_STATUS=0x%08h", d); errors++; end
+
+`ifdef FHE_DMA_STREAM
+      dma_stream_tests();
+`endif
 
       // Restore the seed-A key for the optional MNIST run.
       load_seed(SEED_A);

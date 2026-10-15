@@ -86,7 +86,11 @@ import kv_defines_pkg::*;
 
     // Interrupt
     output logic notif_intr,
-    output logic error_intr
+    output logic error_intr,
+
+    // Hardware requester (FHE stream bridge); tie hw_req to '0 when unused
+    input  axi_dma_hw_req_t  hw_req,
+    output axi_dma_hw_resp_t hw_resp
 
 );
 
@@ -131,7 +135,8 @@ import kv_defines_pkg::*;
     // --------------------------------------- //
 
     axi_dma_reg_pkg::axi_dma_reg__in_t hwif_in;
-    axi_dma_reg_pkg::axi_dma_reg__out_t hwif_out;
+    axi_dma_reg_pkg::axi_dma_reg__out_t hwif_out_reg; // register block outputs
+    axi_dma_reg_pkg::axi_dma_reg__out_t hwif_out;     // effective: registers, or the leased requester
 
     enum logic [1:0] {
         DMA_IDLE,
@@ -327,7 +332,7 @@ import kv_defines_pkg::*;
         .s_cpuif_wr_err      (reg_wr_err                                                    ),
 
         .hwif_in             (hwif_in                                                       ),
-        .hwif_out            (hwif_out                                                      )
+        .hwif_out            (hwif_out_reg                                                  )
     );
     assign error = reg_rd_err   || reg_wr_err;
     assign hold  = reg_rd_stall || reg_wr_stall;
@@ -337,7 +342,48 @@ import kv_defines_pkg::*;
         hwif_in.cptra_pwrgood = cptra_pwrgood;
         hwif_in.cptra_rst_b   = rst_n;
         hwif_in.soc_req       = req_data.soc_req;
-        hwif_in.dma_swwel     = req_data.soc_req || ctrl_fsm_ps != DMA_IDLE;
+        hwif_in.dma_swwel     = req_data.soc_req || ctrl_fsm_ps != DMA_IDLE || hw_req.lease;
+    end
+
+    // --------------------------------------- //
+    // Hardware Requester Lease                //
+    // --------------------------------------- //
+    // While leased, the requester's segment replaces the firmware transfer
+    // registers and its 32-bit word stream takes the AHB_FIFO route, so the
+    // rest of the DMA (requests, credits, checks, FSM) runs unchanged.
+    // Firmware writes are dropped (dma_swwel) as during any busy transfer.
+    always_comb begin
+        hwif_out = hwif_out_reg;
+        if (hw_req.lease) begin
+            hwif_out.ctrl.go.value           = hw_req.go;
+            hwif_out.ctrl.flush.value        = hw_req.flush;
+            hwif_out.ctrl.aes_mode_en.value  = 1'b0;
+            hwif_out.ctrl.aes_gcm_mode.value = 1'b0;
+            hwif_out.ctrl.rd_fixed.value     = 1'b0;
+            hwif_out.ctrl.wr_fixed.value     = 1'b0;
+            hwif_out.ctrl.rd_route.value     = hw_req.to_axi ? axi_dma_reg__ctrl__rd_route__rd_route_e__DISABLE
+                                                             : axi_dma_reg__ctrl__rd_route__rd_route_e__AHB_FIFO;
+            hwif_out.ctrl.wr_route.value     = hw_req.to_axi ? axi_dma_reg__ctrl__wr_route__wr_route_e__AHB_FIFO
+                                                             : axi_dma_reg__ctrl__wr_route__wr_route_e__DISABLE;
+            hwif_out.src_addr_l.addr_l.value = hw_req.addr[31:0];
+            hwif_out.src_addr_h.addr_h.value = hw_req.addr[63:32];
+            hwif_out.dst_addr_l.addr_l.value = hw_req.addr[31:0];
+            hwif_out.dst_addr_h.addr_h.value = hw_req.addr[63:32];
+            hwif_out.byte_count.count.value  = hw_req.byte_count;
+            hwif_out.block_size.size.value   = '0;
+            hwif_out.read_data.rdata.swacc   = hw_req.rd_ready;
+            hwif_out.write_data.wdata.swmod  = hw_req.wr_valid;
+        end
+    end
+
+    always_comb begin
+        hw_resp.idle     = (ctrl_fsm_ps == DMA_IDLE) && !hwif_out_reg.ctrl.go.value;
+        hw_resp.busy     = (ctrl_fsm_ps != DMA_IDLE);
+        hw_resp.done     = (ctrl_fsm_ps == DMA_DONE);
+        hw_resp.error    = (ctrl_fsm_ps == DMA_ERROR);
+        hw_resp.rd_valid = rd_route_valid;
+        hw_resp.rd_data  = rd_route_data;
+        hw_resp.wr_ready = fifo_w_ready;
     end
 
 
@@ -593,22 +639,25 @@ import kv_defines_pkg::*;
         end
     endgenerate
 
-    always_comb hwif_in.intr_block_rf.error_internal_intr_r.error_cmd_dec_sts       .hwset = (ctrl_fsm_ps == DMA_IDLE) && hwif_out.ctrl.go.value && cmd_parse_error;
-    always_comb hwif_in.intr_block_rf.error_internal_intr_r.error_axi_rd_sts        .hwset = r_req_if.resp_valid && r_req_if.resp inside {AXI_RESP_SLVERR,AXI_RESP_DECERR};
-    always_comb hwif_in.intr_block_rf.error_internal_intr_r.error_axi_wr_sts        .hwset = w_req_if.resp_valid && w_req_if.resp inside {AXI_RESP_SLVERR,AXI_RESP_DECERR};
+    // Transfer events of a leased requester segment are reported to the
+    // requester, not as DMA interrupts.
+    wire fw_txn = !hw_req.lease;
+    always_comb hwif_in.intr_block_rf.error_internal_intr_r.error_cmd_dec_sts       .hwset = fw_txn && ((ctrl_fsm_ps == DMA_IDLE) && hwif_out.ctrl.go.value && cmd_parse_error);
+    always_comb hwif_in.intr_block_rf.error_internal_intr_r.error_axi_rd_sts        .hwset = fw_txn && (r_req_if.resp_valid && r_req_if.resp inside {AXI_RESP_SLVERR,AXI_RESP_DECERR});
+    always_comb hwif_in.intr_block_rf.error_internal_intr_r.error_axi_wr_sts        .hwset = fw_txn && (w_req_if.resp_valid && w_req_if.resp inside {AXI_RESP_SLVERR,AXI_RESP_DECERR});
     always_comb hwif_in.intr_block_rf.error_internal_intr_r.error_mbox_lock_sts     .hwset = mb_lock_dropped && !mb_lock_error; // pulse to set
     always_comb hwif_in.intr_block_rf.error_internal_intr_r.error_aes_cif_sts       .hwset = aes_err && aes_req_dv; // Pulse to set
     always_comb hwif_in.intr_block_rf.error_internal_intr_r.error_sha_lock_sts      .hwset = 1'b0; // SHA accelerator direct-mode not enabled; sha locking should be checked by API user (i.e. FW) instead of in HW
-    always_comb hwif_in.intr_block_rf.error_internal_intr_r.error_fifo_oflow_sts    .hwset = (hwif_out.ctrl.wr_route.value == axi_dma_reg__ctrl__wr_route__wr_route_e__AHB_FIFO) &&  fifo_w_valid && !fifo_w_ready;
-    always_comb hwif_in.intr_block_rf.error_internal_intr_r.error_fifo_uflow_sts    .hwset = (hwif_out.ctrl.rd_route.value == axi_dma_reg__ctrl__rd_route__rd_route_e__AHB_FIFO) && !fifo_r_valid &&  fifo_r_ready;
+    always_comb hwif_in.intr_block_rf.error_internal_intr_r.error_fifo_oflow_sts    .hwset = fw_txn && ((hwif_out.ctrl.wr_route.value == axi_dma_reg__ctrl__wr_route__wr_route_e__AHB_FIFO) &&  fifo_w_valid && !fifo_w_ready);
+    always_comb hwif_in.intr_block_rf.error_internal_intr_r.error_fifo_uflow_sts    .hwset = fw_txn && ((hwif_out.ctrl.rd_route.value == axi_dma_reg__ctrl__rd_route__rd_route_e__AHB_FIFO) && !fifo_r_valid &&  fifo_r_ready);
     always_comb hwif_in.intr_block_rf.error_internal_intr_r.error_kv_rd_sts         .hwset = kv_read_error;
     always_comb hwif_in.intr_block_rf.error_internal_intr_r.error_kv_rd_large_sts   .hwset = kv_premature_done_error;
 
-    always_comb hwif_in.intr_block_rf.notif_internal_intr_r.notif_txn_done_sts      .hwset = ctrl_fsm_ps inside {DMA_DONE,DMA_ERROR};
-    always_comb hwif_in.intr_block_rf.notif_internal_intr_r.notif_fifo_empty_sts    .hwset =  fifo_empty && !fifo_empty_r;
-    always_comb hwif_in.intr_block_rf.notif_internal_intr_r.notif_fifo_not_empty_sts.hwset = !fifo_empty &&  fifo_empty_r;
-    always_comb hwif_in.intr_block_rf.notif_internal_intr_r.notif_fifo_full_sts     .hwset =  fifo_full && !fifo_full_r;
-    always_comb hwif_in.intr_block_rf.notif_internal_intr_r.notif_fifo_not_full_sts .hwset = !fifo_full &&  fifo_full_r;
+    always_comb hwif_in.intr_block_rf.notif_internal_intr_r.notif_txn_done_sts      .hwset = fw_txn && (ctrl_fsm_ps inside {DMA_DONE,DMA_ERROR});
+    always_comb hwif_in.intr_block_rf.notif_internal_intr_r.notif_fifo_empty_sts    .hwset = fw_txn && ( fifo_empty && !fifo_empty_r);
+    always_comb hwif_in.intr_block_rf.notif_internal_intr_r.notif_fifo_not_empty_sts.hwset = fw_txn && (!fifo_empty &&  fifo_empty_r);
+    always_comb hwif_in.intr_block_rf.notif_internal_intr_r.notif_fifo_full_sts     .hwset = fw_txn && ( fifo_full && !fifo_full_r);
+    always_comb hwif_in.intr_block_rf.notif_internal_intr_r.notif_fifo_not_full_sts .hwset = fw_txn && (!fifo_full &&  fifo_full_r);
 
     assign notif_intr = hwif_out.intr_block_rf.notif_global_intr_r.intr;
     assign error_intr = hwif_out.intr_block_rf.error_global_intr_r.intr;
@@ -967,7 +1016,7 @@ import kv_defines_pkg::*;
 
     always_comb begin
         if (hwif_out.ctrl.wr_route.value == axi_dma_reg__ctrl__wr_route__wr_route_e__AHB_FIFO) begin
-            fifo_w_data  = req_data.wdata;
+            fifo_w_data  = hw_req.lease ? hw_req.wr_data : req_data.wdata;
             fifo_w_valid = hwif_out.write_data.wdata.swmod;
         end
         else if (hwif_out.ctrl.wr_route.value == axi_dma_reg__ctrl__wr_route__wr_route_e__MBOX) begin

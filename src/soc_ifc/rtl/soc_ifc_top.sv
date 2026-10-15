@@ -132,6 +132,12 @@ module soc_ifc_top
     output kv_read_t    kv_read,
     input  kv_rd_resp_t kv_rd_resp,
 
+`ifdef FHE_DMA_STREAM
+    // FHE stream bridge: hardware requester port of the AXI DMA
+    input  axi_pkg::axi_dma_hw_req_t  dma_hw_req,
+    output axi_pkg::axi_dma_hw_resp_t dma_hw_resp,
+`endif
+
     // Subsystem mode straps
     input logic [63:0] strap_ss_caliptra_base_addr,
     input logic [63:0] strap_ss_mci_base_addr,
@@ -1293,7 +1299,16 @@ axi_dma_top #(
 
     // Interrupt
     .notif_intr(dma_notif_intr),
-    .error_intr(dma_error_intr)
+    .error_intr(dma_error_intr),
+
+    // Hardware requester
+`ifdef FHE_DMA_STREAM
+    .hw_req    (dma_hw_req    ),
+    .hw_resp   (dma_hw_resp   )
+`else
+    .hw_req    ('0            ),
+    .hw_resp   (              )
+`endif
 
 );
 

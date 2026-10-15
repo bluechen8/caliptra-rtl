@@ -89,13 +89,10 @@ package fhe_params_pkg;
   parameter FHE_MEM_SK_ADDR_W      = $clog2(FHE_MEM_SK_DEPTH);
 
   //----------------------------------------------------------------
-  // RNS prime set (per-prime constants).
-  //   Each prime p_i is a 32-bit NTT-friendly prime, p_i = 1 (mod 2N).
-  //   NOTE: the values below are placeholders for the Stage-0 integration
-  //   stub (no actual modular arithmetic runs yet). Stage A pins a verified
-  //   software-generated table (primes + Barrett mu + N^-1) for the chosen N.
+  // Limb primes (profile 0xa108): q0 = 2^46-9*2^24+1, q1 = 2^47-2^24+1.
   //----------------------------------------------------------------
-  parameter [FHE_L-1:0][FHE_WORD-1:0] FHE_PRIMES = '{default: 32'h0}; // TODO(Stage A): real primes
+  localparam logic [63:0] FHE_Q [0:FHE_L-1] =
+      '{0: 64'h00003fff_f7000001, 1: 64'h00007fff_ff000001, default: 64'd0};
 
   //----------------------------------------------------------------
   // Command opcodes (mirror mldsa_cmd_e convention)
@@ -118,9 +115,45 @@ package fhe_params_pkg;
     FHE_EC_BAD_OPCODE = 4'd3,
     FHE_EC_NO_SEED    = 4'd4,
     FHE_EC_KV_READ    = 4'd5,
+    FHE_EC_DMA_BUSY   = 4'd6,
     FHE_EC_BAD_LOGN   = 4'd7,
+    FHE_EC_BAD_WORD   = 4'd8,
+    FHE_EC_BAD_ADDR   = 4'd9,
+    FHE_EC_TRANSPORT  = 4'd10,
     FHE_EC_ABORTED    = 4'd11
   } fhe_err_e;
+
+  //----------------------------------------------------------------
+  // Segment routes (docs/fhe/16 "Commands, slots and inputs"). Each slot of a
+  // command moves either nothing, its q0 limb, or CONFIG.L limbs. Slots that
+  // cross the AES boundary (ENCRYPT message in, DECRYPT slots out) take the AES
+  // route; every other slot bypasses AES.
+  //----------------------------------------------------------------
+  // Limbs a command moves through `slot` (0: the slot is unused).
+  function automatic logic [3:0] fhe_slot_limbs(fhe_cmd_e cmd, logic [2:0] slot, logic [3:0] l);
+    unique case (cmd)
+      FHE_ENCRYPT: return (slot == 3'd0) ? 4'd1 : (slot >= 3'd2 && slot <= 3'd3) ? l : 4'd0;
+      FHE_DECRYPT: return (slot <= 3'd2) ? 4'd1 : 4'd0;
+      FHE_RECOVER: return (slot <= 3'd2) ? l : 4'd0;
+      FHE_REFRESH: return (slot <= 3'd1) ? 4'd1 : (slot <= 3'd3) ? l : 4'd0;
+      default:     return 4'd0;
+    endcase
+  endfunction
+  function automatic logic fhe_slot_aes(fhe_cmd_e cmd, logic [2:0] slot);
+    return (cmd == FHE_ENCRYPT && slot == 3'd0) || (cmd == FHE_DECRYPT && slot == 3'd2);
+  endfunction
+  // The slot moves data and bypasses AES (the DMA stream's routes).
+  function automatic logic fhe_slot_dma(fhe_cmd_e cmd, logic [2:0] slot);
+    return (fhe_slot_limbs(cmd, slot, 4'd1) != 0) && !fhe_slot_aes(cmd, slot);
+  endfunction
+
+  // XFER_STATUS layout (fhe_reg.rdl): {HALF[12], LIMB[11:8], SLOT[6:4],
+  // OUT_VALID[3], IN_READY[2], DIR[1], ACTIVE[0]}.
+  function automatic logic [31:0] fhe_xfer_status(logic active, logic dir, logic in_ready,
+                                                  logic out_valid, logic [2:0] slot,
+                                                  logic [3:0] limb, logic half);
+    return {19'b0, half, limb, 1'b0, slot, out_valid, in_ready, dir, active};
+  endfunction
 
   parameter [63:0] FHE_CORE_NAME    = 64'h00000000_53_4B_4B_43; // "CKKS"
   parameter [63:0] FHE_CORE_VERSION = 64'h00000000_3030312e;    // "1.00"

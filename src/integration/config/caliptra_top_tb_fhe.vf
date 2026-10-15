@@ -36,6 +36,7 @@ ${CALIPTRA_ROOT}/src/fhe/rtl/fhe_nettype_none.v
 //    `ifdef FHE_WALKER), plus the Aloha core above.
 ${CALIPTRA_ROOT}/src/fhe/rtl/fhe_microseq.sv
 ${CALIPTRA_ROOT}/src/fhe/rtl/fhe_local_stream.sv
+${CALIPTRA_ROOT}/src/fhe/rtl/fhe_dma_stream_bridge.sv
 
 // C'-1b: KeyVault keygen-seed reader (instantiated by fhe_top under `ifdef
 //   FHE_WALKER). Imports kv_defines_pkg, already compiled by the base filelist.

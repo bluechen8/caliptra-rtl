@@ -38,4 +38,30 @@ package axi_pkg;
         AXI_RESP_DECERR = 2'b11
     } axi_resp_e;
 
+    // Hardware requester port of axi_dma (used by the FHE stream bridge).
+    // While `lease` is set the requester owns the DMA: firmware register
+    // writes are dropped, and each segment moves `byte_count` bytes between
+    // AXI at `addr` and the requester's 32-bit word stream.
+    typedef struct packed {
+        logic        lease;      // hold for the whole requester command
+        logic        go;         // start a segment; hold until busy
+        logic        to_axi;     // 1: requester -> AXI write; 0: AXI read -> requester
+        logic [63:0] addr;
+        logic [31:0] byte_count;
+        logic        flush;      // leave ERROR after a failed segment
+        logic        rd_ready;   // requester pops rd_data this cycle
+        logic        wr_valid;   // requester pushes wr_data this cycle
+        logic [31:0] wr_data;
+    } axi_dma_hw_req_t;
+
+    typedef struct packed {
+        logic        idle;       // DMA idle with no firmware transfer pending
+        logic        busy;       // a segment is in progress
+        logic        done;       // 1-cycle: segment completed (all writes acknowledged)
+        logic        error;      // segment failed; DMA waits for flush
+        logic        rd_valid;
+        logic [31:0] rd_data;
+        logic        wr_ready;
+    } axi_dma_hw_resp_t;
+
 endpackage

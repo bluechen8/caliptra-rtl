@@ -33,9 +33,8 @@ module fhe_local_stream #(parameter int N = 8192)(
   assign data_rdata = output_valid ? (half ? payload[63:32] : payload[31:0]) : 0;
   assign access_error = (data_write && !input_ready) || (data_read && !output_valid);
   assign remaining = 32'(left);
-  // bit 0 active, 1 output direction, 2 input ready, 3 output valid,
-  // [6:4] pointer selector, [11:8] limb, bit 12 next DATA access is high half.
-  assign status = {19'b0, half, limb, 1'b0, ptr, output_valid, input_ready, direction, active};
+  assign status = fhe_params_pkg::fhe_xfer_status(active, direction, input_ready, output_valid,
+                                                 ptr, limb, half);
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       active <= 0; direction <= 0; full <= 0; half <= 0;
