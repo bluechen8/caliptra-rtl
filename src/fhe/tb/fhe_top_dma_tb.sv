@@ -59,20 +59,22 @@ module fhe_top_dma_tb
   localparam logic [AHW-1:0] A_SLOT0       = 'h30;   // slot n at 0x30 + 8n
   localparam logic [AHW-1:0] A_XFER_DATA   = 'h50;
   localparam logic [31:0]    CTRL_ZEROIZE  = 32'h8;
+  localparam logic [31:0]    CTRL_INPUT_COMMIT = 32'h10;
   // STATUS fields.
   localparam int ST_READY = 0, ST_VALID = 1, ST_ERROR = 2, ST_KEY_VALID = 3;
+  localparam int ST_COMMIT_WAIT = 8, ST_DMA_LEASED = 9;
 `ifdef FHE_FFT_ON_THE_FLY
   localparam logic [31:0] CAP_FFT = 32'd1 << 20;
 `else
   localparam logic [31:0] CAP_FFT = 32'd0;
 `endif
 `ifdef FHE_DMA_STREAM
-  localparam logic [31:0] CAP_DMA = 32'd1 << 24;
+  localparam logic [31:0] CAP_DMA = 32'd1 << 24;   // DMA_STREAM; FW_STREAM = 0
 `else
-  localparam logic [31:0] CAP_DMA = 32'd0;
+  localparam logic [31:0] CAP_DMA = 32'd1 << 25;   // FW_STREAM
 `endif
   localparam int DMA_AW = 48;   // axi_dma address width (slot range checks)
-  localparam logic [31:0] CAP_EXPECTED = 32'(N) | (32'(FHE_L) << 16) | CAP_FFT | CAP_DMA | (32'd1 << 25) | (32'd2 << 28);
+  localparam logic [31:0] CAP_EXPECTED = 32'(N) | (32'(FHE_L) << 16) | CAP_FFT | CAP_DMA | (32'd2 << 28);
 
   localparam int     RT_SCALE    = 17 + LOGN;
   // The pre-reuse golden key was sampled from this 64-bit seed with IV 0, which
@@ -342,9 +344,35 @@ module fhe_top_dma_tb
   logic [63:0] dram [0:DEPTH-1];
 
 `ifdef FHE_DMA_STREAM
+`include "caliptra_reg_defines.svh"
 `include "caliptra_reg_field_defines.svh"
   // ---- Caliptra axi_dma with an AXI memory over the same `dram` ----
   axi_if #(.AW(DMA_AW), .DW(32), .IW(1), .UW(32)) dma_axi (.clk(clk), .rst_n(rst_b));
+
+  // ---- Caliptra AES engine: the DMA's AES port, and an AHB port for the
+  //      firmware/host GCM steps (key, IV, AAD, tag, host-side seal/open) ----
+  localparam int AES_AW = 12;
+  logic [AES_AW-1:0]         aes_haddr = '0;
+  logic [DW-1:0]             aes_hwdata = '0, aes_hrdata;
+  logic                      aes_hsel = 1'b0, aes_hwrite = 1'b0, aes_hresp, aes_hreadyout;
+  logic [1:0]                aes_htrans = 2'b00;
+  logic                      aes_input_ready, aes_output_valid, aes_status_idle;
+  logic                      aes_dma_dv, aes_dma_hold, aes_dma_err;
+  soc_ifc_pkg::soc_ifc_req_t aes_dma_req;
+  logic [31:0]               aes_dma_rdata;
+  aes_clp_wrapper #(.CIF_DATA_WIDTH(32), .AHB_DATA_WIDTH(DW), .AHB_ADDR_WIDTH(AES_AW)) i_aes (
+    .clk(clk), .reset_n(rst_b), .cptra_pwrgood(rst_b),
+    .haddr_i(aes_haddr), .hwdata_i(aes_hwdata), .hsel_i(aes_hsel), .hwrite_i(aes_hwrite),
+    .hready_i(aes_hreadyout), .htrans_i(aes_htrans), .hsize_i(3'b010),
+    .hresp_o(aes_hresp), .hreadyout_o(aes_hreadyout), .hrdata_o(aes_hrdata),
+    .ocp_lock_in_progress(1'b0), .key_release_key_size('0),
+    .input_ready_o(aes_input_ready), .output_valid_o(aes_output_valid), .status_idle_o(aes_status_idle),
+    .dma_req_dv(aes_dma_dv), .dma_req_write(aes_dma_req.write),
+    .dma_req_addr(aes_dma_req.addr[AES_AW-1:0]), .dma_req_wdata(aes_dma_req.wdata),
+    .dma_req_hold(aes_dma_hold), .dma_req_error(aes_dma_err), .dma_req_rdata(aes_dma_rdata),
+    .kv_read(), .kv_rd_resp('0), .kv_write(), .kv_wr_resp('0),
+    .busy_o(), .error_intr(), .notif_intr(), .debugUnlock_or_scan_mode_switch(1'b0)
+  );
   logic                       dma_dv = 1'b0, dma_hold, dma_err, dma_notif, dma_error_intr;
   logic [31:0]                dma_rdata;
   soc_ifc_pkg::soc_ifc_req_t  dma_reg_req = '0;
@@ -353,8 +381,9 @@ module fhe_top_dma_tb
     .recovery_data_avail(1'b0), .recovery_image_activated(1'b0),
     .mbox_lock(1'b0), .sha_lock(1'b0), .debugUnlock_or_scan_mode_switch(1'b0),
     .ocp_lock_in_progress(1'b0), .key_release_addr('0), .key_release_size('0),
-    .aes_input_ready(1'b0), .aes_output_valid(1'b0), .aes_status_idle(1'b1),
-    .aes_req_dv(), .aes_req_hold(1'b0), .aes_req_data(), .aes_rdata('0), .aes_err(1'b0),
+    .aes_input_ready(aes_input_ready), .aes_output_valid(aes_output_valid), .aes_status_idle(aes_status_idle),
+    .aes_req_dv(aes_dma_dv), .aes_req_hold(aes_dma_hold), .aes_req_data(aes_dma_req),
+    .aes_rdata(aes_dma_rdata), .aes_err(aes_dma_err),
     .kv_read(), .kv_rd_resp('0), .axuser('0),
     .m_axi_w_if(dma_axi.w_mgr), .m_axi_r_if(dma_axi.r_mgr),
     .dv(dma_dv), .req_data(dma_reg_req), .hold(dma_hold), .rdata(dma_rdata), .error(dma_err),
@@ -613,26 +642,215 @@ module fhe_top_dma_tb
     end
   endtask
 
-  // Run a command to completion; it must end with `cause` (ERROR unless NONE).
-  task automatic run_cmd(input fhe_cmd_e c, input string nm, input logic [3:0] cause = FHE_EC_NONE);
-    int base, guard;
+`ifdef FHE_DMA_STREAM
+  // ---- Firmware/host AES-GCM steps, over the AES engine's AHB port ----
+  // The ENCRYPT message and the DECRYPT slots cross the AES boundary: the host
+  // seals the message, the DMA decrypts it into Aloha, firmware checks the tag
+  // at COMMIT_WAIT; DECRYPT's output is encrypted on its way to memory and the
+  // host opens it. Word order on both paths is memory order (low word first).
+  localparam logic [255:0] GCM_KEY = 256'h6d6a8f94_67308308_feffe992_8665731c_6d6a8f94_67308308_feffe992_8665731c;
+  localparam logic [95:0]  GCM_IV  = 96'hdecaf888_faced8ad_cafebabe;
+  localparam logic [127:0] GCM_AAD = 128'h41_4c_4f_48_41_2d_76_32_00_00_00_01_feedface;
+  localparam logic [31:0]  AES_CTRL_GCM_256 = (32'(aes_pkg::AES_GCM) << `AES_REG_CTRL_SHADOWED_MODE_LOW) |
+                                              (32'(aes_pkg::AES_256) << `AES_REG_CTRL_SHADOWED_KEY_LEN_LOW);
+  localparam logic [31:0]  AES_CLP_CTRL0 = `CLP_AES_CLP_REG_CTRL0 - `CLP_AES_REG_BASE_ADDR;
+  localparam int           ADDR_SEALED = 'h30000;   // the host-sealed ENCRYPT message
+  logic [127:0]            sealed_tag;
+
+  // Same AHB-Lite sequence as ahb_access, on the AES engine's port.
+  task automatic aes_access(input bit write, input logic [31:0] a, input logic [31:0] wd,
+                            output logic [31:0] rd);
+    bit err;
+    @(negedge clk);
+    aes_hsel <= 1'b1; aes_htrans <= 2'b10; aes_hwrite <= write; aes_haddr <= AES_AW'(a);
+    @(negedge clk);
+    aes_hsel <= 1'b0; aes_htrans <= 2'b00; aes_hwrite <= 1'b0;
+    if (write) aes_hwdata <= a[2] ? {wd, 32'h0} : {32'h0, wd};
+    #1;
+    err = aes_hresp;
+    while (!aes_hreadyout) begin @(negedge clk); #1; end
+    err |= aes_hresp;
+    if (err) begin $display("FAIL: AES AHB error at 0x%0h", a); errors++; end
+    rd = a[2] ? aes_hrdata[63:32] : aes_hrdata[31:0];
+    @(negedge clk);
+    aes_hwdata <= '0;
+  endtask
+  task automatic aes_wr(input logic [31:0] a, input logic [31:0] d);
+    logic [31:0] unused;
+    aes_access(1'b1, a, d, unused);
+  endtask
+  task automatic aes_wr2(input logic [31:0] a, input logic [31:0] d);   // shadowed register
+    aes_wr(a, d); aes_wr(a, d);
+  endtask
+  task automatic aes_wait(input logic [31:0] mask);
+    logic [31:0] st;
+    int guard = 0;
+    do begin aes_access(1'b0, `AES_REG_STATUS, '0, st); guard++; end while (!(st & mask) && guard < 10000);
+    if (!(st & mask)) begin $display("FAIL: AES STATUS 0x%08h never showed 0x%0h", st, mask); errors++; end
+  endtask
+  function automatic logic [31:0] gcm_ctrl(input aes_pkg::gcm_phase_e phase, input int bytes);
+    return (32'(phase) << `AES_REG_CTRL_GCM_SHADOWED_PHASE_LOW) |
+           (32'(bytes) << `AES_REG_CTRL_GCM_SHADOWED_NUM_VALID_BYTES_LOW);
+  endfunction
+
+  // GCM context up to the text phase: mode, key, IV, one AAD block.
+  task automatic gcm_begin(input aes_pkg::aes_op_e op);
+    aes_wait(`AES_REG_STATUS_IDLE_MASK);
+    aes_wr(AES_CLP_CTRL0, 32'h0);   // no endian swap
+    aes_wait(`AES_REG_STATUS_IDLE_MASK);
+    aes_wr2(`AES_REG_CTRL_SHADOWED, (32'(op) << `AES_REG_CTRL_SHADOWED_OPERATION_LOW) | AES_CTRL_GCM_256);
+    aes_wait(`AES_REG_STATUS_IDLE_MASK);
+    aes_wr2(`AES_REG_CTRL_GCM_SHADOWED, gcm_ctrl(aes_pkg::GCM_INIT, 16));
+    aes_wait(`AES_REG_STATUS_IDLE_MASK);
+    for (int j = 0; j < 8; j++) begin
+      aes_wr(`AES_REG_KEY_SHARE0_0 + 4*j, GCM_KEY[32*j +: 32]);
+      aes_wr(`AES_REG_KEY_SHARE1_0 + 4*j, 32'h0);
+    end
+    aes_wait(`AES_REG_STATUS_IDLE_MASK);
+    for (int j = 0; j < 4; j++) aes_wr(`AES_REG_IV_0 + 4*j, (j < 3) ? GCM_IV[32*j +: 32] : 32'h0);
+    aes_wait(`AES_REG_STATUS_IDLE_MASK);
+    aes_wr2(`AES_REG_CTRL_GCM_SHADOWED, gcm_ctrl(aes_pkg::GCM_AAD, 16));
+    aes_wait(`AES_REG_STATUS_INPUT_READY_MASK);
+    for (int j = 0; j < 4; j++) aes_wr(`AES_REG_DATA_IN_0 + 4*j, GCM_AAD[32*j +: 32]);
+  endtask
+  // Text phase over AHB: `words` 64-bit words from dram[src] to dram[dst].
+  task automatic gcm_text_ahb(input int src, input int dst, input int words);
+    logic [31:0] o [0:3];
+    aes_wait(`AES_REG_STATUS_IDLE_MASK);
+    aes_wr2(`AES_REG_CTRL_GCM_SHADOWED, gcm_ctrl(aes_pkg::GCM_TEXT, 16));
+    for (int b = 0; b < words/2; b++) begin
+      aes_wait(`AES_REG_STATUS_INPUT_READY_MASK);
+      for (int j = 0; j < 4; j++) aes_wr(`AES_REG_DATA_IN_0 + 4*j, dram[src/8 + 2*b + j/2][32*(j%2) +: 32]);
+      aes_wait(`AES_REG_STATUS_OUTPUT_VALID_MASK);
+      for (int j = 0; j < 4; j++) aes_access(1'b0, `AES_REG_DATA_OUT_0 + 4*j, '0, o[j]);
+      dram[dst/8 + 2*b]     = {o[1], o[0]};
+      dram[dst/8 + 2*b + 1] = {o[3], o[2]};
+    end
+  endtask
+  // Tag phase, then discard the context.
+  task automatic gcm_finish(input int text_bytes, output logic [127:0] tag);
+    aes_wait(`AES_REG_STATUS_IDLE_MASK);
+    aes_wr2(`AES_REG_CTRL_GCM_SHADOWED, gcm_ctrl(aes_pkg::GCM_TAG, 16));
+    // len(AAD) || len(text) in bits, big-endian 64-bit fields
+    aes_wr(`AES_REG_DATA_IN_0 + 0,  32'h0);
+    aes_wr(`AES_REG_DATA_IN_0 + 4,  {<<8{32'd128}});
+    aes_wr(`AES_REG_DATA_IN_0 + 8,  32'h0);
+    aes_wr(`AES_REG_DATA_IN_0 + 12, {<<8{32'(text_bytes * 8)}});
+    aes_wait(`AES_REG_STATUS_OUTPUT_VALID_MASK);
+    for (int j = 0; j < 4; j++) aes_access(1'b0, `AES_REG_DATA_OUT_0 + 4*j, '0, tag[32*j +: 32]);
+    gcm_discard();
+  endtask
+  // Return the engine to manual mode with cleared state.
+  task automatic gcm_discard();
+    aes_wr2(`AES_REG_CTRL_SHADOWED, 32'h1 << `AES_REG_CTRL_SHADOWED_MANUAL_OPERATION_LOW);
+    aes_wr(`AES_REG_TRIGGER, (32'h1 << `AES_REG_TRIGGER_KEY_IV_DATA_IN_CLEAR_LOW) |
+                             (32'h1 << `AES_REG_TRIGGER_DATA_OUT_CLEAR_LOW));
+  endtask
+
+  // Host: seal the slot-0 plaintext (firmware's slot_base[0]) and point the
+  // hardware slot 0 at the sealed copy.
+  task automatic seal_message();
+    gcm_begin(aes_pkg::AES_ENC);
+    gcm_text_ahb(int'(slot_base[0]), ADDR_SEALED, N);
+    gcm_finish(N*8, sealed_tag);
+    ahb_write64(A_SLOT0, 64'(ADDR_SEALED));
+  endtask
+  // Firmware at COMMIT_WAIT: finish GCM; INPUT_COMMIT if the tag matches,
+  // else ZEROIZE.
+  task automatic commit_input(output bit tag_ok);
+    logic [127:0] tag;
+    gcm_finish(N*8, tag);
+    tag_ok = (tag == sealed_tag);
+    ahb_write(A_CTRL, tag_ok ? CTRL_INPUT_COMMIT : CTRL_ZEROIZE);
+  endtask
+  // From COMMIT_WAIT: check the tag and wait for the command's completion.
+  task automatic commit_and_wait(input string nm, output bit tag_ok);
+    int base = notif_count;
+    commit_input(tag_ok);
+    if (tag_ok) wait_notif(base, nm);
+    else        wait_status(ST_VALID, nm);
+  endtask
+  // After DECRYPT: finish GCM; the host opens the output in place.
+  task automatic open_output(input bit open);
+    logic [127:0] tag, host_tag;
+    gcm_finish(N*8, tag);
+    if (open) begin
+      gcm_begin(aes_pkg::AES_DEC);
+      gcm_text_ahb(int'(slot_base[2]), int'(slot_base[2]), N);
+      gcm_finish(N*8, host_tag);
+      if (host_tag !== tag) begin
+        $display("FAIL: DECRYPT output tag %h, host computed %h", tag, host_tag); errors++;
+      end
+    end
+  endtask
+`endif
+
+  // Issue a command, with the AES-GCM context it needs (DMA stream build);
+  // `base` is notif_count before it. forge >= 0 flips a bit of that sealed
+  // message word (one plaintext mantissa bit, CTR mode) after sealing.
+  task automatic issue_cmd(input fhe_cmd_e c, output int base, input int forge = -1);
     base = notif_count;
+`ifdef FHE_DMA_STREAM
+    if (c == FHE_ENCRYPT) begin
+      seal_message();
+      if (forge >= 0) dram[ADDR_SEALED/8 + forge] ^= 64'h1;
+      gcm_begin(aes_pkg::AES_DEC);
+    end
+    if (c == FHE_DECRYPT) gcm_begin(aes_pkg::AES_ENC);
+`endif
     ahb_write(A_CTRL, {29'd0, c});
-    cpu_sleep = 1; // parent must stay awake through the stream and completion delivery
-    guard = 0;
+  endtask
+
+  // Wait for the next notif, servicing the firmware-forward stream meanwhile.
+  task automatic wait_notif(input int base, input string nm);
+    int guard = 0;
     while ((notif_count == base) && (guard < 50_000_000)) begin service_local_stream(); guard++; end
     if (notif_count == base) begin $display("  FAIL: %s never completed (timeout)", nm); errors++; end
-    else                          $display("  [fhe] %s done (%0d polling iterations)", nm, guard);
+    else                          $display("  [fhe] %s notif (%0d polling iterations)", nm, guard);
+  endtask
+
+  // Complete a command issued when notif_count was `base`; it must end with
+  // `cause` (ERROR unless NONE). With the DMA stream, ENCRYPT stops at
+  // COMMIT_WAIT for the tag check.
+  task automatic finish_cmd(input fhe_cmd_e c, input int base, input string nm,
+                            input logic [3:0] cause = FHE_EC_NONE);
+    logic [31:0] st;
+    cpu_sleep = 1; // parent must stay awake through the stream and completion delivery
+    wait_notif(base, nm);
+`ifdef FHE_DMA_STREAM
+    if (c == FHE_ENCRYPT) begin
+      bit tag_ok;
+      ahb_read(A_STATUS, st);
+      if (!st[ST_COMMIT_WAIT] || st[ST_VALID]) begin
+        $display("  FAIL: %s notif without COMMIT_WAIT (STATUS 0x%08h)", nm, st); errors++;
+      end
+      commit_and_wait(nm, tag_ok);
+      if (!tag_ok) begin $display("  FAIL: %s message tag mismatch", nm); errors++; end
+    end
+`endif
     @(negedge clk);
     cpu_sleep = 0;
-    begin
-      logic [31:0] st;
-      ahb_read(A_STATUS, st);
-      if (st[ST_ERROR] != (cause != FHE_EC_NONE) || st[7:4] != cause) begin
-        $display("  FAIL: %s completed with STATUS 0x%08h, expected cause %0d", nm, st, cause); errors++;
-      end else if (cause != FHE_EC_NONE)
-        $display("PASS %s -> ERROR cause %0d", nm, cause);
-    end
+    ahb_read(A_STATUS, st);
+    if (st[ST_ERROR] != (cause != FHE_EC_NONE) || st[7:4] != cause) begin
+      $display("  FAIL: %s completed with STATUS 0x%08h, expected cause %0d", nm, st, cause); errors++;
+    end else if (cause != FHE_EC_NONE)
+      $display("PASS %s -> ERROR cause %0d", nm, cause);
+`ifdef FHE_DMA_STREAM
+    if (c == FHE_DECRYPT) open_output(cause == FHE_EC_NONE);
+`endif
+  endtask
+
+  task automatic run_cmd(input fhe_cmd_e c, input string nm, input logic [3:0] cause = FHE_EC_NONE);
+    int base;
+    issue_cmd(c, base);
+    finish_cmd(c, base, nm, cause);
+  endtask
+
+  task automatic wait_status(input int bit_idx, input string nm);
+    logic [31:0] d;
+    int guard = 0;
+    do begin ahb_read(A_STATUS, d); guard++; end while (!d[bit_idx] && guard < 100000);
+    if (!d[bit_idx]) begin $display("FAIL: %s: STATUS bit %0d never set (0x%08h)", nm, bit_idx, d); errors++; end
   endtask
 
   // Issue a command expected to be refused, and check the reported cause.
@@ -701,6 +919,12 @@ module fhe_top_dma_tb
   int          rns_scale;
   logic [31:0] i2f_val;
 
+  task automatic rekey(input string nm);
+    load_seed(SEED_A);
+    cfg(2, 12'(rns_scale));
+    run_cmd(FHE_KEYGEN, nm);
+  endtask
+
 `ifdef FHE_DMA_STREAM
   task automatic expect_dma_released(input string nm);
     if (!dma_resp.idle || dut.br_lease) begin
@@ -708,27 +932,112 @@ module fhe_top_dma_tb
     end
   endtask
 
-  // DMA stream: lease conflicts, slot checks, input checks, transport errors
-  // and an abort that drains a segment in flight. Ends with KEY_VALID = 0.
+  // Without the firmware-forward stream, XFER_DATA accesses fail.
+  task automatic check_xfer_data_off();
+    logic [31:0] d;
+    bit rd_err, wr_err;
+    ahb_read(A_CAP, d);
+    if (d != CAP_EXPECTED) begin $display("FAIL: CAP=0x%08h expected 0x%08h", d, CAP_EXPECTED); errors++; end
+    ahb_access(1'b0, A_XFER_DATA, '0, d, rd_err);
+    ahb_access(1'b1, A_XFER_DATA, 32'h1234_5678, d, wr_err);
+    if (!rd_err || !wr_err) begin $display("FAIL: XFER_DATA accepted an access without FW_STREAM"); errors++; end
+    else $display("PASS CAP.DMA_STREAM, no firmware-forward stream (XFER_DATA accesses fail)");
+  endtask
+
+  // Fill `words` 64-bit words at `addr` with a marker; count words still marked.
+  task automatic mark(input int addr, input int words);
+    for (int i = 0; i < words; i++) dram[addr/8 + i] = 64'hFEED_0000_0000_0000 | 64'(addr + i);
+  endtask
+  function automatic int marked(input int addr, input int words);
+    int n = 0;
+    for (int i = 0; i < words; i++) if (dram[addr/8 + i] === (64'hFEED_0000_0000_0000 | 64'(addr + i))) n++;
+    return n;
+  endfunction
+  // The output slots c0/c1 (all limbs) are marked / still marked.
+  task automatic mark_ct();
+    mark(ADDR_C0, tb_limbs()*N); mark(ADDR_C1, tb_limbs()*N);
+  endtask
+  function automatic bit ct_untouched();
+    return marked(ADDR_C0, tb_limbs()*N) == tb_limbs()*N && marked(ADDR_C1, tb_limbs()*N) == tb_limbs()*N;
+  endfunction
+
+  // DMA stream: the ENCRYPT commit barrier, AES routes, lease conflicts, slot
+  // checks, input checks, transport errors and aborts that drain a segment in
+  // flight. Ends with KEY_VALID = 0.
   localparam int SCRATCH = 'h40000, COPY_DST = 'h60000, MARK_DST = 'h70000;
   bit saw_abort_drain = 0;
   always @(posedge clk) if (dut.abort_wait && dut.br_active) saw_abort_drain = 1;
   task automatic dma_stream_tests();
     logic [31:0] d;
     logic [63:0] saved;
-    bit          saw_lease, fw_go_landed;
-    int          guard, diff;
+    bit          saw_lease, fw_go_landed, tag_ok;
+    int          guard, diff, base;
     int          limbs = tb_limbs();
-    $display("== DMA stream: lease, checks, errors, abort ==");
-    load_seed(SEED_A);
-    cfg(2, 12'(rns_scale));
-    run_cmd(FHE_KEYGEN, "KEYGEN (DMA stream tests)");
+    longint      reco [];
+    reco = new[N];
+    $display("== DMA stream: commit barrier, AES routes, lease, checks, errors, aborts ==");
+    rekey("KEYGEN (DMA stream tests)");
     cfg(limbs, 12'(rns_scale));
     enc_slots();
-    run_cmd(FHE_ENCRYPT, "ENCRYPT (DMA outputs)");
+    run_cmd(FHE_ENCRYPT, "ENCRYPT (DMA stream)");
     expect_dma_released("ENCRYPT");
 
-    // (1) A firmware DMA transfer in progress refuses the command (cause 6);
+    // (1) Commit barrier: an early INPUT_COMMIT is ignored; in COMMIT_WAIT the
+    //     walker waits before its first arithmetic pass (ENCRYPT program word
+    //     2, the FFT EXE) and writes nothing; the commit releases it, and the
+    //     result decrypts correctly.
+    mark_ct();
+    issue_cmd(FHE_ENCRYPT, base);
+    ahb_write(A_CTRL, CTRL_INPUT_COMMIT);
+    wait_notif(base, "ENCRYPT to COMMIT_WAIT");
+    repeat (500) @(negedge clk);
+    ahb_read(A_STATUS, d);
+    if (!d[ST_COMMIT_WAIT] || d[ST_VALID] || !d[ST_DMA_LEASED] || dut.br_active || dut.walker.pc != 8'd18 ||
+        !ct_untouched()) begin
+      $display("FAIL: commit barrier (STATUS 0x%08h, active %0d, pc %0d, ciphertext untouched %0d)", d,
+               dut.br_active, dut.walker.pc, ct_untouched()); errors++;
+    end else $display("PASS COMMIT_WAIT stops the walker before its first arithmetic pass; early INPUT_COMMIT ignored");
+    commit_and_wait("ENCRYPT after INPUT_COMMIT", tag_ok);
+    ahb_read(A_STATUS, d);
+    if (!tag_ok || !d[ST_VALID] || d[ST_ERROR] || d[ST_COMMIT_WAIT]) begin
+      $display("FAIL: ENCRYPT after commit: tag ok %0d, STATUS 0x%08h", tag_ok, d); errors++;
+    end
+    cfg(limbs, 12'(i2f_val));
+    dec_slots();
+    run_cmd(FHE_DECRYPT, "DECRYPT (AES-GCM egress)");
+    capture_slots(reco, ADDR_OUT);
+    check_fft(reco, g_input, N, "AES-GCM ingress/egress round trip (recovered vs input)", 1.0e-3);
+
+    // (2) A forged message: the tag check fails, firmware zeroizes in
+    //     COMMIT_WAIT, nothing is written and the lease is released.
+    cfg(limbs, 12'(rns_scale));
+    enc_slots();
+    mark_ct();
+    issue_cmd(FHE_ENCRYPT, base, 7);
+    wait_notif(base, "forged ENCRYPT to COMMIT_WAIT");
+    commit_and_wait("forged ENCRYPT", tag_ok);
+    ahb_read(A_STATUS, d);
+    if (tag_ok || d[7:4] != FHE_EC_ABORTED || d[ST_DMA_LEASED] || !ct_untouched()) begin
+      $display("FAIL: forged message (tag ok %0d, STATUS 0x%08h)", tag_ok, d); errors++;
+    end else $display("PASS forged message: tag mismatch, ZEROIZE in COMMIT_WAIT, nothing written");
+    expect_dma_released("forged ENCRYPT");
+    rekey("KEYGEN (after the forged message)");
+
+    // (3) A non-finite message word taints ENCRYPT (cause 8), reported only
+    //     after the commit; nothing is written.
+    cfg(limbs, 12'(rns_scale));
+    enc_slots();
+    mark_ct();
+    saved = dram[ADDR_P/8 + 3];
+    dram[ADDR_P/8 + 3] = 64'h7FF8_0000_0000_0001;   // NaN
+    run_cmd(FHE_ENCRYPT, "ENCRYPT with a NaN message word", FHE_EC_BAD_WORD);
+    dram[ADDR_P/8 + 3] = saved;
+    if (!ct_untouched()) begin
+      $display("FAIL: tainted ENCRYPT wrote output"); errors++;
+    end else $display("PASS tainted ENCRYPT writes nothing");
+    expect_dma_released("tainted ENCRYPT");
+
+    // (4) A firmware DMA transfer in progress refuses the command (cause 6);
     //     the firmware copy completes intact.
     for (int i = 0; i < 8192; i++) dram[SCRATCH/8 + i] = {32'(i), 32'hA5A5_0000 | 32'(i)};
     dma_fw_copy_start(SCRATCH, COPY_DST, 64 * 1024);
@@ -740,7 +1049,7 @@ module fhe_top_dma_tb
     if (d[0] || diff != 0) begin $display("FAIL: firmware DMA copy (busy=%0d, %0d bad words)", d[0], diff); errors++; end
     else $display("PASS firmware DMA copy completed alongside the refused command");
 
-    // (2) Slot addresses: 16-byte alignment and the DMA address range (cause 9).
+    // (5) Slot addresses: 16-byte alignment and the DMA address range (cause 9).
     set_slot(2, 64'(ADDR_C0 + 8));
     expect_reject(FHE_ENCRYPT, FHE_EC_BAD_ADDR, "ENCRYPT with a misaligned output slot");
     enc_slots();
@@ -748,18 +1057,14 @@ module fhe_top_dma_tb
     if (limbs == 2) expect_reject(FHE_ENCRYPT, FHE_EC_BAD_ADDR, "ENCRYPT whose c1 slot runs past the DMA range");
     enc_slots();
 
-    // (3) Firmware DMA register writes during the lease are dropped.
+    // (6) Firmware DMA register writes during the lease are dropped.
     for (int i = 0; i < 512; i++) dram[MARK_DST/8 + i] = 64'hDEAD_0000_0000_0000 | 64'(i);
-    saw_lease = 0; fw_go_landed = 0;
-    fork
-      run_cmd(FHE_ENCRYPT, "ENCRYPT (firmware DMA writes during the lease)");
-      begin
-        wait (dut.br_lease);
-        saw_lease = dut.hwif_in.FHE_STATUS.DMA_LEASED.next;
-        dma_fw_copy_start(SCRATCH, MARK_DST, 4096);
-        fw_go_landed = i_dma.i_axi_dma_ctrl.hwif_out_reg.ctrl.go.value;
-      end
-    join
+    issue_cmd(FHE_ENCRYPT, base);
+    wait (dut.br_lease);
+    saw_lease = dut.hwif_in.FHE_STATUS.DMA_LEASED.next;
+    dma_fw_copy_start(SCRATCH, MARK_DST, 4096);
+    fw_go_landed = i_dma.i_axi_dma_ctrl.hwif_out_reg.ctrl.go.value;
+    finish_cmd(FHE_ENCRYPT, base, "ENCRYPT (firmware DMA writes during the lease)");
     diff = 0;
     for (int i = 0; i < 512; i++) if (dram[MARK_DST/8 + i] !== (64'hDEAD_0000_0000_0000 | 64'(i))) diff++;
     dma_fw_read(`AXI_DMA_REG_STATUS0, d);
@@ -769,43 +1074,45 @@ module fhe_top_dma_tb
     end else $display("PASS STATUS.DMA_LEASED during the command; firmware DMA writes dropped");
     expect_dma_released("ENCRYPT under lease");
 
-    // (4) An inbound residue not below its prime taints the command (cause 8).
+    // (7) An inbound residue not below its prime taints the command (cause 8);
+    //     its AES output segment then writes nothing.
     cfg(limbs, 12'(i2f_val));
     dec_slots();
+    mark(ADDR_OUT, N);
     saved = dram[ADDR_C0/8 + 5];
     dram[ADDR_C0/8 + 5] = FHE_Q[0];
     run_cmd(FHE_DECRYPT, "DECRYPT with c0[5] = q0", FHE_EC_BAD_WORD);
     dram[ADDR_C0/8 + 5] = saved;
+    if (marked(ADDR_OUT, N) != N) begin $display("FAIL: tainted DECRYPT wrote output"); errors++; end
+    else $display("PASS tainted DECRYPT writes nothing");
     expect_dma_released("tainted DECRYPT");
 
-    // (5) An AXI read error fails the command (cause 10); the DMA is flushed
+    // (8) An AXI read error fails the command (cause 10); the DMA is flushed
     //     and the next command runs normally.
     mem_rd_err = 1'b1;
     run_cmd(FHE_DECRYPT, "DECRYPT with AXI read errors", FHE_EC_TRANSPORT);
     mem_rd_err = 1'b0;
     expect_dma_released("DECRYPT transport error");
     run_cmd(FHE_DECRYPT, "DECRYPT after a transport error");
-    begin
-      longint reco [];
-      reco = new[N];
-      capture_slots(reco, ADDR_OUT);
-      check_fft(reco, g_input, N, "DECRYPT after transport error (recovered vs input)", 1.0e-3);
-    end
+    capture_slots(reco, ADDR_OUT);
+    check_fft(reco, g_input, N, "DECRYPT after transport error (recovered vs input)", 1.0e-3);
 
-    // (6) ZEROIZE in the middle of a DMA output segment: the segment drains,
+    // (9) ZEROIZE in the middle of a DMA output segment: the segment drains,
     //     then the command completes as aborted and the lease is released.
     cfg(limbs, 12'(rns_scale));
     enc_slots();
-    ahb_write(A_CTRL, {29'd0, FHE_ENCRYPT});
+    issue_cmd(FHE_ENCRYPT, base);
+    wait_notif(base, "ENCRYPT to COMMIT_WAIT");
+    commit_input(tag_ok);
     guard = 0;
-    while (!(dut.br_active && dut.br_status[1] && dut.br_left < N/2) && guard < 100000) begin
-      service_local_stream(); guard++;
+    while (!(dut.br_active && dut.br_status[1] && dut.br_left < N/2) && guard < 1000000) begin
+      @(negedge clk); guard++;
     end
     ahb_write(A_CTRL, CTRL_ZEROIZE);
-    guard = 0;
-    do begin ahb_read(A_STATUS, d); guard++; end while (!d[ST_VALID] && guard < 10000);
-    if (d[ST_READY] && d[ST_ERROR] && d[7:4] == FHE_EC_ABORTED && !d[9] && dma_resp.idle && saw_abort_drain)
-      $display("PASS ZEROIZE mid DMA segment drains, then reports an aborted completion (%0d polls)", guard);
+    wait_status(ST_VALID, "ZEROIZE mid DMA segment");
+    ahb_read(A_STATUS, d);
+    if (d[ST_READY] && d[ST_ERROR] && d[7:4] == FHE_EC_ABORTED && !d[ST_DMA_LEASED] && dma_resp.idle && saw_abort_drain)
+      $display("PASS ZEROIZE mid DMA segment drains, then reports an aborted completion");
     else begin $display("FAIL: ZEROIZE mid DMA segment left STATUS=0x%08h", d); errors++; end
     expect_dma_released("abort");
   endtask
@@ -927,7 +1234,11 @@ module fhe_top_dma_tb
       end
     end
 
+`ifdef FHE_DMA_STREAM
+    check_xfer_data_off();
+`else
     check_local_stream_bus();
+`endif
 
     // Pause the parent clock in each idle phase while lifted SRAMs continue
     // to receive base-clock edges. No repeated requests/response shifts allowed.
@@ -967,9 +1278,7 @@ module fhe_top_dma_tb
     end
 
     // ---- firmware: KeyVault seed, then KEYGEN ----
-    load_seed(SEED_A);
-    cfg(2, 12'(rns_scale));
-    run_cmd(FHE_KEYGEN, "KEYGEN");
+    rekey("KEYGEN");
     dump_state(1);
     check_baseline(1);
     begin
@@ -1002,9 +1311,7 @@ module fhe_top_dma_tb
 `ifndef FHE_FFT_ON_THE_FLY
         check_baseline(0); // floating recurrence can change rounded ciphertext values
 `endif
-        load_seed(SEED_A);
-        cfg(2, 12'(rns_scale));
-        run_cmd(FHE_KEYGEN, "KEYGEN (restart stream after replay)");
+        rekey("KEYGEN (restart stream after replay)");
         cfg(tb_limbs(), 12'(rns_scale));
       end
     end
@@ -1203,7 +1510,7 @@ module fhe_top_dma_tb
     begin
       logic [31:0] d;
       logic [7:0]  kv_err;
-      int          diff, guard, limbs;
+      int          diff, guard, limbs, base;
       longint      reco [];
       reco  = new[N];
       limbs = tb_limbs();
@@ -1268,28 +1575,38 @@ module fhe_top_dma_tb
       load_seed(SEED_B);
       cfg(limbs, 12'(rns_scale));
       run_cmd(FHE_KEYGEN, "KEYGEN before abort");
+      // Interrupted halfway through the message segment (AES-GCM decrypt with
+      // the DMA stream), which then drains.
       enc_slots();
-      ahb_write(A_CTRL, {29'd0, FHE_ENCRYPT});
+      issue_cmd(FHE_ENCRYPT, base);
       guard = 0;
+`ifdef FHE_DMA_STREAM
+      while (!(dut.br_active && !dut.br_status[1] && dut.br_left < N/2) && guard < 100000) begin
+        @(negedge clk); guard++;
+      end
+`else
       while (!(dut.i_local_stream.active && dut.i_local_stream.left < N/2) && guard < 100000) begin
         service_local_stream(); guard++;
       end
+`endif
       ahb_write(A_CTRL, CTRL_ZEROIZE);
+      wait_status(ST_VALID, "ZEROIZE mid-ENCRYPT");
       ahb_read(A_STATUS, d);
       if (d[ST_READY] && d[ST_VALID] && d[ST_ERROR] && d[7:4] == FHE_EC_ABORTED && !d[ST_KEY_VALID])
         $display("PASS ZEROIZE mid-ENCRYPT reports an aborted completion and clears KEY_VALID");
       else begin $display("FAIL: ZEROIZE mid-ENCRYPT left STATUS=0x%08h", d); errors++; end
       ahb_read(A_XFER_STATUS, d);
       if (d != 0) begin $display("FAIL: ZEROIZE left XFER_STATUS=0x%08h", d); errors++; end
+`ifdef FHE_DMA_STREAM
+      gcm_discard();   // abandon the GCM context
+`endif
 
 `ifdef FHE_DMA_STREAM
       dma_stream_tests();
 `endif
 
       // Restore the seed-A key for the optional MNIST run.
-      load_seed(SEED_A);
-      cfg(2, 12'(rns_scale));
-      run_cmd(FHE_KEYGEN, "KEYGEN (restore seed A)");
+      rekey("KEYGEN (restore seed A)");
     end
 
     begin

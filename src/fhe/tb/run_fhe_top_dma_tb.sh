@@ -8,8 +8,10 @@
 # TB memory. It checks round trips, recovery, refresh, the single-seed stream
 # and command preconditions. Options: LIMBS2=1 (two-limb ciphertexts and the
 # N=256 key golden), FFT_ON_THE_FLY=1, STREAM_STALLS=1, MNIST_DIR=<dir>,
-# DMA_STREAM=1 (bypass-AES segments through Caliptra's axi_dma and an AXI
-# memory over the same TB memory; adds the lease/address/error/abort tests).
+# DMA_STREAM=1 (every segment through Caliptra's axi_dma and an AXI memory
+# over the same TB memory, the ENCRYPT message and DECRYPT slots through
+# Caliptra's AES-GCM; adds the commit-barrier, lease, address, error and abort
+# tests).
 #
 # Expect: "fhe_top_dma_tb RESULT: PASS".
 set -euo pipefail
@@ -22,6 +24,8 @@ FHE="$(dirname "$HERE")"                                  # src/fhe
 export ALOHA_PORT="$FHE/aloha"
 export ALOHA_SRC="${ALOHA_SRC:-$ALOHA_PORT/vendor}"
 export CALIPTRA_ROOT="$(cd "$FHE/../.." && pwd)"          # caliptra repo root
+export CALIPTRA_PRIM_ROOT="${CALIPTRA_PRIM_ROOT:-$CALIPTRA_ROOT/src/caliptra_prim_generic}"
+export CALIPTRA_PRIM_MODULE_PREFIX="${CALIPTRA_PRIM_MODULE_PREFIX:-caliptra_prim_generic}"
 VERILATOR="${VERILATOR:-$(command -v verilator || echo /scratch/boru/chipyard/.conda-env/bin/verilator)}"
 
 TOP=fhe_top_dma_tb

@@ -349,16 +349,17 @@ import kv_defines_pkg::*;
     // Hardware Requester Lease                //
     // --------------------------------------- //
     // While leased, the requester's segment replaces the firmware transfer
-    // registers and its 32-bit word stream takes the AHB_FIFO route, so the
-    // rest of the DMA (requests, credits, checks, FSM) runs unchanged.
+    // registers and its 32-bit word stream takes the AHB_FIFO route, with or
+    // without AES-GCM, so the rest of the DMA (requests, credits, checks, AES
+    // FSM) runs unchanged.
     // Firmware writes are dropped (dma_swwel) as during any busy transfer.
     always_comb begin
         hwif_out = hwif_out_reg;
         if (hw_req.lease) begin
             hwif_out.ctrl.go.value           = hw_req.go;
             hwif_out.ctrl.flush.value        = hw_req.flush;
-            hwif_out.ctrl.aes_mode_en.value  = 1'b0;
-            hwif_out.ctrl.aes_gcm_mode.value = 1'b0;
+            hwif_out.ctrl.aes_mode_en.value  = hw_req.aes;
+            hwif_out.ctrl.aes_gcm_mode.value = hw_req.aes;
             hwif_out.ctrl.rd_fixed.value     = 1'b0;
             hwif_out.ctrl.wr_fixed.value     = 1'b0;
             hwif_out.ctrl.rd_route.value     = hw_req.to_axi ? axi_dma_reg__ctrl__rd_route__rd_route_e__DISABLE
@@ -567,7 +568,9 @@ import kv_defines_pkg::*;
 
             default:                                                   cmd_inv_route_combo = 1;
         endcase
-        cmd_inv_aes_route_combo = hwif_out.ctrl.aes_mode_en.value && (
+        // Firmware AES transfers are AXI to AXI; a leased requester also uses
+        // AES between AXI and its word stream.
+        cmd_inv_aes_route_combo = hwif_out.ctrl.aes_mode_en.value && !hw_req.lease && (
                                     hwif_out.ctrl.rd_route.value != 2'(axi_dma_reg__ctrl__rd_route__rd_route_e__AXI_WR) ||  
                                     hwif_out.ctrl.wr_route.value != 3'(axi_dma_reg__ctrl__wr_route__wr_route_e__AXI_RD));
         cmd_inv_aes_block_size = hwif_out.ctrl.aes_mode_en.value && hwif_out.block_size.size.value != '0;
@@ -646,7 +649,7 @@ import kv_defines_pkg::*;
     always_comb hwif_in.intr_block_rf.error_internal_intr_r.error_axi_rd_sts        .hwset = fw_txn && (r_req_if.resp_valid && r_req_if.resp inside {AXI_RESP_SLVERR,AXI_RESP_DECERR});
     always_comb hwif_in.intr_block_rf.error_internal_intr_r.error_axi_wr_sts        .hwset = fw_txn && (w_req_if.resp_valid && w_req_if.resp inside {AXI_RESP_SLVERR,AXI_RESP_DECERR});
     always_comb hwif_in.intr_block_rf.error_internal_intr_r.error_mbox_lock_sts     .hwset = mb_lock_dropped && !mb_lock_error; // pulse to set
-    always_comb hwif_in.intr_block_rf.error_internal_intr_r.error_aes_cif_sts       .hwset = aes_err && aes_req_dv; // Pulse to set
+    always_comb hwif_in.intr_block_rf.error_internal_intr_r.error_aes_cif_sts       .hwset = fw_txn && aes_err && aes_req_dv; // Pulse to set
     always_comb hwif_in.intr_block_rf.error_internal_intr_r.error_sha_lock_sts      .hwset = 1'b0; // SHA accelerator direct-mode not enabled; sha locking should be checked by API user (i.e. FW) instead of in HW
     always_comb hwif_in.intr_block_rf.error_internal_intr_r.error_fifo_oflow_sts    .hwset = fw_txn && ((hwif_out.ctrl.wr_route.value == axi_dma_reg__ctrl__wr_route__wr_route_e__AHB_FIFO) &&  fifo_w_valid && !fifo_w_ready);
     always_comb hwif_in.intr_block_rf.error_internal_intr_r.error_fifo_uflow_sts    .hwset = fw_txn && ((hwif_out.ctrl.rd_route.value == axi_dma_reg__ctrl__rd_route__rd_route_e__AHB_FIFO) && !fifo_r_valid &&  fifo_r_ready);
@@ -1506,7 +1509,7 @@ import kv_defines_pkg::*;
     assign aes_fifo_w_valid = aes_cif_read_cnt_incr && aes_fifo_bytes_written < hwif_out.byte_count.count;
     assign aes_fifo_w_data  = aes_rdata; 
 
-    assign aes_fifo_r_ready = hwif_out.ctrl.aes_mode_en.value && w_ready_i;
+    assign aes_fifo_r_ready = hwif_out.ctrl.aes_mode_en.value && rd_route_ready;
     assign aes_fsm_rd_route_data = aes_fifo_r_data;
     assign aes_fsm_rd_route_valid = aes_fifo_r_valid;
 

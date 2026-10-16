@@ -126,8 +126,8 @@ package fhe_params_pkg;
   //----------------------------------------------------------------
   // Segment routes (docs/fhe/16 "Commands, slots and inputs"). Each slot of a
   // command moves either nothing, its q0 limb, or CONFIG.L limbs. Slots that
-  // cross the AES boundary (ENCRYPT message in, DECRYPT slots out) take the AES
-  // route; every other slot bypasses AES.
+  // cross the AES boundary (ENCRYPT message in, DECRYPT slots out) go through
+  // AES-GCM; every other slot bypasses AES.
   //----------------------------------------------------------------
   // Limbs a command moves through `slot` (0: the slot is unused).
   function automatic logic [3:0] fhe_slot_limbs(fhe_cmd_e cmd, logic [2:0] slot, logic [3:0] l);
@@ -139,12 +139,21 @@ package fhe_params_pkg;
       default:     return 4'd0;
     endcase
   endfunction
+  function automatic logic fhe_slot_used(fhe_cmd_e cmd, logic [2:0] slot);
+    return fhe_slot_limbs(cmd, slot, 4'd1) != 4'd0;
+  endfunction
   function automatic logic fhe_slot_aes(fhe_cmd_e cmd, logic [2:0] slot);
     return (cmd == FHE_ENCRYPT && slot == 3'd0) || (cmd == FHE_DECRYPT && slot == 3'd2);
   endfunction
-  // The slot moves data and bypasses AES (the DMA stream's routes).
-  function automatic logic fhe_slot_dma(fhe_cmd_e cmd, logic [2:0] slot);
-    return (fhe_slot_limbs(cmd, slot, 4'd1) != 0) && !fhe_slot_aes(cmd, slot);
+  // The slot carries binary64 message words (checked finite) rather than
+  // residues (checked < q).
+  function automatic logic fhe_slot_msg(fhe_cmd_e cmd, logic [2:0] slot);
+    return cmd == FHE_ENCRYPT && slot == 3'd0;
+  endfunction
+  // The command's input is unauthenticated until firmware checks its GCM tag:
+  // the walker holds before its first EXE pass until CTRL.INPUT_COMMIT.
+  function automatic logic fhe_cmd_commits(fhe_cmd_e cmd);
+    return cmd == FHE_ENCRYPT;
   endfunction
 
   // XFER_STATUS layout (fhe_reg.rdl): {HALF[12], LIMB[11:8], SLOT[6:4],

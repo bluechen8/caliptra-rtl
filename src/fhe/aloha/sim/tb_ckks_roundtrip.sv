@@ -159,6 +159,7 @@ module tb_ckks_roundtrip;
     // zero-latency split dram_src/dram_cap array model, no DMA engine).
     .dma_desc_valid(), .dma_desc_wr(), .dma_desc_ptr(), .dma_desc_limb(),
     .dma_ready(1'b1), .dma_rd_valid(1'b1), .dma_rd_pop(), .dma_wr_ready(1'b1),
+    .exe_hold(1'b0), .exe_held(),
     .busy(w_busy), .done(w_done), .error(w_error)
   );
 

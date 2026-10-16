@@ -96,6 +96,11 @@ module fhe_microseq
   output logic        dma_rd_pop,     // walker consumed a DMA_IN word this cycle
   input  logic        dma_wr_ready,   // DMA_OUT FIFO can accept a word
 
+  // Hold before the next EXE pass (fhe_top's ENCRYPT input-commit barrier);
+  // exe_held = the walker is parked on that EXE.
+  input  logic        exe_hold,
+  output logic        exe_held,
+
   // Sampler reseed gate (via fhe_top -> ComputeCoreWrapper): 1 only for the
   // KEYGEN key-sampling pass; every other pass continues the same stream.
   output logic        reseed_en,
@@ -414,6 +419,7 @@ module fhe_microseq
   assign sk_wdata = {dout_high[21:0], dout_low};
 
   assign dma_desc_valid = step && (st == S_DMA_REQ) && dma_ready;
+  assign exe_held       = (st == S_DECODE) && (f_op(op_w) == OP_EXE) && exe_hold;
   assign dma_desc_wr    = desc_wr_r;
   assign dma_desc_ptr   = desc_ptr_r;
   assign dma_desc_limb  = desc_limb_r;
@@ -571,7 +577,7 @@ module fhe_microseq
               pc          <= pc + 8'd1;
               st          <= S_FETCH;
             end
-            OP_EXE: begin
+            OP_EXE: if (!exe_hold) begin
               // The sampler seed arrives on fhe_top's sideband; only the KEYGEN
               // key-sampling pass reloads it. dina carries no seed.
               reseed_en <= (f_ps(op_w) == PS_KG);

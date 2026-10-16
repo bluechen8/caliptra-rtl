@@ -18,11 +18,11 @@
 //   microsequencer ("walker"), the Aloha ComputeCore and its transports.
 //   Specification: docs/fhe/16-register-map-v2.md (Chipyard checkout).
 //
-//   Transports: the firmware-forward stream (XFER_DATA) carries every segment,
-//   unless FHE_DMA_STREAM is defined. Then segments that bypass AES move through
-//   Caliptra's axi_dma (fhe_dma_stream_bridge, under a per-command lease), and
-//   only the AES routes (ENCRYPT message in, DECRYPT slots out) stay on the
-//   firmware-forward stream until the AES routes exist.
+//   Transports: with FHE_DMA_STREAM every segment moves through Caliptra's
+//   axi_dma (fhe_dma_stream_bridge, under a per-command lease), the ENCRYPT
+//   message and the DECRYPT slots through AES-GCM, and ENCRYPT computes
+//   nothing until firmware commits its input (CTRL.INPUT_COMMIT). Without it,
+//   the firmware-forward bring-up stream (XFER_DATA) carries every segment.
 //
 //   The datapath is compiled only with FHE_WALKER; otherwise the block ties
 //   off its bus and outputs. The former stage-0 stub and the dedicated fhe_dma
@@ -172,8 +172,10 @@ module fhe_top
   assign zeroize   = ctrl_wr & ctrl_wdata[3];
   assign cmd_in    = fhe_cmd_e'(ctrl_wdata[2:0]);
   assign cmd_write = ctrl_wr & ~ctrl_wdata[3] & ready & (ctrl_wdata[2:0] != 3'b000);
-  // CTRL.INPUT_COMMIT (bit 4) is effective only with the DMA stream transport;
-  // the firmware-forward build commits implicitly (firmware checks its input).
+  // CTRL.INPUT_COMMIT (bit 4) releases the ENCRYPT commit barrier (DMA stream
+  // only; the firmware-forward build commits implicitly).
+  logic commit_wait;
+  wire  input_commit = ctrl_wr & ctrl_wdata[4] & commit_wait;
 
   // Phase generator: every logical engine cycle is READ, EXECUTE, WRITE.
   logic [1:0] mem_phase;
@@ -259,8 +261,8 @@ module fhe_top
   assign cfg_logn  = hwif_out.FHE_CONFIG.LOGN.value;
   assign cfg_scale = hwif_out.FHE_CONFIG.SCALE.value;
 
-  // DMA-routed slots of a command must be 16-byte aligned and must not run
-  // past the DMA's address space: BASE + limbs*N*8 <= 2^DMA_AW.
+  // The slots a command uses must be 16-byte aligned and must not run past the
+  // DMA's address space: BASE + limbs*N*8 <= 2^DMA_AW.
   logic [63:0] slot_base [0:3];
   logic        slots_ok, dma_idle;
   function automatic logic slot_ok(input logic [63:0] base, input logic [3:0] limbs);
@@ -273,7 +275,7 @@ module fhe_top
     for (int s = 0; s < 4; s++) begin
       logic [3:0] limbs;
       limbs = fhe_slot_limbs(cmd_in, 3'(s), cfg_l);
-      if (fhe_slot_dma(cmd_in, 3'(s)) && !slot_ok(slot_base[s], limbs))
+      if (limbs != 0 && !slot_ok(slot_base[s], limbs))
         slots_ok = 1'b0;
     end
   end
@@ -376,8 +378,9 @@ module fhe_top
   end
 
   // Interrupts: 1-cycle pulses. notif = completion (including rejection and
-  // abort); error = failed completion.
-  assign notif_intr = done | abort_done;
+  // abort) or entering COMMIT_WAIT; error = failed completion.
+  logic commit_enter;
+  assign notif_intr = done | abort_done | commit_enter;
   assign error_intr = (done & done_error) | abort_done;
 
   //----------------------------------------------------------------
@@ -402,7 +405,7 @@ module fhe_top
     hwif_in.FHE_STATUS.ERROR.next       = status_error;
     hwif_in.FHE_STATUS.KEY_VALID.next   = key_valid;
     hwif_in.FHE_STATUS.ERR_CAUSE.next   = status_cause;
-    hwif_in.FHE_STATUS.COMMIT_WAIT.next = 1'b0;
+    hwif_in.FHE_STATUS.COMMIT_WAIT.next = commit_wait;
     hwif_in.FHE_STATUS.DMA_LEASED.next  = br_lease;
     hwif_in.FHE_STATUS.RSVD.next        = '0;
 
@@ -415,7 +418,7 @@ module fhe_top
     hwif_in.FHE_CAP.FFT_GENERATED.next = FFT_GEN;
     hwif_in.FHE_CAP.RSVD0.next         = '0;
     hwif_in.FHE_CAP.DMA_STREAM.next    = DMA_STREAM;
-    hwif_in.FHE_CAP.FW_STREAM.next     = 1'b1;
+    hwif_in.FHE_CAP.FW_STREAM.next     = !DMA_STREAM;
     hwif_in.FHE_CAP.RSVD1.next         = '0;
     hwif_in.FHE_CAP.MAP_VERSION.next   = MAP_VERSION;
 
@@ -468,6 +471,7 @@ module fhe_top
   logic [3:0]   w_desc_limb;
   logic         w_dma_ready, w_rd_valid, w_rd_pop, w_wr_ready;
   logic [3:0]   active_key_limb;
+  logic         exe_hold, exe_held;
 
   fhe_microseq #(.SRAM_REUSE(1), .LOGN(FHE_LOGN), .N(FHE_N)) walker (
     .step(core_step),
@@ -503,6 +507,8 @@ module fhe_top
     .dma_rd_valid   (w_rd_valid),
     .dma_rd_pop     (w_rd_pop),
     .dma_wr_ready   (w_wr_ready),
+    .exe_hold       (exe_hold),
+    .exe_held       (exe_held),
     .reseed_en      (w_reseed_en),
     .busy           (w_busy),
     .done           (w_done),
@@ -542,18 +548,10 @@ module fhe_top
   );
 
   //----------------------------------------------------------------
-  // Transports: route each walker segment by (command, slot)
+  // Transports
   //----------------------------------------------------------------
-  // AES-route slots (ENCRYPT message in, DECRYPT slots out) stay on the
-  // firmware-forward stream; with FHE_DMA_STREAM every other slot of the
-  // command goes through the DMA bridge (fhe_params_pkg route table).
-  logic seg_dma, seg_dma_q;
-  assign seg_dma = DMA_STREAM && fhe_slot_dma(cmd_q, w_desc_ptr);
-  always_ff @(posedge clk or negedge rst_b) begin
-    if (!rst_b)            seg_dma_q <= 1'b0;
-    else if (w_desc_valid) seg_dma_q <= seg_dma;
-  end
-
+  // With FHE_DMA_STREAM every segment goes through the DMA bridge; otherwise
+  // through the firmware-forward stream (bring-up build).
   logic        ls_ready, ls_rd_valid, ls_wr_ready;
   logic [63:0] ls_rd_data;
   logic [31:0] ls_status, ls_left;
@@ -561,21 +559,21 @@ module fhe_top
   logic [63:0] br_rd_data;
   logic [31:0] br_status, br_left;
 
-  assign w_dma_ready = ls_ready & br_ready;
-  assign w_rd_valid  = seg_dma_q ? br_rd_valid : ls_rd_valid;
-  assign w_rd_data   = seg_dma_q ? br_rd_data  : ls_rd_data;
-  assign w_wr_ready  = seg_dma_q ? br_wr_ready : ls_wr_ready;
-  assign stream_status = br_active ? br_status : ls_status;
-  assign stream_left   = br_active ? br_left   : ls_left;
+  assign w_dma_ready = DMA_STREAM ? br_ready    : ls_ready;
+  assign w_rd_valid  = DMA_STREAM ? br_rd_valid : ls_rd_valid;
+  assign w_rd_data   = DMA_STREAM ? br_rd_data  : ls_rd_data;
+  assign w_wr_ready  = DMA_STREAM ? br_wr_ready : ls_wr_ready;
+  assign stream_status = DMA_STREAM ? br_status : ls_status;
+  assign stream_left   = DMA_STREAM ? br_left   : ls_left;
 
   // Firmware-forward stream: VeeR moves each 64-bit word through XFER_DATA,
   // using SLOT/LIMB from XFER_STATUS.
   fhe_local_stream #(.N(FHE_N)) i_local_stream (
     .clk(clk), .rst_n(rst_b), .clear(zeroize),
-    .desc_valid(w_desc_valid & ~seg_dma), .desc_wr(w_desc_wr),
+    .desc_valid(w_desc_valid & ~DMA_STREAM), .desc_wr(w_desc_wr),
     .desc_ptr(w_desc_ptr), .desc_limb(w_desc_limb), .dma_ready(ls_ready),
-    .rd_valid(ls_rd_valid), .rd_data(ls_rd_data), .rd_ready(w_rd_pop & ~seg_dma_q),
-    .wr_valid(w_wr_push & ~seg_dma_q), .wr_data(w_wr_data), .wr_ready(ls_wr_ready),
+    .rd_valid(ls_rd_valid), .rd_data(ls_rd_data), .rd_ready(w_rd_pop & ~DMA_STREAM),
+    .wr_valid(w_wr_push & ~DMA_STREAM), .wr_data(w_wr_data), .wr_ready(ls_wr_ready),
     .data_read (xfer_rd),
     .data_write(xfer_wr),
     .data_wdata(hwif_out.FHE_XFER_DATA.wr_data), .data_rdata(stream_data),
@@ -583,12 +581,32 @@ module fhe_top
   );
 
 `ifdef FHE_DMA_STREAM
-  // Every command with a DMA-routed slot takes the lease (all but KEYGEN).
+  // Input commit barrier (ENCRYPT). The message arrives through AES-GCM
+  // decrypt, so the walker stops before its first arithmetic pass. Once it is
+  // parked there and the DMA is idle (every input segment done, AES quiet),
+  // COMMIT_WAIT rises (with notif) and firmware checks the GCM tag, then
+  // writes INPUT_COMMIT, or ZEROIZE to abort. The command waits for the
+  // commit even when its input failed a check: the outcome is reported only
+  // after the tag check, so it reveals nothing about unauthenticated plaintext.
+  logic committed, commit_wait_q;
+  assign exe_hold     = fhe_cmd_commits(cmd_q) && !committed;
+  assign commit_wait  = exe_held && br_ready;
+  assign commit_enter = commit_wait && !commit_wait_q;
+  always_ff @(posedge clk or negedge rst_b) begin
+    if (!rst_b)                     {committed, commit_wait_q} <= 2'b00;
+    else if (zeroize || cmd_accept) {committed, commit_wait_q} <= 2'b00;
+    else begin
+      commit_wait_q <= commit_wait;
+      if (input_commit) committed <= 1'b1;
+    end
+  end
+
+  // Every command that moves data takes the lease (all but KEYGEN).
   logic cmd_uses_dma;
   always_comb begin
     cmd_uses_dma = 1'b0;
     for (int s = 0; s < 4; s++)
-      if (fhe_slot_dma(cmd_in, 3'(s))) cmd_uses_dma = 1'b1;
+      if (fhe_slot_used(cmd_in, 3'(s))) cmd_uses_dma = 1'b1;
   end
   fhe_dma_stream_bridge #(.N(FHE_N)) i_dma_bridge (
     .clk(clk), .rst_b(rst_b),
@@ -598,18 +616,21 @@ module fhe_top
     .lease      (br_lease),
     .word_error (br_word_error),
     .xfer_error (br_xfer_error),
-    .desc_valid(w_desc_valid & seg_dma), .desc_wr(w_desc_wr),
-    .desc_ptr(w_desc_ptr), .desc_limb(w_desc_limb), .dma_ready(br_ready),
-    .rd_valid(br_rd_valid), .rd_data(br_rd_data), .rd_ready(w_rd_pop & seg_dma_q),
-    .wr_valid(w_wr_push & seg_dma_q), .wr_data(w_wr_data), .wr_ready(br_wr_ready),
+    .desc_valid(w_desc_valid), .desc_wr(w_desc_wr),
+    .desc_ptr(w_desc_ptr), .desc_limb(w_desc_limb),
+    .desc_aes(fhe_slot_aes(cmd_q, w_desc_ptr)), .desc_msg(fhe_slot_msg(cmd_q, w_desc_ptr)),
+    .dma_ready(br_ready),
+    .rd_valid(br_rd_valid), .rd_data(br_rd_data), .rd_ready(w_rd_pop),
+    .wr_valid(w_wr_push), .wr_data(w_wr_data), .wr_ready(br_wr_ready),
     .slot_base(slot_base),
     .seg_active(br_active), .status(br_status), .remaining(br_left),
     .hw_req(fhe_dma_req), .hw_resp(fhe_dma_resp)
   );
   assign dma_idle = fhe_dma_resp.idle;
 `else
+  assign {commit_enter, commit_wait, exe_hold} = '0;
   assign {br_lease, br_word_error, br_xfer_error, br_active} = '0;
-  assign {br_ready, br_rd_valid, br_wr_ready} = 3'b100;
+  assign {br_ready, br_rd_valid, br_wr_ready} = '0;
   assign {br_rd_data, br_status, br_left} = '0;
   assign dma_idle = 1'b1;
 `endif

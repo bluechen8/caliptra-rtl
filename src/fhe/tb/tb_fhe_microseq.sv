@@ -68,6 +68,7 @@ module tb_fhe_microseq;
     // array model (this trace test has no DMA engine).
     .dma_desc_valid(), .dma_desc_wr(), .dma_desc_ptr(), .dma_desc_limb(),
     .dma_ready(1'b1), .dma_rd_valid(1'b1), .dma_rd_pop(), .dma_wr_ready(1'b1),
+    .exe_hold(1'b0), .exe_held(),
     .busy(busy), .done(done), .error(error)
   );
 

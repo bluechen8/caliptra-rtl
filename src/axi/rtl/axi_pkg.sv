@@ -41,11 +41,13 @@ package axi_pkg;
     // Hardware requester port of axi_dma (used by the FHE stream bridge).
     // While `lease` is set the requester owns the DMA: firmware register
     // writes are dropped, and each segment moves `byte_count` bytes between
-    // AXI at `addr` and the requester's 32-bit word stream.
+    // AXI at `addr` and the requester's 32-bit word stream, optionally through
+    // the AES engine in GCM mode (`aes`; firmware sets up the GCM context).
     typedef struct packed {
         logic        lease;      // hold for the whole requester command
         logic        go;         // start a segment; hold until busy
         logic        to_axi;     // 1: requester -> AXI write; 0: AXI read -> requester
+        logic        aes;        // pass the segment through AES-GCM
         logic [63:0] addr;
         logic [31:0] byte_count;
         logic        flush;      // leave ERROR after a failed segment
