@@ -94,6 +94,12 @@ module fhe_dma_stream_bridge
   logic        ibuf_full, obuf_full;
   logic [63:0] ibuf, obuf;
 
+  // Per-limb residue bound, a constant table.
+  logic [63:0] Q [0:FHE_L-1];
+  for (genvar i = 0; i < FHE_L; i++) begin : g_q
+    assign Q[i] = fhe_q(4'(i));
+  end
+
   assign seg_active = (state != B_IDLE);
   assign dma_ready  = (state == B_IDLE) && !hw_resp.busy;
   assign remaining  = 32'(left);
@@ -184,7 +190,7 @@ module fhe_dma_stream_bridge
               if (!abort_q) begin
                 ibuf_full <= 1'b1;
                 if (msg_q ? (hw_resp.rd_data[30:20] == 11'h7FF)     // NaN or infinity
-                          : ({hw_resp.rd_data, ibuf[31:0]} >= FHE_Q[limb_q]))
+                          : ({hw_resp.rd_data, ibuf[31:0]} >= Q[limb_q]))
                   word_error <= 1'b1;
               end
             end

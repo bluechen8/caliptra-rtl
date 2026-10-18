@@ -9,8 +9,8 @@
 # KeyVault seed read, CONFIG and slot bases, commands, GCM setup, tag checks
 # and sealing. It checks round trips, recovery, refresh, the single-seed
 # stream, command preconditions, the commit barrier, lease, address, error and
-# abort cases. Options: LIMBS2=1 (two-limb ciphertexts and the N=256 key
-# golden), FFT_ON_THE_FLY=1, STREAM_STALLS=1, MNIST_DIR=<dir>. +RPC turns the
+# abort cases. Options: FHE_L=<1..8> (largest level, default 2), LIMBS2=1
+# (two-limb ciphertexts and the N=256 key golden), FFT_ON_THE_FLY=1, STREAM_STALLS=1, MNIST_DIR=<dir>. +RPC turns the
 # binary into the emulator's Aloha RTL link (BUILD_ONLY=1 prints its path).
 #
 # Expect: "fhe_top_dma_tb RESULT: PASS".
@@ -18,6 +18,7 @@ set -euo pipefail
 
 LOGN="${1:-8}"
 N=$((1 << LOGN))
+FHE_L="${FHE_L:-2}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"      # src/fhe/tb
 FHE="$(dirname "$HERE")"                                  # src/fhe
@@ -32,15 +33,15 @@ TOP=fhe_top_dma_tb
 FLIST="$HERE/${TOP}.f"
 # All build/run artifacts go under src/fhe/build/ (gitignored) -- never under tb/.
 BUILD="$FHE/build"
-WORK="$BUILD/dmaN$N"
+WORK="$BUILD/dmaN${N}L${FHE_L}"
 MIF="$WORK/mif"
 OBJ_DIR="${OBJ_DIR:-$BUILD/obj_dir_$TOP}"
-LOG="$BUILD/${TOP}.log"
+LOG="${LOG:-$BUILD/${TOP}.log}"
 mkdir -p "$MIF"
 
-echo "== [N=$N / LOGN=$LOGN] regenerating ROM tables + plaintext =="
+echo "== [N=$N / LOGN=$LOGN / L=$FHE_L] regenerating ROM tables + plaintext =="
 # Generate both tables locally for every N; never use a checked-in CROM.
-python3 "$ALOHA_PORT/vendor/Scripts/GenerateConstantsROM.py"        "$LOGN" "$MIF/TwFctrCache_RNSConsts.coe"
+python3 "$ALOHA_PORT/vendor/Scripts/GenerateConstantsROM.py"        "$LOGN" "$MIF/TwFctrCache_RNSConsts.coe" --profiles "$FHE_L"
 python3 "$ALOHA_PORT/vendor/Scripts/GenerateStoredFFTTwiddleFct.py" "$LOGN" "$MIF/FFTStoredTwiddleFactors.coe"
 
 python3 "$ALOHA_PORT/tvgen/gen_roundtrip.py" "$LOGN" "$WORK" >/dev/null
@@ -57,14 +58,14 @@ echo "=== build $TOP (N=$N) ${EXTRA_DEF:+[$EXTRA_DEF]} ==="
   -Wno-CASEINCOMPLETE -Wno-BLKANDNBLK -Wno-MULTIDRIVEN -Wno-SELRANGE \
   -Wno-LATCH -Wno-IMPLICIT -Wno-UNSIGNED -Wno-CMPCONST -Wno-ASCRANGE \
   -Wno-PINMISSING -Wno-WIDTHCONCAT -Wno-GENUNNAMED -Wno-DECLFILENAME -Wno-UNUSEDSIGNAL \
-  -DFHE_WALKER -DFHE_N="$N" $EXTRA_DEF \
+  -DFHE_WALKER -DFHE_N="$N" -DFHE_L="$FHE_L" $EXTRA_DEF \
   --Mdir "$OBJ_DIR" \
   -f "$FLIST" \
   -o "V$TOP" \
   2>&1 | tee "$LOG"
 
 # Rundir with the .coe->.mem ROM init the Aloha core $readmemh's (depth-5, under build/).
-RUNDIR="$BUILD/.run_$TOP/a/b/c/d"
+RUNDIR="${RUNDIR:-$BUILD/.run_$TOP/a/b/c/d}"
 mkdir -p "$RUNDIR"
 coe2mem() {
   [[ -f "$1" ]] || { echo "ERROR: missing ROM table: $1" >&2; return 1; }
@@ -93,6 +94,7 @@ fi
 [[ -n "${MNIST_DIR:-}" ]] && PLUSARGS="$PLUSARGS +MNIST=$MNIST_DIR"
 [[ -n "${LIMBS2:-}" ]] && PLUSARGS="$PLUSARGS +LIMBS2"
 [[ "${STREAM_STALLS:-0}" == 1 ]] && PLUSARGS="$PLUSARGS +STREAM_STALLS"
+[[ "${QUICK:-0}" == 1 ]] && PLUSARGS="$PLUSARGS +QUICK"
 ( cd "$RUNDIR" && "$OBJ_DIR/V$TOP" +TVDIR="$WORK" $PLUSARGS ) 2>&1 | tee -a "$LOG"
 
 echo "=== verdict ==="

@@ -38,16 +38,20 @@ module fhe_top_dma_tb
   localparam int AHW  = 15;            // FHE 32KB AHB window -> 15-bit client address
   localparam int DW   = 64;
 
-  // Firmware memory model (1 MB of 64-bit words) for the forwarded stream.
-  localparam int MEM_AW = 20;
-  localparam int DEPTH  = 1 << (MEM_AW - 3);
-
   // Poly-buffer layout (byte addresses). STRIDE = max(N*8, 2KB).
   localparam int STRIDE = (N*8 > 2048) ? N*8 : 2048;
   localparam int ADDR_P   = 0*STRIDE;  // plaintext
   localparam int ADDR_C0  = 1*STRIDE;  // ciphertext c0
   localparam int ADDR_C1  = (1+FHE_L)*STRIDE;  // ciphertext c1
-  localparam int ADDR_OUT = (1+2*FHE_L)*STRIDE;  // recovered slots
+  localparam int ADDR_OUT = (1+2*FHE_L)*STRIDE;  // recovered slots / limbs
+  localparam int ADDR_SEALED = (1+3*FHE_L)*STRIDE;  // the host-sealed ENCRYPT message
+  // DMA stream test buffers, 64 KiB each, after the polynomial buffers.
+  localparam int SCRATCH  = ((ADDR_SEALED + STRIDE + 'hFFFF) / 'h10000) * 'h10000;
+  localparam int COPY_DST = SCRATCH + 'h10000, MARK_DST = SCRATCH + 'h20000;
+
+  // Memory model (64-bit words): at least 1 MiB, and all of the above.
+  localparam int MEM_AW = ($clog2(MARK_DST + 'h10000) > 20) ? $clog2(MARK_DST + 'h10000) : 20;
+  localparam int DEPTH  = 1 << (MEM_AW - 3);
 
   // Register byte offsets (register map v2).
   localparam logic [AHW-1:0] A_CTRL        = 'h10;
@@ -246,12 +250,15 @@ module fhe_top_dma_tb
   endtask
   task automatic check_baseline(input bit keys);
     string dir;
-    logic [63:0] expected [0:2*N*FHE_L-1];
+    // The golden holds two limbs; with more installed, limbs 0 and 1 of the
+    // key and of a level-2 ciphertext must still match it.
+    localparam int GL = 2;
+    logic [63:0] expected [0:2*N*GL-1];
     logic [63:0] actual;
     if($value$plusargs("GOLDEN_DIR=%s",dir)) begin
-      assert(N==256 && $test$plusargs("LIMBS2")) else $fatal(1,"golden geometry mismatch");
-      $readmemh({dir,keys ? "/key.hex" : "/ciphertext.hex"},expected,0,keys ? N*FHE_L-1 : 2*N*FHE_L-1);
-      for(int limb=0;limb<FHE_L;limb++)
+      assert(N==256 && FHE_L>=GL && $test$plusargs("LIMBS2")) else $fatal(1,"golden geometry mismatch");
+      $readmemh({dir,keys ? "/key.hex" : "/ciphertext.hex"},expected,0,keys ? N*GL-1 : 2*N*GL-1);
+      for(int limb=0;limb<GL;limb++)
         for(int i=0;i<N;i++) begin
           if(keys) begin
             actual=i%2==0 ? {10'd0,u_aloha_mem.ntt_v0.mem[limb*(N/2)+i/2]} :
@@ -549,7 +556,6 @@ module fhe_top_dma_tb
   localparam logic [31:0]  AES_CTRL_GCM_256 = (32'(aes_pkg::AES_GCM) << `AES_REG_CTRL_SHADOWED_MODE_LOW) |
                                               (32'(aes_pkg::AES_256) << `AES_REG_CTRL_SHADOWED_KEY_LEN_LOW);
   localparam logic [31:0]  AES_CLP_CTRL0 = `CLP_AES_CLP_REG_CTRL0 - `CLP_AES_REG_BASE_ADDR;
-  localparam int           ADDR_SEALED = 'h30000;   // the host-sealed ENCRYPT message
   logic [127:0]            sealed_tag;
 
   // Same AHB-Lite sequence as ahb_access, on the AES engine's port.
@@ -812,6 +818,87 @@ module fhe_top_dma_tb
     run_cmd(FHE_KEYGEN, nm);
   endtask
 
+  // Residue v of limb li, centred in (-q_i/2, q_i/2].
+  function automatic longint signed centred(input int li, input logic [63:0] v);
+    logic [63:0] q;
+    q = fhe_q(4'(li));
+    return (v > q/2) ? longint'(v - q) : longint'(v);
+  endfunction
+
+  // RECOVER the ciphertext in slots 0/1 at level l; every limb must give the
+  // same centred coefficient as limb 0.
+  task automatic check_limbs_agree(input int l, input string nm);
+    cfg(l, 12'(rns_scale));
+    dec_slots();
+    run_cmd(FHE_RECOVER, {nm, ": RECOVER"});
+    for (int i = 0; i < N; i++) begin
+      longint signed c0;
+      c0 = centred(0, dram[ADDR_OUT/8 + i]);
+      for (int li = 1; li < l; li++)
+        assert (centred(li, dram[ADDR_OUT/8 + li*N + i]) == c0)
+          else $fatal(1, "%s: limb %0d disagrees with limb 0 at %0d", nm, li, i);
+    end
+  endtask
+
+  // Level sweep, optional MNIST, verdict.
+  task automatic finish_run();
+    string mnist_dir;
+    level_sweep();
+    if ($value$plusargs("MNIST=%s",mnist_dir)) run_mnist(mnist_dir);
+    if (errors == 0) $display("fhe_top_dma_tb RESULT: PASS");
+    else             $display("fhe_top_dma_tb RESULT: FAIL (%0d error(s))", errors);
+    $finish;
+  endtask
+
+  // Every level 1..FHE_L against the resident key, which holds all FHE_L limbs.
+  task automatic level_sweep();
+    longint reco [];
+    int nonzero;
+    reco = new[N];
+    // Key: c0 = 0 and c1 = 1 (a constant NTT) recover s in every limb, so a
+    // wrong per-limb prime, R^2 or table entry shows as a non-ternary or
+    // disagreeing limb, independent of how encryption uses the key.
+    for (int i = 0; i < FHE_L*N; i++) begin
+      dram[ADDR_C0/8 + i] = 0;
+      dram[ADDR_C1/8 + i] = 1;
+    end
+    check_limbs_agree(FHE_L, "resident key");
+    nonzero = 0;
+    for (int i = 0; i < N; i++) begin
+      longint signed s;
+      s = centred(0, dram[ADDR_OUT/8 + i]);
+      assert (s >= -1 && s <= 1) else $fatal(1, "key coefficient %0d is %0d, not ternary", i, s);
+      if (s != 0) nonzero++;
+    end
+    assert (nonzero > 0 && nonzero < N) else $fatal(1, "degenerate key: %0d nonzero coefficients", nonzero);
+    $display("PASS key: all %0d limbs recover the same ternary secret (%0d nonzero)", FHE_L, nonzero);
+
+    for (int l = 1; l <= FHE_L; l++) begin
+      cfg(l, 12'(rns_scale));
+      enc_slots();
+      run_cmd(FHE_ENCRYPT, $sformatf("ENCRYPT at level %0d", l));
+      check_limbs_agree(l, $sformatf("ENCRYPT level %0d", l));
+      cfg(1, 12'(i2f_val));
+      dec_slots();
+      run_cmd(FHE_DECRYPT, $sformatf("DECRYPT level-%0d ciphertext", l));
+      capture_slots(reco, ADDR_OUT);
+      check_fft(reco, g_input, N, $sformatf("level %0d ENCRYPT round trip", l), 1.0e-3);
+
+      // REFRESH limb 0 up to level l, in place.
+      cfg(l, 12'(rns_scale));
+      dec_slots();
+      set_slot(2, 64'(ADDR_C0)); set_slot(3, 64'(ADDR_C1));
+      run_cmd(FHE_REFRESH, $sformatf("REFRESH to level %0d", l));
+      check_limbs_agree(l, $sformatf("REFRESH level %0d", l));
+      cfg(1, 12'(i2f_val));
+      dec_slots();
+      run_cmd(FHE_DECRYPT, $sformatf("DECRYPT refreshed level-%0d ciphertext", l));
+      capture_slots(reco, ADDR_OUT);
+      check_fft(reco, g_input, N, $sformatf("level %0d REFRESH round trip", l), 1.0e-3);
+    end
+    $display("PASS level sweep: ENCRYPT and REFRESH at every level 1..%0d", FHE_L);
+  endtask
+
   task automatic expect_dma_released(input string nm);
     if (!dma_resp.idle || dut.br_lease) begin
       $display("FAIL: %s left the DMA busy or leased", nm); errors++;
@@ -852,7 +939,6 @@ module fhe_top_dma_tb
   // DMA stream: the ENCRYPT commit barrier, AES routes, lease conflicts, slot
   // checks, input checks, transport errors and aborts that drain a segment in
   // flight. Ends with KEY_VALID = 0.
-  localparam int SCRATCH = 'h40000, COPY_DST = 'h60000, MARK_DST = 'h70000;
   bit saw_abort_drain = 0;
   always @(posedge clk) if (dut.abort_wait && dut.br_active) saw_abort_drain = 1;
   task automatic dma_stream_tests();
@@ -968,7 +1054,7 @@ module fhe_top_dma_tb
     dec_slots();
     mark(ADDR_OUT, N);
     saved = dram[ADDR_C0/8 + 5];
-    dram[ADDR_C0/8 + 5] = FHE_Q[0];
+    dram[ADDR_C0/8 + 5] = fhe_q(0);
     run_cmd(FHE_DECRYPT, "DECRYPT with c0[5] = q0", FHE_EC_BAD_WORD);
     dram[ADDR_C0/8 + 5] = saved;
     if (marked(ADDR_OUT, N) != N) begin $display("FAIL: tainted DECRYPT wrote output"); errors++; end
@@ -1036,7 +1122,7 @@ module fhe_top_dma_tb
         weight = int'(weights[k*197+feature_idx]);
         for (int component=0;component<2;component++)
           for (int li=0;li<2;li++) begin
-            q = FHE_Q[li];
+            q = fhe_q(4'(li));
             for (int i=0;i<N;i++) begin
               int a;
               a = k*4*N + (component*2+li)*N+i;
@@ -1262,6 +1348,10 @@ module fhe_top_dma_tb
     end
 `endif
 
+    // +QUICK (large N): skip from here to the level sweep. An early exit, not
+    // an enclosing if: Verilator emits one block as one C++ function, too large
+    // to compile.
+    if ($test$plusargs("QUICK")) finish_run();
     // Coefficient recovery exercises both key/modulus limbs without decoding.
     // First use the real encrypted input, then an independent constant-polynomial
     // vector whose NTT is constant in every lane and whose c1 is zero.
@@ -1274,8 +1364,8 @@ module fhe_top_dma_tb
       string recovery_dir;
       logic [63:0] reference_ntt [0:2*N-1], reference_coeff [0:2*N-1];
       limbs = tb_limbs();
-      q[0] = (64'd1 << 46) - (64'd9 << 24) + 1;
-      q[1] = (64'd1 << 47) - (64'd1 << 24) + 1;
+      q[0] = fhe_q(0);
+      q[1] = fhe_q(1);
       for (int i=0;i<limbs*N;i++) begin
         saved_c0[i] = dram[ADDR_C0/8+i];
         saved_c1[i] = dram[ADDR_C1/8+i];
@@ -1286,8 +1376,8 @@ module fhe_top_dma_tb
         assert (dram[ADDR_OUT/8+i] < q[0]) else $fatal(1,"noncanonical recovery limb 0");
         if (limbs == 2) begin
           assert (dram[ADDR_OUT/8+N+i] < q[1]) else $fatal(1,"noncanonical recovery limb 1");
-          centered0 = dram[ADDR_OUT/8+i] > q[0]/2 ? dram[ADDR_OUT/8+i]-q[0] : dram[ADDR_OUT/8+i];
-          centered1 = dram[ADDR_OUT/8+N+i] > q[1]/2 ? dram[ADDR_OUT/8+N+i]-q[1] : dram[ADDR_OUT/8+N+i];
+          centered0 = centred(0, dram[ADDR_OUT/8+i]);
+          centered1 = centred(1, dram[ADDR_OUT/8+N+i]);
           assert (centered0 == centered1) else $fatal(1,"recovery limb disagreement at %0d: %0d vs %0d",i,centered0,centered1);
         end
       end
@@ -1351,7 +1441,7 @@ module fhe_top_dma_tb
       longint signed got, delta;
       int limbs, changed;
       limbs = tb_limbs();
-      q[0]=64'd70368593182721; q[1]=64'd140737471578113;
+      q[0]=fhe_q(0); q[1]=fhe_q(1);
       for (int i=0;i<limbs*N;i++) begin
         original0[i]=dram[ADDR_C0/8+i]; original1[i]=dram[ADDR_C1/8+i];
       end
@@ -1373,7 +1463,7 @@ module fhe_top_dma_tb
         cfg(1, 12'(rns_scale));
         run_cmd(FHE_RECOVER,"pre-refresh single-limb recovery");
         for (int i=0;i<N;i++)
-          before_coeff[i] = dram[ADDR_OUT/8+i]>q[0]/2 ? dram[ADDR_OUT/8+i]-q[0] : dram[ADDR_OUT/8+i];
+          before_coeff[i] = centred(0, dram[ADDR_OUT/8+i]);
         cfg(limbs, 12'(rns_scale));
         set_slot(2,64'(ADDR_C0));
         set_slot(3,64'(ADDR_C1));
@@ -1500,21 +1590,15 @@ module fhe_top_dma_tb
 
       dma_stream_tests();
 
-      // Restore the seed-A key for the optional MNIST run.
+      // Restore the seed-A key for the level sweep and the optional MNIST run.
       rekey("KEYGEN (restore seed A)");
     end
 
-    begin
-      string mnist_dir;
-      if ($value$plusargs("MNIST=%s",mnist_dir)) run_mnist(mnist_dir);
-    end
-    if (errors == 0) $display("fhe_top_dma_tb RESULT: PASS");
-    else             $display("fhe_top_dma_tb RESULT: FAIL (%0d error(s))", errors);
-    $finish;
+    finish_run();
   end
 
   initial begin
-    #800_000_000;
+    #(64'd800_000_000 * (N > 256 ? N / 256 : 1));
     $display("fhe_top_dma_tb RESULT: FAIL (global timeout)");
     $finish;
   end

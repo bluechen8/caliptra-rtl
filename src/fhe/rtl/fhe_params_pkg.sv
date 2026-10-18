@@ -35,7 +35,7 @@
   `define FHE_N 8192       // validated Aloha default
 `endif
 `ifndef FHE_L
-  `define FHE_L 2          // frozen Aloha two-prime chain
+  `define FHE_L 2          // installed primes = largest level, 1..8
 `endif
 `ifndef FHE_BATCH
   `define FHE_BATCH 1      // ciphertexts resident / processed at a time
@@ -89,10 +89,37 @@ package fhe_params_pkg;
   parameter FHE_MEM_SK_ADDR_W      = $clog2(FHE_MEM_SK_DEPTH);
 
   //----------------------------------------------------------------
-  // Limb primes (profile 0xa108): q0 = 2^46-9*2^24+1, q1 = 2^47-2^24+1.
+  // Prime catalog (aloha/vendor/Scripts/fhe_profiles.py): limb i uses
+  // q_i = 2^(46+i) - qm_i*2^24 + 1, i = 0..7, and the core selects it by
+  // k = i and modulus/constants select = i. FHE_L installs the first FHE_L.
   //----------------------------------------------------------------
-  localparam logic [63:0] FHE_Q [0:FHE_L-1] =
-      '{0: 64'h00003fff_f7000001, 1: 64'h00007fff_ff000001, default: 64'd0};
+  function automatic logic [16:0] fhe_qm(input logic [3:0] i);
+    case (i[2:0])
+      3'd0: fhe_qm = 17'd9;   3'd1: fhe_qm = 17'd1;
+      3'd2: fhe_qm = 17'd40;  3'd3: fhe_qm = 17'd5;
+      3'd4: fhe_qm = 17'd28;  3'd5: fhe_qm = 17'd7;
+      3'd6: fhe_qm = 17'd13;  default: fhe_qm = 17'd10;
+    endcase
+  endfunction
+  // Index with a constant; a runtime index builds a shifter (use a genvar table).
+  function automatic logic [63:0] fhe_q(input logic [3:0] i);
+    fhe_q = (64'd1 << (46 + i[2:0])) - (64'(fhe_qm(i)) << 24) + 64'd1;
+  endfunction
+  // R^2 mod q_i, R = 2^72: KEYGEN's Montgomery conversion. Elaboration-time
+  // only (144 modular doublings); index with a constant.
+  function automatic logic [63:0] fhe_r2modq(input logic [3:0] i);
+    logic [63:0] q;
+    q = fhe_q(i);
+    fhe_r2modq = 64'd1;
+    for (int b = 0; b < 144; b++) begin
+      fhe_r2modq = fhe_r2modq << 1;
+      if (fhe_r2modq >= q) fhe_r2modq = fhe_r2modq - q;
+    end
+  endfunction
+
+  // Core control word flags, above the [LOGN:0] bank address (N <= 16384).
+  // Mirrored as literals in aloha/vendor/Aloha-HE_Common/ComputeCoreWrapper.v.
+  localparam int FHE_CW_WEA = 17, FHE_CW_INS = 18, FHE_CW_GRANT = 19;
 
   //----------------------------------------------------------------
   // Command opcodes (mirror mldsa_cmd_e convention)

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// Single-limb level refresh for the frozen q0/q1 profile. Snapshot preserves
+// Level refresh from a q0-only ciphertext. Snapshot preserves q0
 // coefficient-domain residues in the existing FFT real bank. Lift centers at
-// q0/2, maps to the target prime, and adds the SAME sampled error in each limb.
+// q0/2, maps to each target limb's prime, and adds the SAME sampled error in each limb.
 // No multipliers, division, floating point, or additional vector storage.
 module CenterLift #(
     parameter int LOGN = 13,

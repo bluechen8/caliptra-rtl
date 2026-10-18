@@ -74,9 +74,9 @@ module tb_fhe_microseq;
 
   // ---- stub core: combinational dout = f(bram,addr); status[0]=1 a few cycles after start ----
   wire [3:0]  cl_bram = {1'b0, control_low_word[31:29]};
-  wire        cl_wea  = control_low_word[14];
-  wire        cl_ins  = control_low_word[15];
-  wire        cl_grant= control_low_word[16];
+  wire        cl_wea  = control_low_word[FHE_CW_WEA];
+  wire        cl_ins  = control_low_word[FHE_CW_INS];
+  wire        cl_grant= control_low_word[FHE_CW_GRANT];
   wire [LOGN:0] cl_addr= control_low_word[LOGN:0];
   always_comb begin
     {dout_high,dout_low} = f_data(cl_bram, cl_addr);

@@ -426,9 +426,10 @@ module fhe_top
   // Walker and core
   //----------------------------------------------------------------
   // Per-modulus R^2 mod q_i for keygen's Montgomery conversion (R = 2^72).
-  // q0 = 2^46-9*2^24+1, q1 = 2^47-2^24+1.
-  localparam logic [63:0] R2MODQ [0:FHE_L-1] =
-      '{0: 64'h00000f47_3d9a6eb2, 1: 64'h00007fff_f7000009, default: 64'd0};
+  logic [63:0] R2MODQ [0:FHE_L-1];
+  for (genvar i = 0; i < FHE_L; i++) begin : g_r2modq
+    assign R2MODQ[i] = fhe_r2modq(4'(i));
+  end
 
   logic [31:0] w_cl, w_ch, w_dl, w_dh;
   logic [31:0] core_dout_lo, core_dout_hi, core_status;

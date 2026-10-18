@@ -262,11 +262,11 @@ module tb_ckks_roundtrip;
                         input bit ins_flag, input int bram_sel);
     logic [31:0] const_part, cl;
     int i;
-    const_part = (bram_sel<<29) | ((ins_flag?0:1)<<16) | (int'(ins_flag)<<15);
+    const_part = (bram_sel<<29) | ((ins_flag?0:1)<<19) | (int'(ins_flag)<<18);
     for (i = 0; i < num; i++) begin
       dina_low  = p[i][31:0];
       dina_high = p[i][63:32];
-      cl = const_part | (1<<14) | i;    // wea=1
+      cl = const_part | (1<<17) | i;    // wea=1
       wr_ctrl_low(cl);
       cl = const_part | i;              // wea=0
       wr_ctrl_low(cl);
@@ -280,7 +280,7 @@ module tb_ckks_roundtrip;
     int i, k;
     p = new[num];
     for (i = 0; i < num; i++) begin
-      cl = (bram_sel<<29) | (1<<16) | i;
+      cl = (bram_sel<<29) | (1<<19) | i;
       control_low_word = cl;
       repeat (3) @(posedge clk);        // BRAM_RD_LAT(2) + output mux settle
       p[i] = {dout_high, dout_low};

@@ -173,17 +173,9 @@ module fhe_microseq
   endfunction
 
   // =====================================================================
-  // Limb-param table (FROZEN, B' L<=2): {qm, k, modsel}. Rung-7 chain.
-  //   q0 = 2^46-9*2^24+1 : qm=9,  k=0, modsel=0
-  //   q1 = 2^47-2^24+1   : qm=1,  k=1, modsel=1
+  // Limb i's prime fields {qm, k, modsel}: catalog prime i (fhe_params_pkg),
+  // with k = modsel = i.
   // =====================================================================
-  // {qm, k, modsel} per limb as a table (frozen 2-prime chain; extend for L>2).
-  localparam logic [16:0] LP_QM [0:1] = '{17'd9, 17'd1};
-  localparam logic [3:0]  LP_K  [0:1] = '{4'd0,  4'd1};
-  localparam logic [3:0]  LP_MS [0:1] = '{4'd0,  4'd1};
-  function automatic logic [16:0] lp_qm (input logic [3:0] i); lp_qm = LP_QM[i[0]]; endfunction
-  function automatic logic [3:0]  lp_k  (input logic [3:0] i); lp_k  = LP_K [i[0]]; endfunction
-  function automatic logic [3:0]  lp_ms (input logic [3:0] i); lp_ms = LP_MS[i[0]]; endfunction
   // neg_qm = (-qm) & 0x1ffff  (17-bit), matches TB neg_qm()
   function automatic logic [16:0] neg_qm(input logic [16:0] qm); neg_qm = (~qm + 17'd1); endfunction
 
@@ -324,7 +316,7 @@ module fhe_microseq
       REC_ENTRY+8: prog_rom = mk(OP_DMA_OUT, pl_dma(B_NTTMSG, 3'd2, 1'b1, 2'd0, 1'b0));
       REC_ENTRY+9: prog_rom = mk(OP_DONE, pl_done(1'b0));
 
-      // Single q0 input -> centered snapshot R -> fresh e0 -> each target limb.
+      // Single q0 input -> raw snapshot R -> fresh e0 -> centre/lift into each target limb.
       REF_ENTRY+0: prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTMSG, 3'd0, 1'b0, 2'd0, 1'b0));
       REF_ENTRY+1: prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTKEY, 3'd1, 1'b0, 2'd0, 1'b0));
       REF_ENTRY+2: prog_rom = mk(OP_LDINS, pl_ldins(T_PWMDEC[7:0], 4'd1, 1'b1, SC_NONE));
@@ -453,9 +445,9 @@ module fhe_microseq
     t = taddr;
     w = tmpl_base(t);
     if (patch) begin
-      if (tmpl_use_q(t))   w = w | (64'(neg_qm(lp_qm(li))) << 13);
-      if (tmpl_use_rom(t)) w = w | (64'(lp_ms(li)) << 9);
-      if (tmpl_use_q(t))   w = w | (64'(lp_k(li))  << 5);
+      if (tmpl_use_q(t))   w = w | (64'(neg_qm(fhe_qm(li))) << 13);
+      if (tmpl_use_rom(t)) w = w | (64'(li) << 9);
+      if (tmpl_use_q(t))   w = w | (64'(li) << 5);
       if (sc != SC_NONE)   w = w | scale_bits(sc);
     end
     patch_word = w;
@@ -474,7 +466,7 @@ module fhe_microseq
 
   // control_low constructor (matches send64/receive64 packing)
   function automatic logic [31:0] mk_ctrl(input logic [3:0] bank, input logic grant, input logic ins_flag, input logic wea, input logic [LOGN:0] addr);
-    mk_ctrl = (32'(bank[2:0]) << 29) | (32'(grant) << 16) | (32'(ins_flag) << 15) | (32'(wea) << 14) | 32'(addr);
+    mk_ctrl = (32'(bank[2:0]) << 29) | (32'(grant) << FHE_CW_GRANT) | (32'(ins_flag) << FHE_CW_INS) | (32'(wea) << FHE_CW_WEA) | 32'(addr);
   endfunction
 
   wire [63:0] dout = {dout_high, dout_low};
