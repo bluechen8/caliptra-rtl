@@ -132,7 +132,7 @@ module soc_ifc_top
     output kv_read_t    kv_read,
     input  kv_rd_resp_t kv_rd_resp,
 
-`ifdef FHE_DMA_STREAM
+`ifdef FHE_WALKER
     // FHE stream bridge: hardware requester port of the AXI DMA
     input  axi_pkg::axi_dma_hw_req_t  dma_hw_req,
     output axi_pkg::axi_dma_hw_resp_t dma_hw_resp,
@@ -1302,7 +1302,7 @@ axi_dma_top #(
     .error_intr(dma_error_intr),
 
     // Hardware requester
-`ifdef FHE_DMA_STREAM
+`ifdef FHE_WALKER
     .hw_req    (dma_hw_req    ),
     .hw_resp   (dma_hw_resp   )
 `else

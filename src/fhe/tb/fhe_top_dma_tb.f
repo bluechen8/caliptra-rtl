@@ -7,14 +7,13 @@
 -f $CALIPTRA_ROOT/src/aes/config/aes.vf
 // axi_pkg: the DMA stream bridge's requester-port types (compiled in every build).
 $CALIPTRA_ROOT/src/axi/rtl/axi_pkg.sv
-// Caliptra axi_dma + AXI memory (instantiated, with AES, only in DMA_STREAM builds).
+// Caliptra axi_dma + AXI memory (with Caliptra AES from aes.vf).
 -f $ALOHA_PORT/../tb/fhe_top_dma_tb_axi.f
 // FHE block + Aloha core.
 $ALOHA_PORT/../rtl/fhe_params_pkg.sv
 $ALOHA_PORT/../rtl/fhe_reg_pkg.sv
 -f $ALOHA_PORT/sim/aloha_core.f
 $ALOHA_PORT/../rtl/fhe_microseq.sv
-$ALOHA_PORT/../rtl/fhe_local_stream.sv
 $ALOHA_PORT/../rtl/fhe_dma_stream_bridge.sv
 $ALOHA_PORT/../rtl/fhe_kv_seed.sv
 $ALOHA_PORT/../rtl/fhe_1r1w_ram.sv

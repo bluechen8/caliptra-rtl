@@ -1,5 +1,5 @@
 // fhe_top_dma_tb: Caliptra's axi_dma and an AXI memory (axi_sub) over the
-// testbench memory; the TB instantiates them in DMA_STREAM builds. Included
+// testbench memory. Included
 // from fhe_top_dma_tb.f after aes.vf (primitives) and axi_pkg.
 +incdir+$CALIPTRA_ROOT/src/integration/rtl/caliptra_reg
 +incdir+$CALIPTRA_ROOT/src/soc_ifc/rtl

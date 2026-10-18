@@ -97,7 +97,6 @@ module fhe_reg (
             logic BASE_L;
             logic BASE_H;
         } [4-1:0]FHE_SLOT;
-        logic FHE_XFER_DATA;
     } decoded_reg_strb_t;
     decoded_reg_strb_t decoded_reg_strb;
     logic decoded_strb_is_external;
@@ -129,8 +128,6 @@ module fhe_reg (
             decoded_reg_strb.FHE_SLOT[i0].BASE_L = cpuif_req_masked & (cpuif_addr == 7'h30 + i0*7'h8);
             decoded_reg_strb.FHE_SLOT[i0].BASE_H = cpuif_req_masked & (cpuif_addr == 7'h34 + i0*7'h8);
         end
-        decoded_reg_strb.FHE_XFER_DATA = cpuif_req_masked & (cpuif_addr == 7'h50);
-        is_external |= cpuif_req_masked & (cpuif_addr == 7'h50);
         decoded_strb_is_external = is_external;
         external_req = is_external;
     end
@@ -484,11 +481,6 @@ module fhe_reg (
         assign hwif_out.FHE_SLOT[i0].BASE_H.ADDR.value = field_storage.FHE_SLOT[i0].BASE_H.ADDR.value;
     end
 
-    assign hwif_out.FHE_XFER_DATA.req = decoded_reg_strb.FHE_XFER_DATA;
-    assign hwif_out.FHE_XFER_DATA.req_is_wr = decoded_req_is_wr;
-    assign hwif_out.FHE_XFER_DATA.wr_data = decoded_wr_data;
-    assign hwif_out.FHE_XFER_DATA.wr_biten = decoded_wr_biten;
-
     //--------------------------------------------------------------------------
     // Write response
     //--------------------------------------------------------------------------
@@ -496,7 +488,6 @@ module fhe_reg (
         automatic logic wr_ack;
         wr_ack = '0;
         wr_ack |= hwif_in.FHE_CTRL.wr_ack;
-        wr_ack |= hwif_in.FHE_XFER_DATA.wr_ack;
         external_wr_ack = wr_ack;
     end
     assign cpuif_wr_ack = external_wr_ack | (decoded_req & decoded_req_is_wr & ~decoded_strb_is_external);
@@ -510,7 +501,7 @@ module fhe_reg (
     always_comb begin
         automatic logic rd_ack;
         rd_ack = '0;
-        rd_ack |= hwif_in.FHE_XFER_DATA.rd_ack;
+        
         readback_external_rd_ack_c = rd_ack;
     end
 
@@ -523,7 +514,7 @@ module fhe_reg (
     logic [31:0] readback_data;
 
     // Assign readback values to a flattened array
-    logic [20-1:0][31:0] readback_array;
+    logic [19-1:0][31:0] readback_array;
     for(genvar i0=0; i0<2; i0++) begin
         assign readback_array[i0*1 + 0][31:0] = (decoded_reg_strb.FHE_NAME[i0] && !decoded_req_is_wr) ? hwif_in.FHE_NAME[i0].NAME.next : '0;
     end
@@ -548,8 +539,7 @@ module fhe_reg (
     assign readback_array[6][20:20] = (decoded_reg_strb.FHE_CAP && !decoded_req_is_wr) ? hwif_in.FHE_CAP.FFT_GENERATED.next : '0;
     assign readback_array[6][23:21] = (decoded_reg_strb.FHE_CAP && !decoded_req_is_wr) ? hwif_in.FHE_CAP.RSVD0.next : '0;
     assign readback_array[6][24:24] = (decoded_reg_strb.FHE_CAP && !decoded_req_is_wr) ? hwif_in.FHE_CAP.DMA_STREAM.next : '0;
-    assign readback_array[6][25:25] = (decoded_reg_strb.FHE_CAP && !decoded_req_is_wr) ? hwif_in.FHE_CAP.FW_STREAM.next : '0;
-    assign readback_array[6][27:26] = (decoded_reg_strb.FHE_CAP && !decoded_req_is_wr) ? hwif_in.FHE_CAP.RSVD1.next : '0;
+    assign readback_array[6][27:25] = (decoded_reg_strb.FHE_CAP && !decoded_req_is_wr) ? hwif_in.FHE_CAP.RSVD1.next : '0;
     assign readback_array[6][31:28] = (decoded_reg_strb.FHE_CAP && !decoded_req_is_wr) ? hwif_in.FHE_CAP.MAP_VERSION.next : '0;
     assign readback_array[7][0:0] = (decoded_reg_strb.FHE_KV_RD_SEED_CTRL && !decoded_req_is_wr) ? field_storage.FHE_KV_RD_SEED_CTRL.read_en.value : '0;
     assign readback_array[7][5:1] = (decoded_reg_strb.FHE_KV_RD_SEED_CTRL && !decoded_req_is_wr) ? field_storage.FHE_KV_RD_SEED_CTRL.read_entry.value : '0;
@@ -561,19 +551,16 @@ module fhe_reg (
     assign readback_array[8][31:10] = '0;
     assign readback_array[9][0:0] = (decoded_reg_strb.FHE_XFER_STATUS && !decoded_req_is_wr) ? hwif_in.FHE_XFER_STATUS.ACTIVE.next : '0;
     assign readback_array[9][1:1] = (decoded_reg_strb.FHE_XFER_STATUS && !decoded_req_is_wr) ? hwif_in.FHE_XFER_STATUS.DIR.next : '0;
-    assign readback_array[9][2:2] = (decoded_reg_strb.FHE_XFER_STATUS && !decoded_req_is_wr) ? hwif_in.FHE_XFER_STATUS.IN_READY.next : '0;
-    assign readback_array[9][3:3] = (decoded_reg_strb.FHE_XFER_STATUS && !decoded_req_is_wr) ? hwif_in.FHE_XFER_STATUS.OUT_VALID.next : '0;
+    assign readback_array[9][3:2] = (decoded_reg_strb.FHE_XFER_STATUS && !decoded_req_is_wr) ? hwif_in.FHE_XFER_STATUS.RSVD0.next : '0;
     assign readback_array[9][6:4] = (decoded_reg_strb.FHE_XFER_STATUS && !decoded_req_is_wr) ? hwif_in.FHE_XFER_STATUS.SLOT.next : '0;
-    assign readback_array[9][7:7] = (decoded_reg_strb.FHE_XFER_STATUS && !decoded_req_is_wr) ? hwif_in.FHE_XFER_STATUS.RSVD0.next : '0;
+    assign readback_array[9][7:7] = (decoded_reg_strb.FHE_XFER_STATUS && !decoded_req_is_wr) ? hwif_in.FHE_XFER_STATUS.RSVD1.next : '0;
     assign readback_array[9][11:8] = (decoded_reg_strb.FHE_XFER_STATUS && !decoded_req_is_wr) ? hwif_in.FHE_XFER_STATUS.LIMB.next : '0;
-    assign readback_array[9][12:12] = (decoded_reg_strb.FHE_XFER_STATUS && !decoded_req_is_wr) ? hwif_in.FHE_XFER_STATUS.HALF.next : '0;
-    assign readback_array[9][31:13] = (decoded_reg_strb.FHE_XFER_STATUS && !decoded_req_is_wr) ? hwif_in.FHE_XFER_STATUS.RSVD1.next : '0;
+    assign readback_array[9][31:12] = (decoded_reg_strb.FHE_XFER_STATUS && !decoded_req_is_wr) ? hwif_in.FHE_XFER_STATUS.RSVD2.next : '0;
     assign readback_array[10][31:0] = (decoded_reg_strb.FHE_XFER_LEFT && !decoded_req_is_wr) ? hwif_in.FHE_XFER_LEFT.LEFT.next : '0;
     for(genvar i0=0; i0<4; i0++) begin
         assign readback_array[i0*2 + 11][31:0] = (decoded_reg_strb.FHE_SLOT[i0].BASE_L && !decoded_req_is_wr) ? field_storage.FHE_SLOT[i0].BASE_L.ADDR.value : '0;
         assign readback_array[i0*2 + 12][31:0] = (decoded_reg_strb.FHE_SLOT[i0].BASE_H && !decoded_req_is_wr) ? field_storage.FHE_SLOT[i0].BASE_H.ADDR.value : '0;
     end
-    assign readback_array[19] = hwif_in.FHE_XFER_DATA.rd_ack ? hwif_in.FHE_XFER_DATA.rd_data : '0;
 
     // Reduce the array
     always_comb begin
@@ -581,7 +568,7 @@ module fhe_reg (
         readback_done = decoded_req & ~decoded_req_is_wr & ~decoded_strb_is_external;
         readback_err = '0;
         readback_data_var = '0;
-        for(int i=0; i<20; i++) readback_data_var |= readback_array[i];
+        for(int i=0; i<19; i++) readback_data_var |= readback_array[i];
         readback_data = readback_data_var;
     end
 

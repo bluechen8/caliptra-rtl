@@ -41,10 +41,13 @@ module fhe_dma_stream_bridge
   input  logic rst_b,
 
   // Command context (fhe_top)
+  input  logic        cmd_start,    // any command was accepted
   input  logic        lease_start,  // a command with DMA segments was accepted
   input  logic        lease_end,    // the walker completed the command
   input  logic        abort,        // ZEROIZE: drain the segment in flight, then release
   output logic        lease,        // DMA leased (STATUS.DMA_LEASED)
+  // Per command: cleared at every acceptance, so a command without segments
+  // (KEYGEN) never reports the previous command's failure.
   output logic        word_error,   // an inbound word was not below its prime
   output logic        xfer_error,   // a DMA segment failed
 
@@ -94,8 +97,7 @@ module fhe_dma_stream_bridge
   assign seg_active = (state != B_IDLE);
   assign dma_ready  = (state == B_IDLE) && !hw_resp.busy;
   assign remaining  = 32'(left);
-  // IN_READY/OUT_VALID/HALF are firmware-forward fields and stay 0 here.
-  assign status = fhe_xfer_status(seg_active, dir_out, 1'b0, 1'b0, ptr_q, limb_q, 1'b0);
+  assign status = fhe_xfer_status(seg_active, dir_out, ptr_q, limb_q);
 
   // Segment end: the DMA finished (all writes acknowledged) and, unless
   // aborting, the walker has moved every word. A failed segment flushes first.
@@ -139,8 +141,11 @@ module fhe_dma_stream_bridge
       dma_fin <= 1'b0; faked <= 1'b0;
     end else begin
       // ---- lease ----
+      if (cmd_start) begin
+        word_error <= 1'b0; xfer_error <= 1'b0;
+      end
       if (lease_start) begin
-        lease <= 1'b1; word_error <= 1'b0; xfer_error <= 1'b0;
+        lease <= 1'b1;
       end else if (lease_end) begin
         lease <= 1'b0;
       end

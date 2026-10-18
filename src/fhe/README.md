@@ -243,28 +243,27 @@ status, register R/W, ENCRYPT→VALID, KEYGEN→VALID, busy-rejection, ZEROIZE).
 ### Register map v2 — fhe_top unit testbench (Verilator)
 
 `fhe_top` built with `+define+FHE_WALKER` instantiates the walker (`fhe_microseq`), the
-Aloha `ComputeCore` and the firmware-forward stream (`fhe_local_stream`) behind the
-generated register block (`fhe_reg.sv`, from `rtl/fhe_reg.rdl`). The dedicated `fhe_dma`
-AXI master is removed. The TB plays firmware: it provisions a modeled KeyVault entry,
-reads the 160-bit seed through `KV_RD_SEED_CTRL`, writes `CONFIG` and the slot bases,
-issues commands and services `XFER_*` against a TB memory. Specification:
+Aloha `ComputeCore` and the DMA stream bridge (`fhe_dma_stream_bridge`) behind the
+generated register block (`fhe_reg.sv`, from `rtl/fhe_reg.rdl`). Every segment moves
+through Caliptra's `axi_dma` (the bridge is on the DMA's hardware requester port, under a
+per-command lease): the ENCRYPT message and the DECRYPT slots through AES-GCM, and
+ENCRYPT waits for `CTRL.INPUT_COMMIT` before its first arithmetic pass. The dedicated
+`fhe_dma` AXI master and the firmware-forward bring-up stream are removed. Specification:
 `docs/fhe/16-register-map-v2.md` in the Chipyard checkout.
 
-With `+define+FHE_DMA_STREAM` (`DMA_STREAM=1` below) every segment moves through
-Caliptra's `axi_dma` instead (`fhe_dma_stream_bridge`, on the DMA's hardware requester
-port, under a per-command lease): the ENCRYPT message and the DECRYPT slots through
-AES-GCM, and ENCRYPT waits for `CTRL.INPUT_COMMIT` before its first arithmetic pass. The TB
-then builds the real `axi_dma_top`, Caliptra's AES engine and an AXI memory over the same
-TB memory; it seals each ENCRYPT message and opens each DECRYPT result with GCM over the
-AES engine's AHB port, checks the tag at COMMIT_WAIT, and adds commit-barrier, forged-tag,
-lease, slot-address, input-check, transport-error and abort tests.
+The TB builds the real `axi_dma_top`, Caliptra's AES engine and an AXI memory over a TB
+memory, and plays firmware and host: it provisions a modeled KeyVault entry, reads the
+160-bit seed through `KV_RD_SEED_CTRL`, writes `CONFIG` and the slot bases, issues
+commands, seals each ENCRYPT message and opens each DECRYPT result with GCM over the AES
+engine's AHB port, and checks the tag at COMMIT_WAIT. Beyond the round trips it runs
+commit-barrier, forged-tag, lease, slot-address, input-check, transport-error and abort
+tests.
 
 ```bash
 # from src/fhe/ — default LOGN=8 (N=256). CLEAN=1 forces a rebuild.
 LIMBS2=1 ./tb/run_fhe_top_dma_tb.sh 8          # two limbs + the N=256 key golden
-FFT_ON_THE_FLY=1 LIMBS2=1 ./tb/run_fhe_top_dma_tb.sh 8
-STREAM_STALLS=1 ./tb/run_fhe_top_dma_tb.sh 8
-DMA_STREAM=1 LIMBS2=1 ./tb/run_fhe_top_dma_tb.sh 8   # every segment via axi_dma and AES-GCM
+FFT_ON_THE_FLY=1 STREAM_STALLS=1 LIMBS2=1 ./tb/run_fhe_top_dma_tb.sh 8
+./tb/run_fhe_top_dma_tb.sh 8                   # one limb
 # -> "fhe_top_dma_tb RESULT: PASS"
 ```
 

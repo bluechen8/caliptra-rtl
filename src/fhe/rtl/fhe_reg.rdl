@@ -105,9 +105,8 @@ addrmap fhe_reg {
         field {desc = "Installed limbs";} L[4];
         field {desc = "FFT twiddles generated (no stored table)";} FFT_GENERATED = 1'b0;
         field {desc = "Reserved";} RSVD0[3];
-        field {desc = "Direct DMA stream transport present";} DMA_STREAM = 1'b0;
-        field {desc = "Firmware-forward stream (XFER_DATA) present";} FW_STREAM = 1'b0;
-        field {desc = "Reserved";} RSVD1[2];
+        field {desc = "DMA stream transport present (always 1)";} DMA_STREAM = 1'b0;
+        field {desc = "Reserved (was the firmware-forward stream)";} RSVD1[3];
         field {desc = "Register map version";} MAP_VERSION[4];
     } FHE_CAP @ 0x1C;
 
@@ -122,13 +121,11 @@ addrmap fhe_reg {
         default hw = w;
         field {desc = "A transfer segment is open";} ACTIVE = 1'b0;
         field {desc = "Direction: 1 = output from Aloha";} DIR = 1'b0;
-        field {desc = "Firmware-forward build: XFER_DATA may be written";} IN_READY = 1'b0;
-        field {desc = "Firmware-forward build: XFER_DATA may be read";} OUT_VALID = 1'b0;
+        field {desc = "Reserved";} RSVD0[2] = 2'b0;
         field {desc = "Slot: 0 message/c0 in, 1 c1 in, 2 c0/slots/residues out, 3 c1 out";} SLOT[3] = 3'b0;
-        field {desc = "Reserved";} RSVD0 = 1'b0;
+        field {desc = "Reserved";} RSVD1 = 1'b0;
         field {desc = "Limb";} LIMB[4] = 4'b0;
-        field {desc = "Firmware-forward build: next XFER_DATA access is the high word";} HALF = 1'b0;
-        field {desc = "Reserved";} RSVD1[19] = 19'b0;
+        field {desc = "Reserved";} RSVD2[20] = 20'b0;
     } FHE_XFER_STATUS @ 0x28;
 
     reg {
@@ -160,14 +157,4 @@ addrmap fhe_reg {
         } BASE_H;
     };
     fhe_slot_t FHE_SLOT[4] @ 0x30;
-
-    /* ---- Firmware-forward data window (external; bring-up build only) ---- */
-    external reg {
-        name = "FHE transfer data";
-        desc = "Firmware-forward build: two 32-bit accesses per 64-bit word, low word first.
-                Other builds: reads 0, writes return an AHB error.";
-        default sw = rw;
-        default hw = rw;
-        field {desc = "Data";} DATA[32] = 32'b0;
-    } FHE_XFER_DATA @ 0x50;
 };

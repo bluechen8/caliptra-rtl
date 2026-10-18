@@ -274,15 +274,10 @@ module caliptra_top
     wire fhe_error_intr;
     wire fhe_notif_intr;
     logic fhe_busy;
-`ifdef FHE_DMA_STREAM
+`ifdef FHE_WALKER
     // FHE stream bridge <-> axi_dma hardware requester port
     axi_pkg::axi_dma_hw_req_t  fhe_dma_req;
     axi_pkg::axi_dma_hw_resp_t fhe_dma_resp;
-`ifndef FHE_WALKER
-    if (1) begin : g_fhe_dma_stream_needs_walker
-        $error("FHE_DMA_STREAM requires FHE_WALKER (the bridge lives in the FHE datapath)");
-    end
-`endif
 `endif
     wire soc_ifc_error_intr;
     wire soc_ifc_notif_intr;
@@ -1207,11 +1202,9 @@ fhe_top #(
   `endif
      // C'-3: storage banks lifted to the top boundary (real SRAM attached there)
      , .fhe_aloha_mem   (fhe_aloha_memory_export)
-`ifdef FHE_DMA_STREAM
-     // Segments that bypass AES move through Caliptra's axi_dma
+     // Every FHE segment moves through Caliptra's axi_dma
      , .fhe_dma_req     (fhe_dma_req)
      , .fhe_dma_resp    (fhe_dma_resp)
-`endif
 `endif
 );
 `else
@@ -1576,7 +1569,7 @@ soc_ifc_top1
     // kv interface
     .kv_read   (kv_read   [KV_DEST_IDX_DMA_DATA]),
     .kv_rd_resp(kv_rd_resp[KV_DEST_IDX_DMA_DATA]),
-`ifdef FHE_DMA_STREAM
+`ifdef FHE_WALKER
     .dma_hw_req (fhe_dma_req ),
     .dma_hw_resp(fhe_dma_resp),
 `endif

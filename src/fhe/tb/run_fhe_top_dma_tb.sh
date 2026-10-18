@@ -3,15 +3,15 @@
 #
 #   ./run_fhe_top_dma_tb.sh [LOGN]      # default LOGN=8 (N=256)
 #
-# fhe_top is built with +define+FHE_WALKER. The TB plays firmware: KeyVault
-# seed read, CONFIG and slot bases, commands, and the XFER_* stream against a
-# TB memory. It checks round trips, recovery, refresh, the single-seed stream
-# and command preconditions. Options: LIMBS2=1 (two-limb ciphertexts and the
-# N=256 key golden), FFT_ON_THE_FLY=1, STREAM_STALLS=1, MNIST_DIR=<dir>,
-# DMA_STREAM=1 (every segment through Caliptra's axi_dma and an AXI memory
-# over the same TB memory, the ENCRYPT message and DECRYPT slots through
-# Caliptra's AES-GCM; adds the commit-barrier, lease, address, error and abort
-# tests).
+# fhe_top is built with +define+FHE_WALKER. Every segment moves through
+# Caliptra's axi_dma and an AXI memory over the TB memory, the ENCRYPT message
+# and DECRYPT slots through Caliptra's AES-GCM. The TB plays firmware and host:
+# KeyVault seed read, CONFIG and slot bases, commands, GCM setup, tag checks
+# and sealing. It checks round trips, recovery, refresh, the single-seed
+# stream, command preconditions, the commit barrier, lease, address, error and
+# abort cases. Options: LIMBS2=1 (two-limb ciphertexts and the N=256 key
+# golden), FFT_ON_THE_FLY=1, STREAM_STALLS=1, MNIST_DIR=<dir>. +RPC turns the
+# binary into the emulator's Aloha RTL link (BUILD_ONLY=1 prints its path).
 #
 # Expect: "fhe_top_dma_tb RESULT: PASS".
 set -euo pipefail
@@ -47,7 +47,6 @@ python3 "$ALOHA_PORT/tvgen/gen_roundtrip.py" "$LOGN" "$WORK" >/dev/null
 
 EXTRA_DEF=""
 [[ "${FFT_ON_THE_FLY:-0}" == 1 ]] && EXTRA_DEF="-DFHE_FFT_ON_THE_FLY"
-[[ "${DMA_STREAM:-0}" == 1 ]] && EXTRA_DEF="$EXTRA_DEF -DFHE_DMA_STREAM"
 
 echo "=== build $TOP (N=$N) ${EXTRA_DEF:+[$EXTRA_DEF]} ==="
 [[ -n "${CLEAN:-}" ]] && rm -rf "$OBJ_DIR"

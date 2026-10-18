@@ -18,11 +18,10 @@
 //   microsequencer ("walker"), the Aloha ComputeCore and its transports.
 //   Specification: docs/fhe/16-register-map-v2.md (Chipyard checkout).
 //
-//   Transports: with FHE_DMA_STREAM every segment moves through Caliptra's
-//   axi_dma (fhe_dma_stream_bridge, under a per-command lease), the ENCRYPT
-//   message and the DECRYPT slots through AES-GCM, and ENCRYPT computes
-//   nothing until firmware commits its input (CTRL.INPUT_COMMIT). Without it,
-//   the firmware-forward bring-up stream (XFER_DATA) carries every segment.
+//   Transport: every segment moves through Caliptra's axi_dma
+//   (fhe_dma_stream_bridge, under a per-command lease), the ENCRYPT message
+//   and the DECRYPT slots through AES-GCM, and ENCRYPT computes nothing until
+//   firmware commits its input (CTRL.INPUT_COMMIT).
 //
 //   The datapath is compiled only with FHE_WALKER; otherwise the block ties
 //   off its bus and outputs. The former stage-0 stub and the dedicated fhe_dma
@@ -62,13 +61,10 @@ module fhe_top
   output kv_defines_pkg::kv_read_t    fhe_kv_read,
   input  kv_defines_pkg::kv_rd_resp_t fhe_kv_rd_resp,
   // Aloha ComputeCore storage banks, lifted to real SRAM at the SoC level.
-  fhe_aloha_mem_if.req fhe_aloha_mem
-`ifdef FHE_DMA_STREAM
-  ,
+  fhe_aloha_mem_if.req fhe_aloha_mem,
   // Hardware requester port of Caliptra's axi_dma
   output axi_pkg::axi_dma_hw_req_t  fhe_dma_req,
   input  axi_pkg::axi_dma_hw_resp_t fhe_dma_resp
-`endif
 `endif
 );
 
@@ -82,16 +78,11 @@ module fhe_top
 `else
   localparam bit FFT_GEN = 1'b0;
 `endif
-`ifdef FHE_DMA_STREAM
-  localparam bit DMA_STREAM = 1'b1;
-`else
-  localparam bit DMA_STREAM = 1'b0;
-`endif
 
   //----------------------------------------------------------------
   // AHB-Lite slave -> generated register block
   //----------------------------------------------------------------
-  logic                      dv, cif_write, cif_err;
+  logic                      dv, cif_write;
   logic [31:0]               cif_wdata, cif_rdata;
   logic [AHB_ADDR_WIDTH-1:0] cif_addr;
 
@@ -115,7 +106,7 @@ module fhe_top
     .hrdata_o    (hrdata_o),
     .dv          (dv),
     .hld         (1'b0),
-    .err         (cif_err),
+    .err         (1'b0),     // no register access fails on the bus
     .write       (cif_write),
     .wdata       (cif_wdata),
     .addr        (cif_addr),
@@ -158,7 +149,7 @@ module fhe_top
   logic        w_busy, w_done, w_error;
   logic        abort_done, abort_wait;
   logic [3:0]  done_cause;
-  // DMA stream bridge state (constant 0 without FHE_DMA_STREAM)
+  // DMA stream bridge state
   logic        br_lease, br_word_error, br_xfer_error;
 
   // CTRL is an external register: decode the write in its request cycle, so a
@@ -172,8 +163,7 @@ module fhe_top
   assign zeroize   = ctrl_wr & ctrl_wdata[3];
   assign cmd_in    = fhe_cmd_e'(ctrl_wdata[2:0]);
   assign cmd_write = ctrl_wr & ~ctrl_wdata[3] & ready & (ctrl_wdata[2:0] != 3'b000);
-  // CTRL.INPUT_COMMIT (bit 4) releases the ENCRYPT commit barrier (DMA stream
-  // only; the firmware-forward build commits implicitly).
+  // CTRL.INPUT_COMMIT (bit 4) releases the ENCRYPT commit barrier.
   logic commit_wait;
   wire  input_commit = ctrl_wr & ctrl_wdata[4] & commit_wait;
 
@@ -297,9 +287,9 @@ module fhe_top
       if (!key_valid) precheck = FHE_EC_NO_KEY;
       else if (cmd_in != FHE_DECRYPT && (cfg_l == 4'd0 || cfg_l > 4'(FHE_L)))
         precheck = FHE_EC_BAD_L;
-      else if (DMA_STREAM && !slots_ok)
+      else if (!slots_ok)
         precheck = FHE_EC_BAD_ADDR;
-      else if (DMA_STREAM && !dma_idle)
+      else if (!dma_idle)
         precheck = FHE_EC_DMA_BUSY;
     end
   end
@@ -386,11 +376,7 @@ module fhe_top
   //----------------------------------------------------------------
   // Register block inputs
   //----------------------------------------------------------------
-  logic [31:0] stream_status, stream_left, stream_data;
-  logic        stream_access_error;
-  logic        xfer_rd, xfer_wr;
-  assign xfer_rd = hwif_out.FHE_XFER_DATA.req & ~hwif_out.FHE_XFER_DATA.req_is_wr;
-  assign xfer_wr = hwif_out.FHE_XFER_DATA.req &  hwif_out.FHE_XFER_DATA.req_is_wr;
+  logic [31:0] stream_status, stream_left;
 
   always_comb begin
     hwif_in.reset_b   = rst_b;
@@ -417,37 +403,27 @@ module fhe_top
     hwif_in.FHE_CAP.L.next             = 4'(FHE_L);
     hwif_in.FHE_CAP.FFT_GENERATED.next = FFT_GEN;
     hwif_in.FHE_CAP.RSVD0.next         = '0;
-    hwif_in.FHE_CAP.DMA_STREAM.next    = DMA_STREAM;
-    hwif_in.FHE_CAP.FW_STREAM.next     = !DMA_STREAM;
+    hwif_in.FHE_CAP.DMA_STREAM.next    = 1'b1;
     hwif_in.FHE_CAP.RSVD1.next         = '0;
     hwif_in.FHE_CAP.MAP_VERSION.next   = MAP_VERSION;
 
     hwif_in.FHE_XFER_STATUS.ACTIVE.next    = stream_status[0];
     hwif_in.FHE_XFER_STATUS.DIR.next       = stream_status[1];
-    hwif_in.FHE_XFER_STATUS.IN_READY.next  = stream_status[2];
-    hwif_in.FHE_XFER_STATUS.OUT_VALID.next = stream_status[3];
+    hwif_in.FHE_XFER_STATUS.RSVD0.next     = '0;
     hwif_in.FHE_XFER_STATUS.SLOT.next      = stream_status[6:4];
-    hwif_in.FHE_XFER_STATUS.RSVD0.next     = 1'b0;
+    hwif_in.FHE_XFER_STATUS.RSVD1.next     = 1'b0;
     hwif_in.FHE_XFER_STATUS.LIMB.next      = stream_status[11:8];
-    hwif_in.FHE_XFER_STATUS.HALF.next      = stream_status[12];
-    hwif_in.FHE_XFER_STATUS.RSVD1.next     = '0;
+    hwif_in.FHE_XFER_STATUS.RSVD2.next     = '0;
     hwif_in.FHE_XFER_LEFT.LEFT.next        = stream_left;
 
     for (int s = 0; s < 4; s++) begin
       hwif_in.FHE_SLOT[s].BASE_L.ADDR.hwclr = zeroize;
       hwif_in.FHE_SLOT[s].BASE_H.ADDR.hwclr = zeroize;
     end
-
-    hwif_in.FHE_XFER_DATA.rd_ack  = xfer_rd;
-    hwif_in.FHE_XFER_DATA.wr_ack  = xfer_wr;
-    hwif_in.FHE_XFER_DATA.rd_data = stream_data;
   end
 
-  // Only XFER_DATA can fail on the bus: an access while the stream is not ready.
-  assign cif_err = stream_access_error;
-
   //----------------------------------------------------------------
-  // Walker, core and firmware-forward stream
+  // Walker and core
   //----------------------------------------------------------------
   // Per-modulus R^2 mod q_i for keygen's Montgomery conversion (R = 2^72).
   // q0 = 2^46-9*2^24+1, q1 = 2^47-2^24+1.
@@ -550,37 +526,9 @@ module fhe_top
   //----------------------------------------------------------------
   // Transports
   //----------------------------------------------------------------
-  // With FHE_DMA_STREAM every segment goes through the DMA bridge; otherwise
-  // through the firmware-forward stream (bring-up build).
-  logic        ls_ready, ls_rd_valid, ls_wr_ready;
-  logic [63:0] ls_rd_data;
-  logic [31:0] ls_status, ls_left;
-  logic        br_ready, br_rd_valid, br_wr_ready, br_active;
-  logic [63:0] br_rd_data;
-  logic [31:0] br_status, br_left;
+  // Every segment goes through the DMA bridge.
+  logic br_active;   // a segment is open (testbench probe)
 
-  assign w_dma_ready = DMA_STREAM ? br_ready    : ls_ready;
-  assign w_rd_valid  = DMA_STREAM ? br_rd_valid : ls_rd_valid;
-  assign w_rd_data   = DMA_STREAM ? br_rd_data  : ls_rd_data;
-  assign w_wr_ready  = DMA_STREAM ? br_wr_ready : ls_wr_ready;
-  assign stream_status = DMA_STREAM ? br_status : ls_status;
-  assign stream_left   = DMA_STREAM ? br_left   : ls_left;
-
-  // Firmware-forward stream: VeeR moves each 64-bit word through XFER_DATA,
-  // using SLOT/LIMB from XFER_STATUS.
-  fhe_local_stream #(.N(FHE_N)) i_local_stream (
-    .clk(clk), .rst_n(rst_b), .clear(zeroize),
-    .desc_valid(w_desc_valid & ~DMA_STREAM), .desc_wr(w_desc_wr),
-    .desc_ptr(w_desc_ptr), .desc_limb(w_desc_limb), .dma_ready(ls_ready),
-    .rd_valid(ls_rd_valid), .rd_data(ls_rd_data), .rd_ready(w_rd_pop & ~DMA_STREAM),
-    .wr_valid(w_wr_push & ~DMA_STREAM), .wr_data(w_wr_data), .wr_ready(ls_wr_ready),
-    .data_read (xfer_rd),
-    .data_write(xfer_wr),
-    .data_wdata(hwif_out.FHE_XFER_DATA.wr_data), .data_rdata(stream_data),
-    .status(ls_status), .remaining(ls_left), .access_error(stream_access_error)
-  );
-
-`ifdef FHE_DMA_STREAM
   // Input commit barrier (ENCRYPT). The message arrives through AES-GCM
   // decrypt, so the walker stops before its first arithmetic pass. Once it is
   // parked there and the DMA is idle (every input segment done, AES quiet),
@@ -590,7 +538,7 @@ module fhe_top
   // after the tag check, so it reveals nothing about unauthenticated plaintext.
   logic committed, commit_wait_q;
   assign exe_hold     = fhe_cmd_commits(cmd_q) && !committed;
-  assign commit_wait  = exe_held && br_ready;
+  assign commit_wait  = exe_held && w_dma_ready;
   assign commit_enter = commit_wait && !commit_wait_q;
   always_ff @(posedge clk or negedge rst_b) begin
     if (!rst_b)                     {committed, commit_wait_q} <= 2'b00;
@@ -610,6 +558,7 @@ module fhe_top
   end
   fhe_dma_stream_bridge #(.N(FHE_N)) i_dma_bridge (
     .clk(clk), .rst_b(rst_b),
+    .cmd_start  (cmd_accept),
     .lease_start(cmd_accept & cmd_uses_dma),
     .lease_end  (w_done),
     .abort      (zeroize),
@@ -619,21 +568,14 @@ module fhe_top
     .desc_valid(w_desc_valid), .desc_wr(w_desc_wr),
     .desc_ptr(w_desc_ptr), .desc_limb(w_desc_limb),
     .desc_aes(fhe_slot_aes(cmd_q, w_desc_ptr)), .desc_msg(fhe_slot_msg(cmd_q, w_desc_ptr)),
-    .dma_ready(br_ready),
-    .rd_valid(br_rd_valid), .rd_data(br_rd_data), .rd_ready(w_rd_pop),
-    .wr_valid(w_wr_push), .wr_data(w_wr_data), .wr_ready(br_wr_ready),
+    .dma_ready(w_dma_ready),
+    .rd_valid(w_rd_valid), .rd_data(w_rd_data), .rd_ready(w_rd_pop),
+    .wr_valid(w_wr_push), .wr_data(w_wr_data), .wr_ready(w_wr_ready),
     .slot_base(slot_base),
-    .seg_active(br_active), .status(br_status), .remaining(br_left),
+    .seg_active(br_active), .status(stream_status), .remaining(stream_left),
     .hw_req(fhe_dma_req), .hw_resp(fhe_dma_resp)
   );
   assign dma_idle = fhe_dma_resp.idle;
-`else
-  assign {commit_enter, commit_wait, exe_hold} = '0;
-  assign {br_lease, br_word_error, br_xfer_error, br_active} = '0;
-  assign {br_ready, br_rd_valid, br_wr_ready} = '0;
-  assign {br_rd_data, br_status, br_left} = '0;
-  assign dma_idle = 1'b1;
-`endif
 
 `else
   // No datapath in this build: complete every bus access OKAY with zero data.

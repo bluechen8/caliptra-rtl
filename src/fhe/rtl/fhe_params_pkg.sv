@@ -156,12 +156,10 @@ package fhe_params_pkg;
     return cmd == FHE_ENCRYPT;
   endfunction
 
-  // XFER_STATUS layout (fhe_reg.rdl): {HALF[12], LIMB[11:8], SLOT[6:4],
-  // OUT_VALID[3], IN_READY[2], DIR[1], ACTIVE[0]}.
-  function automatic logic [31:0] fhe_xfer_status(logic active, logic dir, logic in_ready,
-                                                  logic out_valid, logic [2:0] slot,
-                                                  logic [3:0] limb, logic half);
-    return {19'b0, half, limb, 1'b0, slot, out_valid, in_ready, dir, active};
+  // XFER_STATUS layout (fhe_reg.rdl): {LIMB[11:8], SLOT[6:4], DIR[1], ACTIVE[0]}.
+  function automatic logic [31:0] fhe_xfer_status(logic active, logic dir, logic [2:0] slot,
+                                                  logic [3:0] limb);
+    return {20'b0, limb, 1'b0, slot, 2'b0, dir, active};
   endfunction
 
   parameter [63:0] FHE_CORE_NAME    = 64'h00000000_53_4B_4B_43; // "CKKS"

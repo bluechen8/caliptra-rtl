@@ -235,8 +235,7 @@ package fhe_reg_uvm;
         fhe_reg__FHE_CAP_bit_cg FFT_GENERATED_bit_cg[1];
         fhe_reg__FHE_CAP_bit_cg RSVD0_bit_cg[3];
         fhe_reg__FHE_CAP_bit_cg DMA_STREAM_bit_cg[1];
-        fhe_reg__FHE_CAP_bit_cg FW_STREAM_bit_cg[1];
-        fhe_reg__FHE_CAP_bit_cg RSVD1_bit_cg[2];
+        fhe_reg__FHE_CAP_bit_cg RSVD1_bit_cg[3];
         fhe_reg__FHE_CAP_bit_cg MAP_VERSION_bit_cg[4];
         fhe_reg__FHE_CAP_fld_cg fld_cg;
         rand uvm_reg_field N;
@@ -244,7 +243,6 @@ package fhe_reg_uvm;
         rand uvm_reg_field FFT_GENERATED;
         rand uvm_reg_field RSVD0;
         rand uvm_reg_field DMA_STREAM;
-        rand uvm_reg_field FW_STREAM;
         rand uvm_reg_field RSVD1;
         rand uvm_reg_field MAP_VERSION;
 
@@ -268,10 +266,8 @@ package fhe_reg_uvm;
             this.RSVD0.configure(this, 3, 21, "RO", 1, 'h0, 0, 1, 0);
             this.DMA_STREAM = new("DMA_STREAM");
             this.DMA_STREAM.configure(this, 1, 24, "RO", 1, 'h0, 1, 1, 0);
-            this.FW_STREAM = new("FW_STREAM");
-            this.FW_STREAM.configure(this, 1, 25, "RO", 1, 'h0, 1, 1, 0);
             this.RSVD1 = new("RSVD1");
-            this.RSVD1.configure(this, 2, 26, "RO", 1, 'h0, 0, 1, 0);
+            this.RSVD1.configure(this, 3, 25, "RO", 1, 'h0, 0, 1, 0);
             this.MAP_VERSION = new("MAP_VERSION");
             this.MAP_VERSION.configure(this, 4, 28, "RO", 1, 'h0, 0, 1, 0);
             if (has_coverage(UVM_CVR_REG_BITS)) begin
@@ -280,7 +276,6 @@ package fhe_reg_uvm;
                 foreach(FFT_GENERATED_bit_cg[bt]) FFT_GENERATED_bit_cg[bt] = new();
                 foreach(RSVD0_bit_cg[bt]) RSVD0_bit_cg[bt] = new();
                 foreach(DMA_STREAM_bit_cg[bt]) DMA_STREAM_bit_cg[bt] = new();
-                foreach(FW_STREAM_bit_cg[bt]) FW_STREAM_bit_cg[bt] = new();
                 foreach(RSVD1_bit_cg[bt]) RSVD1_bit_cg[bt] = new();
                 foreach(MAP_VERSION_bit_cg[bt]) MAP_VERSION_bit_cg[bt] = new();
             end
@@ -382,23 +377,19 @@ package fhe_reg_uvm;
 
         fhe_reg__FHE_XFER_STATUS_bit_cg ACTIVE_bit_cg[1];
         fhe_reg__FHE_XFER_STATUS_bit_cg DIR_bit_cg[1];
-        fhe_reg__FHE_XFER_STATUS_bit_cg IN_READY_bit_cg[1];
-        fhe_reg__FHE_XFER_STATUS_bit_cg OUT_VALID_bit_cg[1];
+        fhe_reg__FHE_XFER_STATUS_bit_cg RSVD0_bit_cg[2];
         fhe_reg__FHE_XFER_STATUS_bit_cg SLOT_bit_cg[3];
-        fhe_reg__FHE_XFER_STATUS_bit_cg RSVD0_bit_cg[1];
+        fhe_reg__FHE_XFER_STATUS_bit_cg RSVD1_bit_cg[1];
         fhe_reg__FHE_XFER_STATUS_bit_cg LIMB_bit_cg[4];
-        fhe_reg__FHE_XFER_STATUS_bit_cg HALF_bit_cg[1];
-        fhe_reg__FHE_XFER_STATUS_bit_cg RSVD1_bit_cg[19];
+        fhe_reg__FHE_XFER_STATUS_bit_cg RSVD2_bit_cg[20];
         fhe_reg__FHE_XFER_STATUS_fld_cg fld_cg;
         rand uvm_reg_field ACTIVE;
         rand uvm_reg_field DIR;
-        rand uvm_reg_field IN_READY;
-        rand uvm_reg_field OUT_VALID;
-        rand uvm_reg_field SLOT;
         rand uvm_reg_field RSVD0;
-        rand uvm_reg_field LIMB;
-        rand uvm_reg_field HALF;
+        rand uvm_reg_field SLOT;
         rand uvm_reg_field RSVD1;
+        rand uvm_reg_field LIMB;
+        rand uvm_reg_field RSVD2;
 
         function new(string name = "fhe_reg__FHE_XFER_STATUS");
             super.new(name, 32, build_coverage(UVM_CVR_ALL));
@@ -414,30 +405,24 @@ package fhe_reg_uvm;
             this.ACTIVE.configure(this, 1, 0, "RO", 1, 'h0, 1, 1, 0);
             this.DIR = new("DIR");
             this.DIR.configure(this, 1, 1, "RO", 1, 'h0, 1, 1, 0);
-            this.IN_READY = new("IN_READY");
-            this.IN_READY.configure(this, 1, 2, "RO", 1, 'h0, 1, 1, 0);
-            this.OUT_VALID = new("OUT_VALID");
-            this.OUT_VALID.configure(this, 1, 3, "RO", 1, 'h0, 1, 1, 0);
+            this.RSVD0 = new("RSVD0");
+            this.RSVD0.configure(this, 2, 2, "RO", 1, 'h0, 1, 1, 0);
             this.SLOT = new("SLOT");
             this.SLOT.configure(this, 3, 4, "RO", 1, 'h0, 1, 1, 0);
-            this.RSVD0 = new("RSVD0");
-            this.RSVD0.configure(this, 1, 7, "RO", 1, 'h0, 1, 1, 0);
+            this.RSVD1 = new("RSVD1");
+            this.RSVD1.configure(this, 1, 7, "RO", 1, 'h0, 1, 1, 0);
             this.LIMB = new("LIMB");
             this.LIMB.configure(this, 4, 8, "RO", 1, 'h0, 1, 1, 0);
-            this.HALF = new("HALF");
-            this.HALF.configure(this, 1, 12, "RO", 1, 'h0, 1, 1, 0);
-            this.RSVD1 = new("RSVD1");
-            this.RSVD1.configure(this, 19, 13, "RO", 1, 'h0, 1, 1, 0);
+            this.RSVD2 = new("RSVD2");
+            this.RSVD2.configure(this, 20, 12, "RO", 1, 'h0, 1, 1, 0);
             if (has_coverage(UVM_CVR_REG_BITS)) begin
                 foreach(ACTIVE_bit_cg[bt]) ACTIVE_bit_cg[bt] = new();
                 foreach(DIR_bit_cg[bt]) DIR_bit_cg[bt] = new();
-                foreach(IN_READY_bit_cg[bt]) IN_READY_bit_cg[bt] = new();
-                foreach(OUT_VALID_bit_cg[bt]) OUT_VALID_bit_cg[bt] = new();
-                foreach(SLOT_bit_cg[bt]) SLOT_bit_cg[bt] = new();
                 foreach(RSVD0_bit_cg[bt]) RSVD0_bit_cg[bt] = new();
-                foreach(LIMB_bit_cg[bt]) LIMB_bit_cg[bt] = new();
-                foreach(HALF_bit_cg[bt]) HALF_bit_cg[bt] = new();
+                foreach(SLOT_bit_cg[bt]) SLOT_bit_cg[bt] = new();
                 foreach(RSVD1_bit_cg[bt]) RSVD1_bit_cg[bt] = new();
+                foreach(LIMB_bit_cg[bt]) LIMB_bit_cg[bt] = new();
+                foreach(RSVD2_bit_cg[bt]) RSVD2_bit_cg[bt] = new();
             end
             if (has_coverage(UVM_CVR_FIELD_VALS))
                 fld_cg = new();
@@ -558,36 +543,6 @@ package fhe_reg_uvm;
         endfunction : build
     endclass : fhe_reg__fhe_slot_t
 
-    // Reg - fhe_reg::FHE_XFER_DATA
-    class fhe_reg__FHE_XFER_DATA extends uvm_reg;
-        protected uvm_reg_data_t m_current;
-        protected uvm_reg_data_t m_data;
-        protected bit            m_is_read;
-
-        fhe_reg__FHE_XFER_DATA_bit_cg DATA_bit_cg[32];
-        fhe_reg__FHE_XFER_DATA_fld_cg fld_cg;
-        rand uvm_reg_field DATA;
-
-        function new(string name = "fhe_reg__FHE_XFER_DATA");
-            super.new(name, 32, build_coverage(UVM_CVR_ALL));
-        endfunction : new
-        extern virtual function void sample_values();
-        extern protected virtual function void sample(uvm_reg_data_t  data,
-                                                      uvm_reg_data_t  byte_en,
-                                                      bit             is_read,
-                                                      uvm_reg_map     map);
-
-        virtual function void build();
-            this.DATA = new("DATA");
-            this.DATA.configure(this, 32, 0, "RW", 1, 'h0, 1, 1, 0);
-            if (has_coverage(UVM_CVR_REG_BITS)) begin
-                foreach(DATA_bit_cg[bt]) DATA_bit_cg[bt] = new();
-            end
-            if (has_coverage(UVM_CVR_FIELD_VALS))
-                fld_cg = new();
-        endfunction : build
-    endclass : fhe_reg__FHE_XFER_DATA
-
     // Addrmap - fhe_reg
     class fhe_reg extends uvm_reg_block;
         rand fhe_reg__FHE_NAME FHE_NAME[2];
@@ -601,7 +556,6 @@ package fhe_reg_uvm;
         rand fhe_reg__FHE_XFER_STATUS FHE_XFER_STATUS;
         rand fhe_reg__FHE_XFER_LEFT FHE_XFER_LEFT;
         rand fhe_reg__fhe_slot_t FHE_SLOT[4];
-        rand fhe_reg__FHE_XFER_DATA FHE_XFER_DATA;
 
         function new(string name = "fhe_reg");
             super.new(name);
@@ -669,11 +623,6 @@ package fhe_reg_uvm;
                 this.FHE_SLOT[i0].build();
                 this.default_map.add_submap(this.FHE_SLOT[i0].default_map, 'h30 + i0*'h8);
             end
-            this.FHE_XFER_DATA = new("FHE_XFER_DATA");
-            this.FHE_XFER_DATA.configure(this);
-
-            this.FHE_XFER_DATA.build();
-            this.default_map.add_reg(this.FHE_XFER_DATA, 'h50);
         endfunction : build
     endclass : fhe_reg
 

@@ -16,12 +16,14 @@
 //   Unit testbench for fhe_top with register map v2 (docs/fhe/16 in the
 //   Chipyard checkout) and the real datapath (+define+FHE_WALKER).
 //
-//   The TB plays firmware: it provisions a modeled KeyVault entry, reads the
-//   160-bit seed through KV_RD_SEED_CTRL, writes CONFIG and the slot bases,
-//   issues commands, and services the firmware-forward stream (XFER_*) against
+//   The TB plays firmware and host: it provisions a modeled KeyVault entry,
+//   reads the 160-bit seed through KV_RD_SEED_CTRL, writes CONFIG and the slot
+//   bases, issues commands, and sets up and finishes AES-GCM. Every segment
+//   moves through Caliptra's axi_dma and AES engine against an AXI memory over
 //   a TB memory array. It checks keygen -> encrypt -> decrypt round trips,
-//   coefficient recovery, level refresh, single-seed stream behaviour and the
-//   command preconditions.
+//   coefficient recovery, level refresh, single-seed stream behaviour, the
+//   command preconditions, the commit barrier, lease, errors and aborts. With
+//   +RPC it is the emulator's Aloha RTL link instead (fhe_rtl.rs).
 //
 //   Run: tb/run_fhe_top_dma_tb.sh [LOGN]   (default LOGN=8 / N=256)
 //   Expect: "fhe_top_dma_tb RESULT: PASS".
@@ -57,7 +59,7 @@ module fhe_top_dma_tb
   localparam logic [AHW-1:0] A_XFER_STATUS = 'h28;
   localparam logic [AHW-1:0] A_XFER_LEFT   = 'h2C;
   localparam logic [AHW-1:0] A_SLOT0       = 'h30;   // slot n at 0x30 + 8n
-  localparam logic [AHW-1:0] A_XFER_DATA   = 'h50;
+  localparam logic [AHW-1:0] A_OLD_XFER_DATA = 'h50; // removed with the firmware-forward stream
   localparam logic [31:0]    CTRL_ZEROIZE  = 32'h8;
   localparam logic [31:0]    CTRL_INPUT_COMMIT = 32'h10;
   // STATUS fields.
@@ -68,11 +70,7 @@ module fhe_top_dma_tb
 `else
   localparam logic [31:0] CAP_FFT = 32'd0;
 `endif
-`ifdef FHE_DMA_STREAM
-  localparam logic [31:0] CAP_DMA = 32'd1 << 24;   // DMA_STREAM; FW_STREAM = 0
-`else
-  localparam logic [31:0] CAP_DMA = 32'd1 << 25;   // FW_STREAM
-`endif
+  localparam logic [31:0] CAP_DMA = 32'd1 << 24;   // DMA_STREAM
   localparam int DMA_AW = 48;   // axi_dma address width (slot range checks)
   localparam logic [31:0] CAP_EXPECTED = 32'(N) | (32'(FHE_L) << 16) | CAP_FFT | CAP_DMA | (32'd2 << 28);
 
@@ -111,10 +109,8 @@ module fhe_top_dma_tb
   logic busy_o, error_intr, notif_intr;
 
   fhe_mem_if mem_if();
-`ifdef FHE_DMA_STREAM
   axi_pkg::axi_dma_hw_req_t  dma_req;
   axi_pkg::axi_dma_hw_resp_t dma_resp;
-`endif
 
   fhe_top #(
     .AHB_DATA_WIDTH(DW), .AHB_ADDR_WIDTH(AHW), .DMA_AW(DMA_AW)
@@ -131,9 +127,7 @@ module fhe_top_dma_tb
     // C'-3: Aloha ComputeCore storage banks lifted to the top; the TB supplies
     // them via the behavioral fhe_aloha_mem_top (real SRAM at the SoC level).
     .fhe_aloha_mem(aloha_mem.req)
-`ifdef FHE_DMA_STREAM
     , .fhe_dma_req(dma_req), .fhe_dma_resp(dma_resp)
-`endif
   );
 
   fhe_aloha_mem_if aloha_mem();
@@ -162,14 +156,8 @@ module fhe_top_dma_tb
   initial if ($test$plusargs("STREAM_STALLS")) begin
     wait (rst_b);
     @(negedge clk);
-`ifdef FHE_DMA_STREAM
-    while (!(dut.cmd_q == FHE_ENCRYPT && dut.w_busy && dut.br_active && dut.br_status[1] &&
+    while (!(dut.cmd_q == FHE_ENCRYPT && dut.w_busy && dut.br_active && dut.stream_status[1] &&
              !dut.w_wr_push && dut.w_wr_ready)) @(negedge clk);
-`else
-    while (!(dut.cmd_q == FHE_ENCRYPT && dut.w_busy &&
-             dut.i_local_stream.active && dut.i_local_stream.direction &&
-             !dut.w_wr_push && !dut.i_local_stream.full)) @(negedge clk);
-`endif
     force dut.w_wr_ready = 0;
     repeat (64) @(negedge clk);
     release dut.w_wr_ready;
@@ -343,7 +331,6 @@ module fhe_top_dma_tb
   // Firmware memory: plaintext, ciphertext and output buffers.
   logic [63:0] dram [0:DEPTH-1];
 
-`ifdef FHE_DMA_STREAM
 `include "caliptra_reg_defines.svh"
 `include "caliptra_reg_field_defines.svh"
   // ---- Caliptra axi_dma with an AXI memory over the same `dram` ----
@@ -440,7 +427,6 @@ module fhe_top_dma_tb
     dma_fw_write(`AXI_DMA_REG_BYTE_COUNT, 32'(bytes));
     dma_fw_write(`AXI_DMA_REG_CTRL, DMA_GO_AXI_COPY);
   endtask
-`endif
 
   // ------------------------------------------------------------------
   int notif_count;
@@ -553,96 +539,6 @@ module fhe_top_dma_tb
   endtask
 
   // Directed bus-level checks of the private stream while the walker is idle.
-  // Illegal DATA accesses must return ERROR without changing stream state.
-  // The race case forces a walker push into the first ERROR cycle: the access
-  // must still fail and must not consume the newly available word.
-  task automatic stream_check(input bit ok, input string what);
-    if (!ok) begin $display("FAIL[STREAM]: %s", what); errors++; end
-  endtask
-
-  task automatic check_local_stream_bus();
-    logic [31:0] d, lo, hi;
-    bit err;
-    int start_errors = errors;
-    ahb_read(A_CAP, d);
-    stream_check(d == CAP_EXPECTED, $sformatf("CAP=0x%08h expected 0x%08h", d, CAP_EXPECTED));
-    ahb_access(1'b0, A_XFER_DATA, '0, d, err);
-    stream_check(err, "idle DATA read accepted");
-    ahb_access(1'b1, A_XFER_DATA, 32'h1234_5678, d, err);
-    stream_check(err, "idle DATA write accepted");
-    ahb_read(A_XFER_STATUS, d);
-    stream_check(d == 0, $sformatf("rejected access changed STATUS=0x%08h", d));
-    // Keep the next address valid through ERROR completion: no idle bubble
-    // between the rejected transfers. Exercise both read and write errors,
-    // followed immediately by a legal CAP read to check recovery.
-    for (int write_access = 0; write_access < 2; write_access++) begin
-      @(negedge clk);
-      hsel = 1; htrans = 2'b10; haddr = A_XFER_DATA;
-      hwrite = 1'(write_access); hsize = 3'b010; hwdata = 64'h1234_5678;
-      @(negedge clk);
-      stream_check(hresp && !hreadyout, "first access skipped ERROR wait cycle");
-      @(negedge clk);
-      stream_check(hresp && hreadyout, "first ERROR did not complete");
-      @(negedge clk);
-      stream_check(hresp && !hreadyout, "back-to-back access skipped ERROR wait cycle");
-      haddr = A_CAP; hwrite = 0;
-      @(negedge clk);
-      stream_check(hresp && hreadyout, "second ERROR did not complete");
-      @(negedge clk);
-      stream_check(!hresp && hreadyout, "legal access after ERROR did not complete OKAY");
-      stream_check(hrdata[63:32] == CAP_EXPECTED, "CAP read after ERROR returned wrong data");
-      hsel = 0; htrans = 0; hwdata = 0;
-      @(negedge clk);
-      stream_check(!hresp && hreadyout, "spurious ERROR after final access");
-    end
-    ahb_read(A_XFER_STATUS, d);
-    stream_check(d == 0, "back-to-back errors changed stream state");
-    // Open an output descriptor without running the walker.
-    @(negedge clk);
-    force dut.w_desc_valid = 1'b1; force dut.w_desc_wr = 1'b1;
-    force dut.w_desc_ptr = 3'd2; force dut.w_desc_limb = 4'd0;
-    @(negedge clk);
-    release dut.w_desc_valid; release dut.w_desc_wr; release dut.w_desc_ptr; release dut.w_desc_limb;
-    fork
-      ahb_access(1'b0, A_XFER_DATA, '0, d, err);
-      begin
-        @(negedge clk); @(posedge clk); #1;   // data phase, first ERROR cycle
-        force dut.w_wr_push = 1'b1; force dut.w_wr_data = 64'hfeed_beef_0bad_cafe;
-        @(posedge clk); #1;
-        release dut.w_wr_push; release dut.w_wr_data;
-      end
-    join
-    stream_check(err, "DATA read completed after its ERROR cycle");
-    ahb_read(A_XFER_STATUS, d);
-    stream_check(d[3:0] == 4'b1011 && !d[12], $sformatf("race changed STATUS=0x%08h", d));
-    ahb_read(A_XFER_DATA, lo); ahb_read(A_XFER_DATA, hi);
-    stream_check({hi, lo} == 64'hfeed_beef_0bad_cafe, $sformatf("word=0x%08h%08h", hi, lo));
-    ahb_read(A_XFER_LEFT, d);
-    stream_check(d == N-1, $sformatf("LEFT=%0d after one word", d));
-    ahb_write(A_CTRL, CTRL_ZEROIZE);   // discards the open descriptor
-    ahb_read(A_XFER_STATUS, d);
-    stream_check(d == 0, $sformatf("ZEROIZE left STATUS=0x%08h", d));
-    if (errors == start_errors) $display("PASS local-stream AHB errors, back-to-back errors/recovery, error-cycle race, ZEROIZE");
-  endtask
-
-  // Firmware model: private memory <-> AHB stream, no FHE AXI traffic.
-  task automatic service_local_stream();
-    logic [31:0] status, left, lo, hi;
-    int idx;
-    ahb_read(A_XFER_STATUS, status);
-    if (status[2] || status[3]) begin   // input ready / output valid (both imply active)
-      ahb_read(A_XFER_LEFT, left);
-      idx = int'(slot_base[status[6:4]]/8) + int'(status[11:8])*N + N-int'(left);
-      if (status[1]) begin
-        ahb_read(A_XFER_DATA, lo); ahb_read(A_XFER_DATA, hi);
-        dram[idx] = {hi,lo};
-      end else begin
-        ahb_write(A_XFER_DATA, dram[idx][31:0]); ahb_write(A_XFER_DATA, dram[idx][63:32]);
-      end
-    end
-  endtask
-
-`ifdef FHE_DMA_STREAM
   // ---- Firmware/host AES-GCM steps, over the AES engine's AHB port ----
   // The ENCRYPT message and the DECRYPT slots cross the AES boundary: the host
   // seals the message, the DMA decrypts it into Aloha, firmware checks the tag
@@ -650,7 +546,6 @@ module fhe_top_dma_tb
   // host opens it. Word order on both paths is memory order (low word first).
   localparam logic [255:0] GCM_KEY = 256'h6d6a8f94_67308308_feffe992_8665731c_6d6a8f94_67308308_feffe992_8665731c;
   localparam logic [95:0]  GCM_IV  = 96'hdecaf888_faced8ad_cafebabe;
-  localparam logic [127:0] GCM_AAD = 128'h41_4c_4f_48_41_2d_76_32_00_00_00_01_feedface;
   localparam logic [31:0]  AES_CTRL_GCM_256 = (32'(aes_pkg::AES_GCM) << `AES_REG_CTRL_SHADOWED_MODE_LOW) |
                                               (32'(aes_pkg::AES_256) << `AES_REG_CTRL_SHADOWED_KEY_LEN_LOW);
   localparam logic [31:0]  AES_CLP_CTRL0 = `CLP_AES_CLP_REG_CTRL0 - `CLP_AES_REG_BASE_ADDR;
@@ -693,7 +588,8 @@ module fhe_top_dma_tb
            (32'(bytes) << `AES_REG_CTRL_GCM_SHADOWED_NUM_VALID_BYTES_LOW);
   endfunction
 
-  // GCM context up to the text phase: mode, key, IV, one AAD block.
+  // GCM context up to the text phase: mode, key, IV. No extra data, as in the
+  // session protocol (docs/fhe/16 "Session protocol on the DMA path").
   task automatic gcm_begin(input aes_pkg::aes_op_e op);
     aes_wait(`AES_REG_STATUS_IDLE_MASK);
     aes_wr(AES_CLP_CTRL0, 32'h0);   // no endian swap
@@ -709,9 +605,6 @@ module fhe_top_dma_tb
     aes_wait(`AES_REG_STATUS_IDLE_MASK);
     for (int j = 0; j < 4; j++) aes_wr(`AES_REG_IV_0 + 4*j, (j < 3) ? GCM_IV[32*j +: 32] : 32'h0);
     aes_wait(`AES_REG_STATUS_IDLE_MASK);
-    aes_wr2(`AES_REG_CTRL_GCM_SHADOWED, gcm_ctrl(aes_pkg::GCM_AAD, 16));
-    aes_wait(`AES_REG_STATUS_INPUT_READY_MASK);
-    for (int j = 0; j < 4; j++) aes_wr(`AES_REG_DATA_IN_0 + 4*j, GCM_AAD[32*j +: 32]);
   endtask
   // Text phase over AHB: `words` 64-bit words from dram[src] to dram[dst].
   task automatic gcm_text_ahb(input int src, input int dst, input int words);
@@ -731,9 +624,9 @@ module fhe_top_dma_tb
   task automatic gcm_finish(input int text_bytes, output logic [127:0] tag);
     aes_wait(`AES_REG_STATUS_IDLE_MASK);
     aes_wr2(`AES_REG_CTRL_GCM_SHADOWED, gcm_ctrl(aes_pkg::GCM_TAG, 16));
-    // len(AAD) || len(text) in bits, big-endian 64-bit fields
+    // len(AAD) = 0 || len(text) in bits, big-endian 64-bit fields
     aes_wr(`AES_REG_DATA_IN_0 + 0,  32'h0);
-    aes_wr(`AES_REG_DATA_IN_0 + 4,  {<<8{32'd128}});
+    aes_wr(`AES_REG_DATA_IN_0 + 4,  32'h0);
     aes_wr(`AES_REG_DATA_IN_0 + 8,  32'h0);
     aes_wr(`AES_REG_DATA_IN_0 + 12, {<<8{32'(text_bytes * 8)}});
     aes_wait(`AES_REG_STATUS_OUTPUT_VALID_MASK);
@@ -783,28 +676,26 @@ module fhe_top_dma_tb
       end
     end
   endtask
-`endif
 
-  // Issue a command, with the AES-GCM context it needs (DMA stream build);
+  // Issue a command, with the AES-GCM context it needs;
   // `base` is notif_count before it. forge >= 0 flips a bit of that sealed
   // message word (one plaintext mantissa bit, CTR mode) after sealing.
   task automatic issue_cmd(input fhe_cmd_e c, output int base, input int forge = -1);
     base = notif_count;
-`ifdef FHE_DMA_STREAM
     if (c == FHE_ENCRYPT) begin
       seal_message();
       if (forge >= 0) dram[ADDR_SEALED/8 + forge] ^= 64'h1;
       gcm_begin(aes_pkg::AES_DEC);
     end
     if (c == FHE_DECRYPT) gcm_begin(aes_pkg::AES_ENC);
-`endif
     ahb_write(A_CTRL, {29'd0, c});
   endtask
 
-  // Wait for the next notif, servicing the firmware-forward stream meanwhile.
+  // Wait for the next notif, polling STATUS meanwhile.
   task automatic wait_notif(input int base, input string nm);
     int guard = 0;
-    while ((notif_count == base) && (guard < 50_000_000)) begin service_local_stream(); guard++; end
+    logic [31:0] st;
+    while ((notif_count == base) && (guard < 50_000_000)) begin ahb_read(A_STATUS, st); guard++; end
     if (notif_count == base) begin $display("  FAIL: %s never completed (timeout)", nm); errors++; end
     else                          $display("  [fhe] %s notif (%0d polling iterations)", nm, guard);
   endtask
@@ -817,7 +708,6 @@ module fhe_top_dma_tb
     logic [31:0] st;
     cpu_sleep = 1; // parent must stay awake through the stream and completion delivery
     wait_notif(base, nm);
-`ifdef FHE_DMA_STREAM
     if (c == FHE_ENCRYPT) begin
       bit tag_ok;
       ahb_read(A_STATUS, st);
@@ -827,7 +717,6 @@ module fhe_top_dma_tb
       commit_and_wait(nm, tag_ok);
       if (!tag_ok) begin $display("  FAIL: %s message tag mismatch", nm); errors++; end
     end
-`endif
     @(negedge clk);
     cpu_sleep = 0;
     ahb_read(A_STATUS, st);
@@ -835,9 +724,7 @@ module fhe_top_dma_tb
       $display("  FAIL: %s completed with STATUS 0x%08h, expected cause %0d", nm, st, cause); errors++;
     end else if (cause != FHE_EC_NONE)
       $display("PASS %s -> ERROR cause %0d", nm, cause);
-`ifdef FHE_DMA_STREAM
     if (c == FHE_DECRYPT) open_output(cause == FHE_EC_NONE);
-`endif
   endtask
 
   task automatic run_cmd(input fhe_cmd_e c, input string nm, input logic [3:0] cause = FHE_EC_NONE);
@@ -925,23 +812,24 @@ module fhe_top_dma_tb
     run_cmd(FHE_KEYGEN, nm);
   endtask
 
-`ifdef FHE_DMA_STREAM
   task automatic expect_dma_released(input string nm);
     if (!dma_resp.idle || dut.br_lease) begin
       $display("FAIL: %s left the DMA busy or leased", nm); errors++;
     end
   endtask
 
-  // Without the firmware-forward stream, XFER_DATA accesses fail.
-  task automatic check_xfer_data_off();
+  // CAP reports the DMA stream; the former XFER_DATA offset is unmapped
+  // (reads 0, writes ignored, no bus error).
+  task automatic check_cap();
     logic [31:0] d;
     bit rd_err, wr_err;
     ahb_read(A_CAP, d);
     if (d != CAP_EXPECTED) begin $display("FAIL: CAP=0x%08h expected 0x%08h", d, CAP_EXPECTED); errors++; end
-    ahb_access(1'b0, A_XFER_DATA, '0, d, rd_err);
-    ahb_access(1'b1, A_XFER_DATA, 32'h1234_5678, d, wr_err);
-    if (!rd_err || !wr_err) begin $display("FAIL: XFER_DATA accepted an access without FW_STREAM"); errors++; end
-    else $display("PASS CAP.DMA_STREAM, no firmware-forward stream (XFER_DATA accesses fail)");
+    ahb_access(1'b1, A_OLD_XFER_DATA, 32'h1234_5678, d, wr_err);
+    ahb_access(1'b0, A_OLD_XFER_DATA, '0, d, rd_err);
+    if (rd_err || wr_err || d != 0) begin
+      $display("FAIL: unmapped 0x50 err %0d/%0d data 0x%08h", rd_err, wr_err, d); errors++;
+    end else $display("PASS CAP.DMA_STREAM; 0x50 unmapped");
   endtask
 
   // Fill `words` 64-bit words at `addr` with a marker; count words still marked.
@@ -1096,6 +984,12 @@ module fhe_top_dma_tb
     run_cmd(FHE_DECRYPT, "DECRYPT after a transport error");
     capture_slots(reco, ADDR_OUT);
     check_fft(reco, g_input, N, "DECRYPT after transport error (recovered vs input)", 1.0e-3);
+    // A command without segments must not inherit a failure: KEYGEN right
+    // after one (same seed, so the key is unchanged).
+    mem_rd_err = 1'b1;
+    run_cmd(FHE_DECRYPT, "DECRYPT with AXI read errors, again", FHE_EC_TRANSPORT);
+    mem_rd_err = 1'b0;
+    rekey("KEYGEN after a transport error");
 
     // (9) ZEROIZE in the middle of a DMA output segment: the segment drains,
     //     then the command completes as aborted and the lease is released.
@@ -1105,7 +999,7 @@ module fhe_top_dma_tb
     wait_notif(base, "ENCRYPT to COMMIT_WAIT");
     commit_input(tag_ok);
     guard = 0;
-    while (!(dut.br_active && dut.br_status[1] && dut.br_left < N/2) && guard < 1000000) begin
+    while (!(dut.br_active && dut.stream_status[1] && dut.stream_left < N/2) && guard < 1000000) begin
       @(negedge clk); guard++;
     end
     ahb_write(A_CTRL, CTRL_ZEROIZE);
@@ -1116,7 +1010,6 @@ module fhe_top_dma_tb
     else begin $display("FAIL: ZEROIZE mid DMA segment left STATUS=0x%08h", d); errors++; end
     expect_dma_released("abort");
   endtask
-`endif
 
   // Independent public integer evaluator: scalar multiply/add only, using
   // unbounded-domain model weights and canonical modular reduction per term.
@@ -1203,42 +1096,54 @@ module fhe_top_dma_tb
         count = $fscanf(32'h80000000, "%d %h %h", op, addr, value);
         if (count != 3) $finish;
         else begin
-          // Cancel once, at a firmware status read between coefficient pairs.
-          // Use a real CSR write so the regression covers actual ZEROIZE
-          // semantics, without racing an in-flight STREAM_DATA bus access.
+          // Cancel once, mid-transfer, at a firmware poll. Use a real CSR write
+          // so the regression covers actual ZEROIZE semantics.
           if ($test$plusargs("RPC_ZEROIZE_REFRESH") && !refresh_aborted &&
-              op == 0 && addr == A_XFER_STATUS && dut.cmd_q == FHE_REFRESH &&
-              dut.i_local_stream.active && !dut.i_local_stream.direction &&
-              dut.i_local_stream.left < N && !dut.i_local_stream.half) begin
+              op == 0 && addr == A_STATUS && dut.cmd_q == FHE_REFRESH && dut.br_active) begin
             ahb_write(A_CTRL, 32'h8);
             refresh_aborted = 1;
             $display("FHE_FAULT injected ZEROIZE during refresh");
           end
           if (refresh_aborted && !abort_acknowledged) begin
-            if (op == 1 && addr == A_CTRL && value == 8) begin
-              abort_acknowledged = 1;
-              $display("PASS firmware noticed cancelled refresh and cleared controller");
-            end else if (op == 0 && addr == A_STATUS) begin
+            // Firmware reports the abort (ERR_CAUSE 11) from the completion,
+            // after the segment in flight drains.
+            if (op == 0 && addr == A_STATUS) begin
               abort_polls++;
-              if (abort_polls > 16)
-                $fatal(1, "firmware kept polling idle aborted refresh without completion");
+              if (abort_polls > 1000)
+                $fatal(1, "firmware kept polling the aborted refresh");
             end
           end
           // Reply "RPC <read data> <1 if AHB ERROR>"; the emulator raises a
-          // load/store access fault for an ERROR response.
-          ahb_access(op == 1, addr, value, rdata, err);
-          repeat (32) @(negedge clk);
+          // load/store access fault for an ERROR response. Address space (see
+          // fhe_rtl.rs): FHE window at its offset; the AES window at
+          // 0x1_0000 + offset and the memory at its DRAM address
+          // (0x8000_0000 and up, aliased onto `dram`). Memory accesses are the
+          // host's buffer loads and reads and take no time.
+          err = 0;
+          if (addr >= 32'h8000_0000) begin
+            if (op == 1) begin
+              if (addr[2]) dram[addr[MEM_AW-1:3]][63:32] = value;
+              else         dram[addr[MEM_AW-1:3]][31:0]  = value;
+            end
+            rdata = addr[2] ? dram[addr[MEM_AW-1:3]][63:32] : dram[addr[MEM_AW-1:3]][31:0];
+          end else if (addr[31:16] == 16'h1) begin
+            aes_access(op == 1, {16'h0, addr[15:0]}, value, rdata);
+          end else begin
+            ahb_access(op == 1, addr, value, rdata, err);
+          end
+          if (addr < 32'h8000_0000) repeat (32) @(negedge clk);
+          if (refresh_aborted && !abort_acknowledged && op == 0 && addr == A_STATUS &&
+              rdata[ST_VALID] && rdata[7:4] == 4'd11) begin
+            abort_acknowledged = 1;
+            $display("PASS firmware observed the aborted refresh");
+          end
           $display("RPC %08x %0d", rdata, err);
           $fflush();
         end
       end
     end
 
-`ifdef FHE_DMA_STREAM
-    check_xfer_data_off();
-`else
-    check_local_stream_bus();
-`endif
+    check_cap();
 
     // Pause the parent clock in each idle phase while lifted SRAMs continue
     // to receive base-clock edges. No repeated requests/response shifts allowed.
@@ -1260,7 +1165,7 @@ module fhe_top_dma_tb
     end
     $display("PASS idle parent-clock pause/resume in all three phases");
 
-    $display("== fhe_top register map v2 round trip (firmware-forward stream), N=%0d ==", N);
+    $display("== fhe_top register map v2 round trip, N=%0d ==", N);
 
     // plaintext -> firmware memory (ENCRYPT slot 0 source)
     $readmemh({tvdir, "/input.txt"}, g_input);
@@ -1580,15 +1485,9 @@ module fhe_top_dma_tb
       enc_slots();
       issue_cmd(FHE_ENCRYPT, base);
       guard = 0;
-`ifdef FHE_DMA_STREAM
-      while (!(dut.br_active && !dut.br_status[1] && dut.br_left < N/2) && guard < 100000) begin
+      while (!(dut.br_active && !dut.stream_status[1] && dut.stream_left < N/2) && guard < 100000) begin
         @(negedge clk); guard++;
       end
-`else
-      while (!(dut.i_local_stream.active && dut.i_local_stream.left < N/2) && guard < 100000) begin
-        service_local_stream(); guard++;
-      end
-`endif
       ahb_write(A_CTRL, CTRL_ZEROIZE);
       wait_status(ST_VALID, "ZEROIZE mid-ENCRYPT");
       ahb_read(A_STATUS, d);
@@ -1597,13 +1496,9 @@ module fhe_top_dma_tb
       else begin $display("FAIL: ZEROIZE mid-ENCRYPT left STATUS=0x%08h", d); errors++; end
       ahb_read(A_XFER_STATUS, d);
       if (d != 0) begin $display("FAIL: ZEROIZE left XFER_STATUS=0x%08h", d); errors++; end
-`ifdef FHE_DMA_STREAM
       gcm_discard();   // abandon the GCM context
-`endif
 
-`ifdef FHE_DMA_STREAM
       dma_stream_tests();
-`endif
 
       // Restore the seed-A key for the optional MNIST run.
       rekey("KEYGEN (restore seed A)");

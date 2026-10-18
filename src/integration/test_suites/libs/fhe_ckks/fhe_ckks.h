@@ -40,7 +40,6 @@
 #define FHE_REG_XFER_STATUS       (CLP_FHE_REG_BASE_ADDR + 0x28)
 #define FHE_REG_XFER_LEFT         (CLP_FHE_REG_BASE_ADDR + 0x2C)
 #define FHE_REG_SLOT0_BASE_L      (CLP_FHE_REG_BASE_ADDR + 0x30)  // slot n at +8n
-#define FHE_REG_XFER_DATA         (CLP_FHE_REG_BASE_ADDR + 0x50)
 
 // Commands (FHE_CTRL[2:0])
 #define FHE_CMD_NONE              0x0

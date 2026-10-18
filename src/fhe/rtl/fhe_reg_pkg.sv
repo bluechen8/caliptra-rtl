@@ -108,11 +108,7 @@ package fhe_reg_pkg;
     } fhe_reg__FHE_CAP__DMA_STREAM__in_t;
 
     typedef struct packed{
-        logic next;
-    } fhe_reg__FHE_CAP__FW_STREAM__in_t;
-
-    typedef struct packed{
-        logic [1:0] next;
+        logic [2:0] next;
     } fhe_reg__FHE_CAP__RSVD1__in_t;
 
     typedef struct packed{
@@ -125,7 +121,6 @@ package fhe_reg_pkg;
         fhe_reg__FHE_CAP__FFT_GENERATED__in_t FFT_GENERATED;
         fhe_reg__FHE_CAP__RSVD0__in_t RSVD0;
         fhe_reg__FHE_CAP__DMA_STREAM__in_t DMA_STREAM;
-        fhe_reg__FHE_CAP__FW_STREAM__in_t FW_STREAM;
         fhe_reg__FHE_CAP__RSVD1__in_t RSVD1;
         fhe_reg__FHE_CAP__MAP_VERSION__in_t MAP_VERSION;
     } fhe_reg__FHE_CAP__in_t;
@@ -182,12 +177,8 @@ package fhe_reg_pkg;
     } fhe_reg__FHE_XFER_STATUS__DIR__in_t;
 
     typedef struct packed{
-        logic next;
-    } fhe_reg__FHE_XFER_STATUS__IN_READY__in_t;
-
-    typedef struct packed{
-        logic next;
-    } fhe_reg__FHE_XFER_STATUS__OUT_VALID__in_t;
+        logic [1:0] next;
+    } fhe_reg__FHE_XFER_STATUS__RSVD0__in_t;
 
     typedef struct packed{
         logic [2:0] next;
@@ -195,30 +186,24 @@ package fhe_reg_pkg;
 
     typedef struct packed{
         logic next;
-    } fhe_reg__FHE_XFER_STATUS__RSVD0__in_t;
+    } fhe_reg__FHE_XFER_STATUS__RSVD1__in_t;
 
     typedef struct packed{
         logic [3:0] next;
     } fhe_reg__FHE_XFER_STATUS__LIMB__in_t;
 
     typedef struct packed{
-        logic next;
-    } fhe_reg__FHE_XFER_STATUS__HALF__in_t;
-
-    typedef struct packed{
-        logic [18:0] next;
-    } fhe_reg__FHE_XFER_STATUS__RSVD1__in_t;
+        logic [19:0] next;
+    } fhe_reg__FHE_XFER_STATUS__RSVD2__in_t;
 
     typedef struct packed{
         fhe_reg__FHE_XFER_STATUS__ACTIVE__in_t ACTIVE;
         fhe_reg__FHE_XFER_STATUS__DIR__in_t DIR;
-        fhe_reg__FHE_XFER_STATUS__IN_READY__in_t IN_READY;
-        fhe_reg__FHE_XFER_STATUS__OUT_VALID__in_t OUT_VALID;
-        fhe_reg__FHE_XFER_STATUS__SLOT__in_t SLOT;
         fhe_reg__FHE_XFER_STATUS__RSVD0__in_t RSVD0;
-        fhe_reg__FHE_XFER_STATUS__LIMB__in_t LIMB;
-        fhe_reg__FHE_XFER_STATUS__HALF__in_t HALF;
+        fhe_reg__FHE_XFER_STATUS__SLOT__in_t SLOT;
         fhe_reg__FHE_XFER_STATUS__RSVD1__in_t RSVD1;
+        fhe_reg__FHE_XFER_STATUS__LIMB__in_t LIMB;
+        fhe_reg__FHE_XFER_STATUS__RSVD2__in_t RSVD2;
     } fhe_reg__FHE_XFER_STATUS__in_t;
 
     typedef struct packed{
@@ -251,12 +236,6 @@ package fhe_reg_pkg;
     } fhe_reg__fhe_slot_t__in_t;
 
     typedef struct packed{
-        logic rd_ack;
-        logic [31:0] rd_data;
-        logic wr_ack;
-    } fhe_reg__FHE_XFER_DATA__external__in_t;
-
-    typedef struct packed{
         logic reset_b;
         logic fhe_ready;
         fhe_reg__FHE_NAME__in_t [2-1:0]FHE_NAME;
@@ -270,7 +249,6 @@ package fhe_reg_pkg;
         fhe_reg__FHE_XFER_STATUS__in_t FHE_XFER_STATUS;
         fhe_reg__FHE_XFER_LEFT__in_t FHE_XFER_LEFT;
         fhe_reg__fhe_slot_t__in_t [4-1:0]FHE_SLOT;
-        fhe_reg__FHE_XFER_DATA__external__in_t FHE_XFER_DATA;
     } fhe_reg__in_t;
 
     typedef struct packed{
@@ -343,18 +321,10 @@ package fhe_reg_pkg;
     } fhe_reg__fhe_slot_t__out_t;
 
     typedef struct packed{
-        logic req;
-        logic req_is_wr;
-        logic [31:0] wr_data;
-        logic [31:0] wr_biten;
-    } fhe_reg__FHE_XFER_DATA__external__out_t;
-
-    typedef struct packed{
         fhe_reg__FHE_CTRL__external__out_t FHE_CTRL;
         fhe_reg__FHE_CONFIG__out_t FHE_CONFIG;
         kv_read_ctrl_reg__out_t FHE_KV_RD_SEED_CTRL;
         fhe_reg__fhe_slot_t__out_t [4-1:0]FHE_SLOT;
-        fhe_reg__FHE_XFER_DATA__external__out_t FHE_XFER_DATA;
     } fhe_reg__out_t;
 
     typedef enum logic [31:0] {
