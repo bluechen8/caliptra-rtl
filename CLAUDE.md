@@ -175,3 +175,12 @@ Chisel. Newly lifted here:
 SDP banks = N/2, SP banks = N; **crom stays fixed 9b/512** (RNS consts, N-independent) and **INS_RAM
 stays 16×42** (microprogram, flop/LUTRAM — deliberately NOT lifted). The `fheWalker` Chisel flag is
 gone (implied by `noFhe=false`); the SV `` `ifdef FHE_WALKER `` is now driven off `noFhe`.
+
+## FHE tables are firmware-installed (2026-10-19)
+
+Supersedes the twiddle boot-load above. There is no stored FFT-twiddle table (FTWROM)
+and no Rocket table window: FFT twiddles are always generated, and the runtime image
+embeds the CROM table and copies it in at every boot through `fhe_top`'s write-only
+CROM window (AHB 0x4000-0x5FFF; lanes 0-2 staged, the lane-3 store writes the word;
+stores taken only while READY). `fhe_aloha_mem_if` carries `crom_wea/wa/wd`; the
+runtime zeroizes the engine before the copy. Spec: chipyard `docs/fhe/19`.

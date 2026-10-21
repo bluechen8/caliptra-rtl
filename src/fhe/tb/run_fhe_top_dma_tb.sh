@@ -10,8 +10,11 @@
 # and sealing. It checks round trips, recovery, refresh, the single-seed
 # stream, command preconditions, the commit barrier, lease, address, error and
 # abort cases. Options: FHE_L=<1..8> (largest level, default 2), LIMBS2=1
-# (two-limb ciphertexts and the N=256 key golden), FFT_ON_THE_FLY=1, STREAM_STALLS=1, MNIST_DIR=<dir>. +RPC turns the
-# binary into the emulator's Aloha RTL link (BUILD_ONLY=1 prints its path).
+# (two-limb ciphertexts and the N=256 key golden), STREAM_STALLS=1, MNIST_DIR=<dir>,
+# RECOVER=0 (production build without the RECOVER command: checks it is refused
+# and runs the level sweep by round trip only). +RPC turns the binary into the
+# emulator's Aloha RTL link (BUILD_ONLY=1 prints its path); BUILD_ONLY builds
+# default to RECOVER=0, like silicon.
 #
 # Expect: "fhe_top_dma_tb RESULT: PASS".
 set -euo pipefail
@@ -39,17 +42,17 @@ OBJ_DIR="${OBJ_DIR:-$BUILD/obj_dir_$TOP}"
 LOG="${LOG:-$BUILD/${TOP}.log}"
 mkdir -p "$MIF"
 
-echo "== [N=$N / LOGN=$LOGN / L=$FHE_L] regenerating ROM tables + plaintext =="
-# Generate both tables locally for every N; never use a checked-in CROM.
+echo "== [N=$N / LOGN=$LOGN / L=$FHE_L] regenerating the CROM table + plaintext =="
+# Generate the CROM locally for every N and L; never use a checked-in table.
 python3 "$ALOHA_PORT/vendor/Scripts/GenerateConstantsROM.py"        "$LOGN" "$MIF/TwFctrCache_RNSConsts.coe" --profiles "$FHE_L"
-python3 "$ALOHA_PORT/vendor/Scripts/GenerateStoredFFTTwiddleFct.py" "$LOGN" "$MIF/FFTStoredTwiddleFactors.coe"
 
 python3 "$ALOHA_PORT/tvgen/gen_roundtrip.py" "$LOGN" "$WORK" >/dev/null
 
-EXTRA_DEF=""
-[[ "${FFT_ON_THE_FLY:-0}" == 1 ]] && EXTRA_DEF="-DFHE_FFT_ON_THE_FLY"
-
-echo "=== build $TOP (N=$N) ${EXTRA_DEF:+[$EXTRA_DEF]} ==="
+# RECOVER (plaintext-equivalent output) exists only in verification builds.
+RECOVER="${RECOVER:-$([[ "${BUILD_ONLY:-0}" == 1 ]] && echo 0 || echo 1)}"
+RECOVER_DEF="-DFHE_RECOVER_CMD"
+[[ "$RECOVER" == 0 ]] && RECOVER_DEF=""
+echo "=== build $TOP (N=$N) ${RECOVER_DEF:-[production: no RECOVER]} ==="
 [[ -n "${CLEAN:-}" ]] && rm -rf "$OBJ_DIR"
 "$VERILATOR" --binary -j "${JOBS:-4}" \
   --timing --assert \
@@ -58,13 +61,13 @@ echo "=== build $TOP (N=$N) ${EXTRA_DEF:+[$EXTRA_DEF]} ==="
   -Wno-CASEINCOMPLETE -Wno-BLKANDNBLK -Wno-MULTIDRIVEN -Wno-SELRANGE \
   -Wno-LATCH -Wno-IMPLICIT -Wno-UNSIGNED -Wno-CMPCONST -Wno-ASCRANGE \
   -Wno-PINMISSING -Wno-WIDTHCONCAT -Wno-GENUNNAMED -Wno-DECLFILENAME -Wno-UNUSEDSIGNAL \
-  -DFHE_WALKER -DFHE_N="$N" -DFHE_L="$FHE_L" $EXTRA_DEF \
+  -DFHE_WALKER -DFHE_N="$N" -DFHE_L="$FHE_L" $RECOVER_DEF \
   --Mdir "$OBJ_DIR" \
   -f "$FLIST" \
   -o "V$TOP" \
   2>&1 | tee "$LOG"
 
-# Rundir with the .coe->.mem ROM init the Aloha core $readmemh's (depth-5, under build/).
+# Rundir (depth-5, under build/) with the CROM table the TB copies in, as firmware does.
 RUNDIR="${RUNDIR:-$BUILD/.run_$TOP/a/b/c/d}"
 mkdir -p "$RUNDIR"
 coe2mem() {
@@ -74,7 +77,6 @@ coe2mem() {
       -e 's/[;,]//g' "$1" | grep -viE '[^0-9a-fx[:space:]]' | grep -vE '^[[:space:]]*$' > "$2"
 }
 coe2mem "$MIF/TwFctrCache_RNSConsts.coe"   "$RUNDIR/fft_rns_rom.mem"
-coe2mem "$MIF/FFTStoredTwiddleFactors.coe" "$RUNDIR/fft_all_twiddle_rom.mem"
 
 if [[ "${BUILD_ONLY:-0}" == 1 ]]; then
   echo "RPC executable: $OBJ_DIR/V$TOP"
@@ -84,7 +86,7 @@ fi
 
 echo "=== running (cwd=$RUNDIR) ==="
 PLUSARGS=""
-if [[ "$N" == 256 ]]; then
+if [[ "$N" == 256 && "$RECOVER" == 1 ]]; then
   python3 "$ALOHA_PORT/tvgen/gen_recovery.py" "$WORK"
   PLUSARGS="$PLUSARGS +RECOVERY_DIR=$WORK"
 fi

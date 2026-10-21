@@ -64,7 +64,6 @@ if [[ -z "${ALOHA_MIF_DIR:-}" ]]; then
   mkdir -p "$MIF"
   LOGN="$(python3 -c 'import math, sys; print(int(math.log2(int(sys.argv[1]))))' "$NVAL")"
   python3 "$ALOHA_SRC/Scripts/GenerateConstantsROM.py" "$LOGN" "$MIF/TwFctrCache_RNSConsts.coe"
-  python3 "$ALOHA_SRC/Scripts/GenerateStoredFFTTwiddleFct.py" "$LOGN" "$MIF/FFTStoredTwiddleFactors.coe"
 fi
 coe2mem() {
   [[ -f "$1" ]] || { echo "ERROR: missing ROM table: $1" >&2; return 1; }
@@ -73,7 +72,6 @@ coe2mem() {
       -e 's/[;,]//g' "$1" | grep -viE '[^0-9a-fx[:space:]]' | grep -vE '^[[:space:]]*$' > "$2"
 }
 coe2mem "$MIF/TwFctrCache_RNSConsts.coe"   "$RUNDIR/fft_rns_rom.mem"
-coe2mem "$MIF/FFTStoredTwiddleFactors.coe" "$RUNDIR/fft_all_twiddle_rom.mem"
 
 PLUSARGS=(+TVDIR="$GOLDEN_ABS")
 [[ -n "${ROUNDTRIP:-}" ]] && PLUSARGS+=(+ROUNDTRIP)

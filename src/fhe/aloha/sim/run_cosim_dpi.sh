@@ -51,7 +51,6 @@ MIF="${ALOHA_MIF_DIR:-$WORK/mif}"
 if [[ -z "${ALOHA_MIF_DIR:-}" ]]; then
   mkdir -p "$MIF"
   python3 "$ALOHA_SRC/Scripts/GenerateConstantsROM.py" "$LOGN" "$MIF/TwFctrCache_RNSConsts.coe"
-  python3 "$ALOHA_SRC/Scripts/GenerateStoredFFTTwiddleFct.py" "$LOGN" "$MIF/FFTStoredTwiddleFactors.coe"
 fi
 
 # ---- inputs m1, m2 -----------------------------------------------------------
@@ -100,7 +99,6 @@ coe2mem() {
       -e 's/[;,]//g' "$1" | grep -viE '[^0-9a-fx[:space:]]' | grep -vE '^[[:space:]]*$' > "$2"
 }
 coe2mem "$MIF/TwFctrCache_RNSConsts.coe"   "$RUNDIR/fft_rns_rom.mem"
-coe2mem "$MIF/FFTStoredTwiddleFactors.coe" "$RUNDIR/fft_all_twiddle_rom.mem"
 
 # ---- single run: keygen + encrypt + (in-proc server) + decrypt + check -------
 echo "== single-run DPI-C cosim (op=$OP): $DESC ==" | tee -a "$LOG"

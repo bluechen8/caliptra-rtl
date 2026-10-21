@@ -45,9 +45,8 @@ mkdir -p "$MIF"
 echo "== [N=$N / LOGN=$LOGN] generating golden plaintext + Aloha ROM tables =="
 python3 "$ALOHA_PORT/tvgen/gen_roundtrip.py" "$LOGN" "$RUNDIR" >/dev/null
 
-# Generate both tables locally for every N; never use a checked-in CROM.
+# Generate the CROM locally for every N; never use a checked-in table.
 python3 "$ALOHA_PORT/vendor/Scripts/GenerateConstantsROM.py"        "$LOGN" "$MIF/TwFctrCache_RNSConsts.coe"
-python3 "$ALOHA_PORT/vendor/Scripts/GenerateStoredFFTTwiddleFct.py" "$LOGN" "$MIF/FFTStoredTwiddleFactors.coe"
 
 coe2mem() {
   [[ -f "$1" ]] || { echo "ERROR: missing ROM table: $1" >&2; return 1; }
@@ -56,7 +55,6 @@ coe2mem() {
       -e 's/[;,]//g' "$1" | grep -viE '[^0-9a-fx[:space:]]' | grep -vE '^[[:space:]]*$' > "$2"
 }
 coe2mem "$MIF/TwFctrCache_RNSConsts.coe"   "$RUNDIR/fft_rns_rom.mem"
-coe2mem "$MIF/FFTStoredTwiddleFactors.coe" "$RUNDIR/fft_all_twiddle_rom.mem"
 
 MK="$CALIPTRA_ROOT/tools/scripts/Makefile"
 COMMON=(CALIPTRA_ROOT="$CALIPTRA_ROOT" TESTNAME=smoke_test_kv_fhe

@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 // Shared-SRAM boundary. SRAM_REUSE=1 uses packed 64-bit message banks,
-// two 64-bit FFT bank pairs, banked 54-bit resident keys and the two tables.
+// two 64-bit FFT bank pairs, banked 54-bit resident keys and the CROM.
 // The ntt_v request names now address resident K with a limb offset. Retired
 // ntt_key/e0/vt/sk-copy ports remain for the standalone reference mode only;
 // the integrated Chisel implementation does not instantiate their storage.
@@ -54,7 +54,10 @@
 
 `define ALOHA_MEM_ROM_SIG(_W, _AW, _sig)                                        \
   logic [_AW-1:0]     ``_sig``_addra;                                          \
-  logic [_W-1:0]      ``_sig``_douta;
+  logic [_W-1:0]      ``_sig``_douta;                                          \
+  logic               ``_sig``_wea;                                            \
+  logic [_AW-1:0]     ``_sig``_wa;                                             \
+  logic [_W-1:0]      ``_sig``_wd;
 
 // ---- modport direction groups (req = ComputeCore, resp = storage) ----------
 `define ALOHA_MEM_SDP_REQ(_sig)                                                 \
@@ -71,13 +74,15 @@
   input  ``_sig``_wea, ``_sig``_addra, ``_sig``_dina,                           \
   output ``_sig``_douta
 
-`define ALOHA_MEM_ROM_REQ(_sig)   output ``_sig``_addra, input  ``_sig``_douta
-`define ALOHA_MEM_ROM_RESP(_sig)  input  ``_sig``_addra, output ``_sig``_douta
+`define ALOHA_MEM_ROM_REQ(_sig)                                                 \
+  output ``_sig``_addra, ``_sig``_wea, ``_sig``_wa, ``_sig``_wd, input ``_sig``_douta
+`define ALOHA_MEM_ROM_RESP(_sig)                                                \
+  input  ``_sig``_addra, ``_sig``_wea, ``_sig``_wa, ``_sig``_wd, output ``_sig``_douta
 
 interface fhe_aloha_mem_if;
   // Three physical clock edges per logical ComputeCore edge. Requests are
   // sampled in READ, the core advances in EXECUTE, saved writes retire in WRITE.
-  logic phase_read, phase_execute, phase_write, table_load_ready;
+  logic phase_read, phase_execute, phase_write;
 
   logic [7:0] ntt_msg0_mask, ntt_msg1_mask;
   logic sk_en, sk_we;
@@ -104,13 +109,13 @@ interface fhe_aloha_mem_if;
   `ALOHA_MEM_SDP_SIG(64, `ALOHA_SDP_AW, fft_lower1)
   `ALOHA_MEM_SDP_SIG(64, `ALOHA_SDP_AW, fft_higher0)
   `ALOHA_MEM_SDP_SIG(64, `ALOHA_SDP_AW, fft_higher1)
-  // CROM depth is nextPow2(128 + FHE_L*(LOGN+26)).
+  // CROM depth is nextPow2(128 + FHE_L*(LOGN+26)). The core reads addra; VeeR
+  // firmware writes wea/wa/wd through fhe_top's CROM window while the engine is
+  // idle. FFT twiddles are always generated, so there is no stored twiddle table.
   `ALOHA_MEM_ROM_SIG(128, `FHE_CROM_AW, crom)
-  // 1x FFTAllTwiddleROM : 128b x N/2 (LOGN-1 addr), stored FFT twiddles.
-  `ALOHA_MEM_ROM_SIG(128, `ALOHA_SDP_AW, ftwrom)
 
   modport req (
-    output phase_read, phase_execute, phase_write, table_load_ready,
+    output phase_read, phase_execute, phase_write,
     output ntt_msg0_mask, ntt_msg1_mask,
     output sk_en, sk_we, sk_addr, sk_wdata, input sk_rdata,
     `ALOHA_MEM_SDP_REQ(ntt_msg0),
@@ -128,12 +133,11 @@ interface fhe_aloha_mem_if;
     `ALOHA_MEM_SDP_REQ(fft_lower1),
     `ALOHA_MEM_SDP_REQ(fft_higher0),
     `ALOHA_MEM_SDP_REQ(fft_higher1),
-    `ALOHA_MEM_ROM_REQ(crom),
-    `ALOHA_MEM_ROM_REQ(ftwrom)
+    `ALOHA_MEM_ROM_REQ(crom)
   );
 
   modport resp (
-    input phase_read, phase_execute, phase_write, table_load_ready,
+    input phase_read, phase_execute, phase_write,
     input ntt_msg0_mask, ntt_msg1_mask,
     input sk_en, sk_we, sk_addr, sk_wdata, output sk_rdata,
     `ALOHA_MEM_SDP_RESP(ntt_msg0),
@@ -151,8 +155,7 @@ interface fhe_aloha_mem_if;
     `ALOHA_MEM_SDP_RESP(fft_lower1),
     `ALOHA_MEM_SDP_RESP(fft_higher0),
     `ALOHA_MEM_SDP_RESP(fft_higher1),
-    `ALOHA_MEM_ROM_RESP(crom),
-    `ALOHA_MEM_ROM_RESP(ftwrom)
+    `ALOHA_MEM_ROM_RESP(crom)
   );
 
 endinterface

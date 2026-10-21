@@ -303,6 +303,7 @@ module fhe_microseq
       DEC_ENTRY+12: prog_rom = mk(OP_EXE,    pl_exe(PS_ZERO));
       DEC_ENTRY+13: prog_rom = mk(OP_DMA_OUT,pl_dma(B_FFT, 3'd2, 1'b0, 2'd0, 1'b1));    // out<-upper N of 2N
       DEC_ENTRY+14: prog_rom = mk(OP_DONE,   pl_done(1'b0));
+`ifdef FHE_RECOVER_CMD  // FHE_RECOVER_EN; the dispatch below refuses RECOVER otherwise
       // Coefficient recovery: each limb stays in the modular datapath.
       // PTR0/PTR1 input and PTR2 output are limb-major, N u64 words per limb.
       REC_ENTRY+0: prog_rom = mk(OP_LIMB, pl_limb(8'd8));
@@ -315,6 +316,7 @@ module fhe_microseq
       REC_ENTRY+7: prog_rom = mk(OP_EXE, pl_exe(PS_ZERO));
       REC_ENTRY+8: prog_rom = mk(OP_DMA_OUT, pl_dma(B_NTTMSG, 3'd2, 1'b1, 2'd0, 1'b0));
       REC_ENTRY+9: prog_rom = mk(OP_DONE, pl_done(1'b0));
+`endif
 
       // Single q0 input -> raw snapshot R -> fresh e0 -> centre/lift into each target limb.
       REF_ENTRY+0: prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTMSG, 3'd0, 1'b0, 2'd0, 1'b0));
@@ -364,6 +366,7 @@ module fhe_microseq
   logic [3:0]  limb_cnt;         // = num_limbs for this cmd (1 if decrypt)
   logic [7:0]  limb_base;        // pc of first body word
   logic [7:0]  limb_len;
+  wire         recover = FHE_RECOVER_EN && (cmd == FHE_RECOVER);  // constant 0 without RECOVER
 
   // word loop (send64 / receive64)
   logic [LOGN:0] widx;
@@ -521,15 +524,17 @@ module fhe_microseq
             limb_idx    <= 4'd0;
             // KEYGEN always fills every installed key limb.
             limb_cnt    <= (cmd == FHE_KEYGEN) ? 4'(FHE_L) :
-                           (cmd == FHE_ENCRYPT || cmd == FHE_RECOVER || cmd == FHE_REFRESH)
+                           (cmd == FHE_ENCRYPT || recover || cmd == FHE_REFRESH)
                              ? ((num_limbs==4'd0)?4'd1:num_limbs) : 4'd1;
             pc <= (cmd == FHE_KEYGEN)  ? KG_ENTRY[7:0] :
                   (cmd == FHE_ENCRYPT) ? ENC_ENTRY[7:0] :
                   (cmd == FHE_REFRESH) ? REF_ENTRY[7:0] :
-                  (cmd == FHE_RECOVER) ? REC_ENTRY[7:0] : DEC_ENTRY[7:0];
-            // Recovery must never address a key/table limb outside this build.
-            if (((cmd == FHE_RECOVER || cmd == FHE_REFRESH) &&
+                  recover              ? REC_ENTRY[7:0] : DEC_ENTRY[7:0];
+            // Recovery must never address a key/table limb outside this build,
+            // and a build without RECOVER has no program for it.
+            if (((recover || cmd == FHE_REFRESH) &&
                  (num_limbs == 0 || num_limbs > FHE_L)) ||
+                (cmd == FHE_RECOVER && !FHE_RECOVER_EN) ||
                 (cmd == FHE_REFRESH && !SRAM_REUSE)) begin
               error <= 1'b1;
               st <= S_DONE;

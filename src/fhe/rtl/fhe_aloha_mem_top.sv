@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// Behavioral model of the ten-array shared SRAM implementation. Keep masks,
-// forwarding and logical read latency identical to Caliptra.scala.
-module fhe_aloha_mem_top #(parameter bit PHASED = 0, SRAM_REUSE = 0) (
+// Behavioral model of the nine-array shared SRAM implementation. Keep masks,
+// forwarding and logical read latency identical to Caliptra.scala. CROM_INIT
+// preloads the CROM for standalone core sims; integrated benches leave it empty
+// and write the table through the CROM write port, as firmware does.
+module fhe_aloha_mem_top #(parameter bit PHASED = 0, SRAM_REUSE = 0, parameter CROM_INIT = "") (
   input logic clk_i, fhe_aloha_mem_if.resp m
 );
   // Retired logical ports have no backing storage.
@@ -91,16 +93,36 @@ module fhe_aloha_mem_top #(parameter bit PHASED = 0, SRAM_REUSE = 0) (
     .clk(clk_i), .rd(m.phase_read), .exec(m.phase_execute), .wr(m.phase_write),
     .we(m.fft_higher1_wea), .wa(m.fft_higher1_addra), .wd(m.fft_higher1_dina), .mask(1'b1),
     .ra(m.fft_higher1_addrb), .q(m.fft_higher1_doutb));
-  fhe_shared_bank #(.W(128), .DEPTH(1 << `FHE_CROM_AW), .PHASED(PHASED), .INIT_FILE("fft_rns_rom.mem")) crom (
-    .clk(clk_i), .rd(m.phase_read), .exec(m.phase_execute), .wr(m.phase_write),
-    .we(1'b0), .wa('0), .wd('0), .mask(1'b1), .ra(m.crom_addra), .q(m.crom_douta));
-`ifdef FHE_FFT_ON_THE_FLY
-  assign m.ftwrom_douta = '0; // no stored FFT table in generated-twiddle mode
-`else
-  fhe_shared_bank #(.W(128), .DEPTH(`FHE_N/2), .PHASED(PHASED), .INIT_FILE("fft_all_twiddle_rom.mem")) ftwrom (
-    .clk(clk_i), .rd(m.phase_read), .exec(m.phase_execute), .wr(m.phase_write),
-    .we(1'b0), .wa('0), .wd('0), .mask(1'b1), .ra(m.ftwrom_addra), .q(m.ftwrom_douta));
-`endif
+  fhe_table_bank #(.DEPTH(1 << `FHE_CROM_AW), .PHASED(PHASED), .INIT_FILE(CROM_INIT)) crom (
+    .clk(clk_i), .rd(m.phase_read), .exec(m.phase_execute),
+    .we(m.crom_wea), .wa(m.crom_wa), .wd(m.crom_wd), .ra(m.crom_addra), .q(m.crom_douta));
+endmodule
+
+// CROM: one 1RW array. A table write (engine idle) takes the port on any edge;
+// otherwise the array reads on READ and the data passes two EXECUTE stages.
+module fhe_table_bank #(
+  parameter int DEPTH = 256, AW = $clog2(DEPTH),
+  parameter bit PHASED = 1,
+  parameter INIT_FILE = ""
+)(
+  input logic clk, rd, exec, we,
+  input logic [AW-1:0] wa, ra,
+  input logic [127:0] wd,
+  output logic [127:0] q
+);
+  logic [127:0] mem [0:DEPTH-1];
+  logic [127:0] raw, stage0;
+  initial if (INIT_FILE != "") $readmemh(INIT_FILE, mem);
+  always_ff @(posedge clk) begin
+    if (we) mem[wa] <= wd;
+    if (PHASED) begin
+      if (rd && !we) raw <= mem[ra];
+      if (exec) begin stage0 <= raw; q <= stage0; end
+    end else begin
+      stage0 <= mem[ra];
+      q <= stage0;
+    end
+  end
 endmodule
 
 module fhe_shared_bank #(

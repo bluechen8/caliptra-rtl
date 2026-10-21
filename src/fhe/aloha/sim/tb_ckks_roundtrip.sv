@@ -75,10 +75,15 @@ module tb_ckks_roundtrip;
   // via the behavioral fhe_aloha_mem_top so this composed-core sim keeps the
   // exact 2-cycle-latency / collision behavior of aloha_bram_behav.sv.
   fhe_aloha_mem_if aloha_mem();
-  fhe_aloha_mem_top u_aloha_mem (.clk_i(clk), .m(aloha_mem.resp));
+  // The integration has no stored FFT-twiddle table, so the core generates FFT
+  // twiddles; the CROM is preloaded here instead of copied in by firmware.
+  fhe_aloha_mem_top #(.CROM_INIT("fft_rns_rom.mem")) u_aloha_mem (.clk_i(clk), .m(aloha_mem.resp));
+  assign aloha_mem.crom_wea = 1'b0;
+  assign aloha_mem.crom_wa  = '0;
+  assign aloha_mem.crom_wd  = '0;
 
   ComputeCoreWrapper #(
-      .FFT_ON_THE_FLY_GENERATION(0),
+      .FFT_ON_THE_FLY_GENERATION(1),
       .PROVIDE_DEBUG_IO(1),
       .LOGN(LOGN),
       .N(N),

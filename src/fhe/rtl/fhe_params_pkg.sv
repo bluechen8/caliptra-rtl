@@ -51,6 +51,18 @@ package fhe_params_pkg;
   parameter FHE_LOGN       = $clog2(FHE_N);      // 13 for N=8192
   parameter FHE_L          = `FHE_L;             // RNS chain length
   parameter FHE_LEVEL_W    = $clog2(FHE_L) + 1;  // bits to encode a target level (1..L)
+  // CROM: a 128-word FFT/RNS prefix, then one (log N + 26)-word NTT seed profile
+  // per installed prime (fhe_profiles.geometry); fhe_aloha_mem_if's FHE_CROM_AW
+  // is the same width.
+  parameter FHE_CROM_WORDS = 128 + FHE_L * (FHE_LOGN + 26);
+  parameter FHE_CROM_AW    = $clog2(FHE_CROM_WORDS);
+  // RECOVER returns decrypted coefficients (plaintext-equivalent, no AES), so it
+  // exists only in verification builds that define FHE_RECOVER_CMD.
+`ifdef FHE_RECOVER_CMD
+  parameter bit FHE_RECOVER_EN = 1'b1;
+`else
+  parameter bit FHE_RECOVER_EN = 1'b0;
+`endif
   parameter FHE_BATCH      = `FHE_BATCH;         // concurrent ciphertexts
   parameter FHE_BATCH_W    = (FHE_BATCH == 1) ? 1 : $clog2(FHE_BATCH);
 

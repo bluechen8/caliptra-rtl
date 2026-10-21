@@ -107,9 +107,7 @@ if [[ "$IS_FHE" == 1 ]]; then
   LOGN=$(python3 -c "import math;print(int(math.log2($FHE_N)))")
   python3 "$ALOHA_PORT/tvgen/gen_roundtrip.py" "$LOGN" "$FHE_TV" >/dev/null 2>&1
   python3 "$ALOHA_PORT/vendor/Scripts/GenerateConstantsROM.py"        "$LOGN" "$FHE_TV/mif/rns.coe" >/dev/null 2>&1
-  python3 "$ALOHA_PORT/vendor/Scripts/GenerateStoredFFTTwiddleFct.py" "$LOGN" "$FHE_TV/mif/tw.coe"  >/dev/null 2>&1
   coe2mem "$FHE_TV/mif/rns.coe" "$FHE_TV/fft_rns_rom.mem"
-  coe2mem "$FHE_TV/mif/tw.coe"  "$FHE_TV/fft_all_twiddle_rom.mem"
 fi
 
 # --- one test: build firmware, stage aux files, run the shared simv from its rundir ---

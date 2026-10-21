@@ -73,18 +73,18 @@ module fhe_top
 
   localparam logic [3:0] MAP_VERSION = 4'd2;
   localparam logic [63:0] VERSION_V2 = 64'h00000000_3030322e; // "2.00"
-`ifdef FHE_FFT_ON_THE_FLY
-  localparam bit FFT_GEN = 1'b1;
-`else
-  localparam bit FFT_GEN = 1'b0;
-`endif
+  // CROM window (docs/fhe/19): word w, lane k at CROM_BASE + 16*w + 4*k.
+  localparam int CROM_BASE = 'h4000;
 
   //----------------------------------------------------------------
   // AHB-Lite slave -> generated register block
   //----------------------------------------------------------------
   logic                      dv, cif_write;
-  logic [31:0]               cif_wdata, cif_rdata;
+  logic [31:0]               cif_wdata, cif_rdata, reg_rdata;
   logic [AHB_ADDR_WIDTH-1:0] cif_addr;
+  // The CROM window takes 0x4000-0x5FFF; the register block never sees it.
+  wire crom_window = cif_addr[AHB_ADDR_WIDTH-1:13] == (CROM_BASE >> 13);
+  assign cif_rdata = crom_window ? 32'd0 : reg_rdata;  // the window is write-only
 
   fhe_ahb_slv_sif #(
     .AHB_DATA_WIDTH    (AHB_DATA_WIDTH),
@@ -119,7 +119,7 @@ module fhe_top
   fhe_reg i_fhe_reg (
     .clk                 (clk),
     .rst                 (1'b0),
-    .s_cpuif_req         (dv),
+    .s_cpuif_req         (dv & ~crom_window),
     .s_cpuif_req_is_wr   (cif_write),
     .s_cpuif_addr        (cif_addr[FHE_REG_ADDR_WIDTH-1:0]),
     .s_cpuif_wr_data     (cif_wdata),
@@ -128,7 +128,7 @@ module fhe_top
     .s_cpuif_req_stall_rd(),
     .s_cpuif_rd_ack      (),
     .s_cpuif_rd_err      (),
-    .s_cpuif_rd_data     (cif_rdata),
+    .s_cpuif_rd_data     (reg_rdata),
     .s_cpuif_wr_ack      (),
     .s_cpuif_wr_err      (),
     .hwif_in             (hwif_in),
@@ -190,7 +190,30 @@ module fhe_top
   assign fhe_aloha_mem.phase_read    = mem_read;
   assign fhe_aloha_mem.phase_execute = core_step;
   assign fhe_aloha_mem.phase_write   = mem_write;
-  assign fhe_aloha_mem.table_load_ready = rst_b && !zeroize && ready && !cmd_write;
+
+  // VeeR firmware copies its table into the CROM (docs/fhe/19). Lanes 0-2 of a
+  // word are staged; the lane-3 store writes the whole word. Stores are taken
+  // only while the engine is idle, so a running command never sees CROM change,
+  // and stores past the CROM depth are dropped.
+  // The write uses the staged lanes in the cycle after the lane-3 store; the
+  // next store's data phase cannot change them before that edge.
+  logic [95:0] crom_stage;
+  logic [31:0] crom_lane3;
+  wire [8:0] crom_word = cif_addr[12:4];
+  wire crom_store = dv && cif_write && crom_window && ready && (10'(crom_word) < 10'(1 << FHE_CROM_AW));
+  wire crom_last  = cif_addr[3:2] == 2'd3;
+  always_ff @(posedge clk or negedge rst_b)
+    if (!rst_b) fhe_aloha_mem.crom_wea <= 1'b0;
+    else        fhe_aloha_mem.crom_wea <= crom_store && crom_last;
+  always_ff @(posedge clk)
+    if (crom_store) begin
+      if (!crom_last) crom_stage[32*cif_addr[3:2] +: 32] <= cif_wdata;
+      else begin
+        crom_lane3 <= cif_wdata;
+        fhe_aloha_mem.crom_wa <= FHE_CROM_AW'(crom_word);
+      end
+    end
+  assign fhe_aloha_mem.crom_wd = {crom_lane3, crom_stage};
 
   // READY rises only after a completion has latched VALID/ERROR, so firmware
   // sees READY and the completion status together.
@@ -276,8 +299,9 @@ module fhe_top
   logic [3:0] precheck;
   always_comb begin
     precheck = FHE_EC_NONE;
-    if (!(cmd_in inside {FHE_ENCRYPT, FHE_KEYGEN, FHE_DECRYPT, FHE_RECOVER, FHE_REFRESH}))
-      precheck = FHE_EC_BAD_OPCODE;
+    if (!(cmd_in inside {FHE_ENCRYPT, FHE_KEYGEN, FHE_DECRYPT, FHE_REFRESH} ||
+          (FHE_RECOVER_EN && cmd_in == FHE_RECOVER)))
+      precheck = FHE_EC_BAD_OPCODE;  // RECOVER only in verification builds
     else if (cfg_logn != 4'(FHE_LOGN))
       precheck = FHE_EC_BAD_LOGN;
     else if (cmd_in == FHE_KEYGEN) begin
@@ -401,7 +425,7 @@ module fhe_top
 
     hwif_in.FHE_CAP.N.next             = 16'(FHE_N);
     hwif_in.FHE_CAP.L.next             = 4'(FHE_L);
-    hwif_in.FHE_CAP.FFT_GENERATED.next = FFT_GEN;
+    hwif_in.FHE_CAP.FFT_GENERATED.next = 1'b1;  // twiddles are always generated
     hwif_in.FHE_CAP.RSVD0.next         = '0;
     hwif_in.FHE_CAP.DMA_STREAM.next    = 1'b1;
     hwif_in.FHE_CAP.RSVD1.next         = '0;
@@ -494,7 +518,7 @@ module fhe_top
 
   ComputeCoreWrapper #(
     .SRAM_REUSE                (1),
-    .FFT_ON_THE_FLY_GENERATION (FFT_GEN),
+    .FFT_ON_THE_FLY_GENERATION (1),
     .PROVIDE_DEBUG_IO          (1),
     .LOGN                      (FHE_LOGN),
     .N                         (FHE_N),

@@ -134,7 +134,7 @@ SKSCHEME_HW=1 ./sim/run_roundtrip.sh build/rt8192 8192
 ```
 
 Validated at **N = 128 / 256 / 8192**. Small-`N` inputs/ROMs are produced like §A.2:
-`GenerateConstantsROM.py <LOGN>` + `GenerateStoredFFTTwiddleFct.py <LOGN>` into `build/N<N>/mif`,
+`GenerateConstantsROM.py <LOGN>` into `build/N<N>/mif` (FFT twiddles are generated, so no stored table),
 and `tvgen/gen_roundtrip.py <LOGN> build/rt<N>` for the plaintext + seeds. The **`SCHEME`**
 generator flag selects the encryption datapath: `0` = vendor public-key PWM (the SEAL-golden
 reference, default), `1` = secret-key `PWMSk` (`rtl/PWMSk.sv`, selected by `+define+FHE_SK_HW`).
@@ -262,7 +262,7 @@ tests.
 ```bash
 # from src/fhe/ — default LOGN=8 (N=256). CLEAN=1 forces a rebuild.
 LIMBS2=1 ./tb/run_fhe_top_dma_tb.sh 8          # two limbs + the N=256 key golden
-FFT_ON_THE_FLY=1 STREAM_STALLS=1 LIMBS2=1 ./tb/run_fhe_top_dma_tb.sh 8
+STREAM_STALLS=1 LIMBS2=1 ./tb/run_fhe_top_dma_tb.sh 8
 ./tb/run_fhe_top_dma_tb.sh 8                   # one limb
 # -> "fhe_top_dma_tb RESULT: PASS"
 ```

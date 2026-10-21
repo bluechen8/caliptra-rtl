@@ -69,14 +69,12 @@ module fhe_top_dma_tb
   // STATUS fields.
   localparam int ST_READY = 0, ST_VALID = 1, ST_ERROR = 2, ST_KEY_VALID = 3;
   localparam int ST_COMMIT_WAIT = 8, ST_DMA_LEASED = 9;
-`ifdef FHE_FFT_ON_THE_FLY
-  localparam logic [31:0] CAP_FFT = 32'd1 << 20;
-`else
-  localparam logic [31:0] CAP_FFT = 32'd0;
-`endif
+  // CROM window (docs/fhe/19): word w, lane k at A_CROM + 16*w + 4*k.
+  localparam logic [AHW-1:0] A_CROM = 'h4000;
+  localparam int CROM_DEPTH = 1 << FHE_CROM_AW;
   localparam logic [31:0] CAP_DMA = 32'd1 << 24;   // DMA_STREAM
   localparam int DMA_AW = 48;   // axi_dma address width (slot range checks)
-  localparam logic [31:0] CAP_EXPECTED = 32'(N) | (32'(FHE_L) << 16) | CAP_FFT | CAP_DMA | (32'd2 << 28);
+  localparam logic [31:0] CAP_EXPECTED = 32'(N) | (32'(FHE_L) << 16) | (32'd1 << 20) | CAP_DMA | (32'd2 << 28);  // [20] generated twiddles
 
   localparam int     RT_SCALE    = 17 + LOGN;
   // The pre-reuse golden key was sampled from this 64-bit seed with IV 0, which
@@ -828,6 +826,7 @@ module fhe_top_dma_tb
   // RECOVER the ciphertext in slots 0/1 at level l; every limb must give the
   // same centred coefficient as limb 0.
   task automatic check_limbs_agree(input int l, input string nm);
+    if (!FHE_RECOVER_EN) return;  // production build: no RECOVER
     cfg(l, 12'(rns_scale));
     dec_slots();
     run_cmd(FHE_RECOVER, {nm, ": RECOVER"});
@@ -858,6 +857,7 @@ module fhe_top_dma_tb
     // Key: c0 = 0 and c1 = 1 (a constant NTT) recover s in every limb, so a
     // wrong per-limb prime, R^2 or table entry shows as a non-ternary or
     // disagreeing limb, independent of how encryption uses the key.
+    if (FHE_RECOVER_EN) begin
     for (int i = 0; i < FHE_L*N; i++) begin
       dram[ADDR_C0/8 + i] = 0;
       dram[ADDR_C1/8 + i] = 1;
@@ -872,6 +872,7 @@ module fhe_top_dma_tb
     end
     assert (nonzero > 0 && nonzero < N) else $fatal(1, "degenerate key: %0d nonzero coefficients", nonzero);
     $display("PASS key: all %0d limbs recover the same ternary secret (%0d nonzero)", FHE_L, nonzero);
+    end
 
     for (int l = 1; l <= FHE_L; l++) begin
       cfg(l, 12'(rns_scale));
@@ -903,6 +904,66 @@ module fhe_top_dma_tb
     if (!dma_resp.idle || dut.br_lease) begin
       $display("FAIL: %s left the DMA busy or leased", nm); errors++;
     end
+  endtask
+
+  // The table firmware embeds (fft_rns_rom.mem in the run directory), copied
+  // through the CROM window as firmware does: ascending 32-bit stores.
+  logic [127:0] crom_image [0:FHE_CROM_WORDS-1];
+  task automatic crom_store(input int w, input logic [127:0] v);
+    for (int k = 0; k < 4; k++) ahb_write(A_CROM + AHW'(16*w + 4*k), v[32*k +: 32]);
+  endtask
+  // A word reaches the array the cycle after its lane-3 store; settle before
+  // reading the array by backdoor.
+  task automatic crom_settle();
+    repeat (2) @(posedge clk);
+  endtask
+  task automatic load_crom();
+    $readmemh("fft_rns_rom.mem", crom_image);
+    for (int w = 0; w < FHE_CROM_WORDS; w++) crom_store(w, crom_image[w]);
+    crom_settle();
+  endtask
+  // Checks the copy, and the window rules: write-only, idle-only, bounded, and
+  // invisible to the register block.
+  task automatic check_crom_window();
+    logic [31:0] d, cfg_before;
+    bit err;
+    int bad = 0;
+    for (int w = 0; w < FHE_CROM_WORDS; w++)
+      if (u_aloha_mem.crom.mem[w] !== crom_image[w]) begin
+        if (bad < 4) $display("  CROM word %0d: 0x%032h, expected 0x%032h", w, u_aloha_mem.crom.mem[w], crom_image[w]);
+        bad++;
+      end
+    if (bad) begin $display("FAIL: %0d CROM words differ after the copy", bad); errors++; end
+    ahb_access(1'b0, A_CROM + 'h10, '0, d, err);
+    if (err || d != 0) begin $display("FAIL: CROM window read err %0d data 0x%08h", err, d); errors++; end
+    // Word 1, lane 0 and lane 2 alias CTRL (0x10) and CONFIG (0x18) in the low
+    // address bits; neither register may change.
+    ahb_read(A_CONFIG, cfg_before);
+    ahb_write(A_CROM + 'h18, 32'hffff_ffff);
+    ahb_write(A_CROM + 'h10, 32'h2);
+    ahb_read(A_CONFIG, d);
+    if (d != cfg_before) begin $display("FAIL: CROM store reached CONFIG"); errors++; end
+    ahb_read(A_STATUS, d);
+    if (!d[ST_READY] || d[ST_VALID]) begin $display("FAIL: CROM store started a command"); errors++; end
+    crom_store(1, crom_image[1]);
+    // A store past the CROM depth must not wrap onto word 0.
+    if (CROM_DEPTH < 512) crom_store(CROM_DEPTH, ~crom_image[0]);
+    crom_settle();
+    if (u_aloha_mem.crom.mem[0] !== crom_image[0] || u_aloha_mem.crom.mem[1] !== crom_image[1]) begin
+      $display("FAIL: CROM word 0/1 changed by an aliased or out-of-range store"); errors++;
+    end
+    if (!errors) $display("PASS CROM copy (%0d words), write-only, bounded, separate from registers", FHE_CROM_WORDS);
+  endtask
+  // A store while a command runs is dropped (called with a command in flight).
+  task automatic crom_store_while_busy();
+    logic [31:0] d;
+    ahb_read(A_STATUS, d);
+    if (d[ST_READY]) $fatal(1, "crom_store_while_busy needs a running command");
+    crom_store(2, ~crom_image[2]);
+    crom_settle();
+    if (u_aloha_mem.crom.mem[2] !== crom_image[2]) begin
+      $display("FAIL: CROM store accepted while busy"); errors++;
+    end else $display("PASS CROM store dropped while a command runs");
   endtask
 
   // CAP reports the DMA stream; the former XFER_DATA offset is unmapped
@@ -1229,6 +1290,8 @@ module fhe_top_dma_tb
       end
     end
 
+    load_crom();
+    check_crom_window();
     check_cap();
 
     // Pause the parent clock in each idle phase while lifted SRAMs continue
@@ -1299,9 +1362,6 @@ module fhe_top_dma_tb
         run_cmd(FHE_ENCRYPT, "ENCRYPT (testbench v1 seed replay)");
         replay_v1_seeds(0);
         dump_state(0);
-`ifndef FHE_FFT_ON_THE_FLY
-        check_baseline(0); // floating recurrence can change rounded ciphertext values
-`endif
         rekey("KEYGEN (restart stream after replay)");
         cfg(tb_limbs(), 12'(rns_scale));
       end
@@ -1316,7 +1376,12 @@ module fhe_top_dma_tb
     // ---- DECRYPT: c0 <- slot 0, c1 <- slot 1, slots -> slot 2 ----
     cfg(tb_limbs(), 12'(i2f_val));
     dec_slots();
-    run_cmd(FHE_DECRYPT, "DECRYPT");
+    begin
+      int base;
+      issue_cmd(FHE_DECRYPT, base);
+      crom_store_while_busy();
+      finish_cmd(FHE_DECRYPT, base, "DECRYPT");
+    end
 
     // recovered slots read back from DRAM @ OUT
     begin
@@ -1326,8 +1391,16 @@ module fhe_top_dma_tb
       check_fft(reco, g_input, N, "fhe_top round-trip (recovered vs input)", 1.0e-3);
     end
 
-`ifdef FHE_FFT_ON_THE_FLY
+    // Production build (no RECOVER): RECOVER is illegal; the level sweep checks
+    // ENCRYPT and REFRESH by round trip only. The rest of this bench uses RECOVER.
+    if (!FHE_RECOVER_EN) begin
+      expect_reject(FHE_RECOVER, FHE_EC_BAD_OPCODE, "RECOVER in a production build");
+      finish_run();
+    end
+
     // Interoperate with the stored-FFT reference, not just an OTF round trip.
+    // (Generated twiddles round differently, so the ciphertext itself is not
+    // bit-exact against that reference.)
     begin
       string dir;
       logic [63:0] reference [0:4*N-1], saved0 [0:2*N-1], saved1 [0:2*N-1];
@@ -1346,7 +1419,6 @@ module fhe_top_dma_tb
         end
       end
     end
-`endif
 
     // +QUICK (large N): skip from here to the level sweep. An early exit, not
     // an enclosing if: Verilator emits one block as one C++ function, too large
