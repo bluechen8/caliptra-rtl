@@ -137,7 +137,7 @@ module fhe_microseq
   // INS-template indices
   localparam int unsigned T_FFTDIF=0, T_FFTDIT=1, T_RNS=2, T_NTTFWD=3,
                           T_NTTINV=4, T_PWMENC=5, T_PWMDEC=6, T_I2F=7, T_PROJ=8,
-                          T_SAMPLE=9, T_SNAPSHOT=10, T_LIFT=11;
+                          T_SAMPLE=9, T_SNAPSHOT=10, T_LIFT=11, T_PWMKG=12;
 
   // =====================================================================
   // INS-template ROM (raw 64-bit inner words, pre-patch). doc section 5.2.
@@ -161,12 +161,14 @@ module fhe_microseq
       T_SAMPLE: tmpl_base = W40 | 64'd6;
       T_SNAPSHOT: tmpl_base = W40 | (64'd1<<3) | 64'd7;
       T_LIFT: tmpl_base = W40 | 64'd7;
+      // PWM enc=0,neg=0 with OP1[6] (keygen convert): b = dina (R^2 mod q), c0 = 0
+      T_PWMKG : tmpl_base = W40 | (64'd1<<9) | 64'd4;
       default : tmpl_base = W40;
     endcase
   endfunction
   // which fields the template needs patched
   function automatic logic tmpl_use_q  (input int unsigned t);
-    tmpl_use_q  = (t==T_RNS)||(t==T_NTTFWD)||(t==T_NTTINV)||(t==T_PWMENC)||(t==T_PWMDEC)||(t==T_I2F)||(t==T_LIFT);
+    tmpl_use_q  = (t==T_RNS)||(t==T_NTTFWD)||(t==T_NTTINV)||(t==T_PWMENC)||(t==T_PWMDEC)||(t==T_I2F)||(t==T_LIFT)||(t==T_PWMKG);
   endfunction
   function automatic logic tmpl_use_rom(input int unsigned t);
     tmpl_use_rom = (t==T_RNS)||(t==T_NTTFWD)||(t==T_NTTINV);
@@ -199,8 +201,8 @@ module fhe_microseq
   function automatic logic [27:0] pl_ldins(input logic [7:0] addr, input logic [3:0] len, input logic patch, input logic [1:0] sc);
     pl_ldins = {addr, len, patch, sc, 13'd0};
   endfunction
-  // EXE : paramsel[27:26]
-  function automatic logic [27:0] pl_exe(input logic [1:0] ps); pl_exe = {ps, 26'd0}; endfunction
+  // EXE : paramsel[27:26] r2[25] (dina = R^2 mod q of the active limb during the pass)
+  function automatic logic [27:0] pl_exe(input logic [1:0] ps, input logic r2 = 1'b0); pl_exe = {ps, r2, 25'd0}; endfunction
   // MOVE : srcbank[27:24] dstbank[23:20] srcstr[19] dststr[18]
   function automatic logic [27:0] pl_move(input logic [3:0] sb, input logic [3:0] db, input logic ss, input logic ds);
     pl_move = {sb, db, ss, ds, 18'd0};
@@ -222,6 +224,7 @@ module fhe_microseq
   function automatic logic        f_pat (input logic [31:0] w); f_pat  = w[15];    endfunction
   function automatic logic [1:0]  f_sc  (input logic [31:0] w); f_sc   = w[14:13]; endfunction
   function automatic logic [1:0]  f_ps  (input logic [31:0] w); f_ps   = w[27:26]; endfunction
+  function automatic logic        f_r2  (input logic [31:0] w); f_r2   = w[25];    endfunction
   function automatic logic [3:0]  f_sb  (input logic [31:0] w); f_sb   = w[27:24]; endfunction
   function automatic logic [3:0]  f_db  (input logic [31:0] w); f_db   = w[23:20]; endfunction
   function automatic logic        f_ss  (input logic [31:0] w); f_ss   = w[19];    endfunction
@@ -239,23 +242,41 @@ module fhe_microseq
   localparam int REC_ENTRY = 48;
   localparam int REF_ENTRY = 64;
 
+  // KEYGEN with shared storage (entry 0). The secret is integer end to end: the
+  // sample-only pass draws e0/e1/v from the KeyVault seed (the same words, in
+  // the same order, as the FFT-coupled pass it replaces, so s is unchanged);
+  // per limb, RNS reduces v mod q (ComputeCore feeds its float input zeros
+  // during KEYGEN), NTT transforms it, and the keygen-convert PWM multiplies by
+  // R^2 from dina with a zero addend, writing the resident Montgomery key. No
+  // FFT, no CONST fills. The sampler stops at its done, so the keystream left
+  // for later commands starts at a different word than it did with the FFT pass.
+  function automatic logic [31:0] kg_reuse_rom(input logic [7:0] a);
+    kg_reuse_rom = mk(OP_NOP, 28'd0);
+    case (a)
+      KG_ENTRY+0: kg_reuse_rom = mk(OP_LDINS, pl_ldins(T_SAMPLE[7:0], 4'd1, 1'b0, SC_NONE));
+      KG_ENTRY+1: kg_reuse_rom = mk(OP_EXE,   pl_exe(PS_KG));
+      KG_ENTRY+2: kg_reuse_rom = mk(OP_LIMB,  pl_limb(8'd6));         // body = next 6 words
+      KG_ENTRY+3: kg_reuse_rom = mk(OP_LDINS, pl_ldins(T_RNS[7:0],    4'd1, 1'b1, SC_RNSKG));
+      KG_ENTRY+4: kg_reuse_rom = mk(OP_EXE,   pl_exe(PS_ZERO));
+      KG_ENTRY+5: kg_reuse_rom = mk(OP_LDINS, pl_ldins(T_NTTFWD[7:0], 4'd1, 1'b1, SC_NONE));
+      KG_ENTRY+6: kg_reuse_rom = mk(OP_EXE,   pl_exe(PS_ZERO));
+      KG_ENTRY+7: kg_reuse_rom = mk(OP_LDINS, pl_ldins(T_PWMKG[7:0],  4'd1, 1'b1, SC_NONE));
+      KG_ENTRY+8: kg_reuse_rom = mk(OP_EXE,   pl_exe(PS_ZERO, 1'b1)); // dina = R^2 mod q_limb
+      KG_ENTRY+9: kg_reuse_rom = mk(OP_DONE,  pl_done(1'b0));
+      default: ;
+    endcase
+  endfunction
+
   // Combinational ROM: synthesizes as constant decode logic (an `initial`-filled
   // array would be dropped by synthesis). Unlisted addresses decode to NOP.
   function automatic logic [31:0] prog_rom(input logic [7:0] a);
     prog_rom = mk(OP_NOP, 28'd0);
-    case (a)
-      // ---------- KEYGEN (entry 0) ----------
-      // FIXME(fhe-keygen-fp-split): the secret's VALUE is 100% integer — the ternary
-      // sampler writes vt, and RNSErrorPolys (RNS.sv) sign-magnitude-reduces it to
-      // mod q with NO floating point. But keygen still runs the float FFT+RNS as dead
-      // work: KG+0 zeroes B_FFTEXP, KG+1/+2 run the FFT-DIF butterflies on those zeros
-      // (only because the sampler is welded to a transform pass — ComputeCore.v:177-181,
-      // sample_errors=do_fft), and KG+4's float message path produces just `e0` which
-      // KG+9 (B_NTTMSG=C_ZEROS) then discards. Clean split = sample-only pass +
-      // integer-RNS + NTT, dropping KG+0/the FFT butterflies/the float-RNS message half.
-      // Refresh already provides sample-only control. Reuse it for keygen only
-      // after separating the integer secret conversion from the float RNS path;
-      // retain this established keygen sequence and golden ciphertexts for now.
+    if (SRAM_REUSE && a < 8'(ENC_ENTRY)) prog_rom = kg_reuse_rom(a);
+    else case (a)
+      // ---------- KEYGEN, separate-copy trace builds (entry 0) ----------
+      // The sampler only runs inside a transform pass here (sample-only needs
+      // shared storage), so this sequence keeps the FFT over zeroed FFT_EXP and
+      // the CONST fills; its pin trace is what tb_fhe_microseq checks.
       KG_ENTRY+0:  prog_rom = mk(OP_CONST, pl_const(B_FFTEXP, C_ZEROS));
       KG_ENTRY+1:  prog_rom = mk(OP_LDINS, pl_ldins(T_FFTDIF[7:0], 4'd1, 1'b0, SC_NONE));
       KG_ENTRY+2:  prog_rom = mk(OP_EXE,   pl_exe(PS_KG));
@@ -268,7 +289,7 @@ module fhe_microseq
       KG_ENTRY+9:  prog_rom = mk(OP_CONST, pl_const(B_NTTMSG, C_ZEROS));
       KG_ENTRY+10: prog_rom = mk(OP_LDINS, pl_ldins(T_PWMDEC[7:0], 4'd1, 1'b1, SC_NONE));
       KG_ENTRY+11: prog_rom = mk(OP_EXE,   pl_exe(PS_ZERO));
-      KG_ENTRY+12: prog_rom = SRAM_REUSE ? mk(OP_NOP, 28'd0) : mk(OP_MOVE,  pl_move(B_NTTMSG, B_SK, 1'b0, 1'b1));
+      KG_ENTRY+12: prog_rom = mk(OP_MOVE,  pl_move(B_NTTMSG, B_SK, 1'b0, 1'b1));
       KG_ENTRY+13: prog_rom = mk(OP_DONE,  pl_done(1'b0));
 
       // ---------- ENCRYPT (entry 16) ----------
@@ -576,10 +597,11 @@ module fhe_microseq
             end
             OP_EXE: if (!exe_hold) begin
               // The sampler seed arrives on fhe_top's sideband; only the KEYGEN
-              // key-sampling pass reloads it. dina carries no seed.
+              // key-sampling pass reloads it. dina carries no seed; it holds the
+              // limb's R^2 for the keygen-convert PWM and is zero otherwise.
               reseed_en <= (f_ps(op_w) == PS_KG);
-              dina_low  <= 32'd0;
-              dina_high <= 32'd0;
+              dina_low  <= f_r2(op_w) ? r2modq[limb_idx][31:0]  : 32'd0;
+              dina_high <= f_r2(op_w) ? r2modq[limb_idx][63:32] : 32'd0;
               control_low_word <= 32'd0;
               st <= S_EXE_DINA;
             end
