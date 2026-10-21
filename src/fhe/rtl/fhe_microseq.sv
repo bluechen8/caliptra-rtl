@@ -155,14 +155,13 @@ module fhe_microseq
       T_NTTFWD: tmpl_base = W40 |              64'd1;             // NTT is_dif=0
       T_NTTINV: tmpl_base = W40 | (64'd1<<3) | 64'd1;            // NTT is_dif=1
       T_PWMENC: tmpl_base = W40 | (64'd1<<4) | (64'd1<<3) | 64'd4;// PWM enc=1,neg=1
-      T_PWMDEC: tmpl_base = W40 | 64'd4;                          // PWM enc=0,neg=0
+      // PWM enc=0,neg=0; T_PWMKG adds OP1[6]: b = scalar on dina, zero addend
+      T_PWMDEC, T_PWMKG: tmpl_base = W40 | (t==T_PWMKG ? 64'd1<<9 : 64'd0) | 64'd4;
       T_I2F   : tmpl_base = W40 | 64'd3;                          // I2F
       T_PROJ  : tmpl_base = W40 | 64'd5;                          // PROJECT
       T_SAMPLE: tmpl_base = W40 | 64'd6;
       T_SNAPSHOT: tmpl_base = W40 | (64'd1<<3) | 64'd7;
       T_LIFT: tmpl_base = W40 | 64'd7;
-      // PWM enc=0,neg=0 with OP1[6] (keygen convert): b = dina (R^2 mod q), c0 = 0
-      T_PWMKG : tmpl_base = W40 | (64'd1<<9) | 64'd4;
       default : tmpl_base = W40;
     endcase
   endfunction
@@ -242,14 +241,10 @@ module fhe_microseq
   localparam int REC_ENTRY = 48;
   localparam int REF_ENTRY = 64;
 
-  // KEYGEN with shared storage (entry 0). The secret is integer end to end: the
-  // sample-only pass draws e0/e1/v from the KeyVault seed (the same words, in
-  // the same order, as the FFT-coupled pass it replaces, so s is unchanged);
-  // per limb, RNS reduces v mod q (ComputeCore feeds its float input zeros
-  // during KEYGEN), NTT transforms it, and the keygen-convert PWM multiplies by
-  // R^2 from dina with a zero addend, writing the resident Montgomery key. No
-  // FFT, no CONST fills. The sampler stops at its done, so the keystream left
-  // for later commands starts at a different word than it did with the FFT pass.
+  // KEYGEN with shared storage (entry 0): a sample-only pass draws the secret
+  // from the KeyVault seed; per limb, RNS reduces it mod q (ComputeCore feeds
+  // its float input zeros during KEYGEN), NTT transforms it, and PWM multiplies
+  // by R^2 from dina with a zero addend, writing the resident Montgomery key.
   function automatic logic [31:0] kg_reuse_rom(input logic [7:0] a);
     kg_reuse_rom = mk(OP_NOP, 28'd0);
     case (a)
@@ -384,6 +379,7 @@ module fhe_microseq
   logic        limb_active;
   logic [3:0]  limb_idx;
   assign active_limb = limb_idx;
+  wire [63:0] r2_cur = r2modq[limb_idx];  // R^2 mod q of the active limb
   logic [3:0]  limb_cnt;         // = num_limbs for this cmd (1 if decrypt)
   logic [7:0]  limb_base;        // pc of first body word
   logic [7:0]  limb_len;
@@ -500,7 +496,7 @@ module fhe_microseq
     if (cur_ins)              cur_wr_data = ins_word(widx, ins_patched, ins_len_r);
     else if (cur_sk)          cur_wr_data = {10'd0, sk_rdata}; // SK-load
     else if (cur_cid == C_DIN) cur_wr_data = ext_din;       // DMA_IN
-    else if (cur_cid == C_R2) cur_wr_data = r2modq[limb_idx];
+    else if (cur_cid == C_R2) cur_wr_data = r2_cur;
     else                      cur_wr_data = 64'd0;          // CONST ZEROS
   endfunction
 
@@ -600,8 +596,7 @@ module fhe_microseq
               // key-sampling pass reloads it. dina carries no seed; it holds the
               // limb's R^2 for the keygen-convert PWM and is zero otherwise.
               reseed_en <= (f_ps(op_w) == PS_KG);
-              dina_low  <= f_r2(op_w) ? r2modq[limb_idx][31:0]  : 32'd0;
-              dina_high <= f_r2(op_w) ? r2modq[limb_idx][63:32] : 32'd0;
+              {dina_high, dina_low} <= f_r2(op_w) ? r2_cur : 64'd0;
               control_low_word <= 32'd0;
               st <= S_EXE_DINA;
             end
