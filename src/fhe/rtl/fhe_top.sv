@@ -457,6 +457,7 @@ module fhe_top
 
   logic [31:0] w_cl, w_ch, w_dl, w_dh;
   logic [31:0] core_dout_lo, core_dout_hi, core_status;
+  logic [39:0] core_cmd;     // walker -> ComputeCore command, held per pass
   // The sampler Trivium is reset only at power-on; its state otherwise
   // persists across passes and commands (one continuous stream per key).
   logic        fhe_prng_rst;
@@ -495,6 +496,7 @@ module fhe_top
     .dout_low          (core_dout_lo),
     .dout_high         (core_dout_hi),
     .status            (core_status),
+    .core_cmd          (core_cmd),
     .ext_sel        (w_ext_sel),
     .ext_idx        (w_ext_idx),
     .ext_din        (w_rd_data),
@@ -523,7 +525,8 @@ module fhe_top
     .LOGN                      (FHE_LOGN),
     .N                         (FHE_N),
     .SCHEME                    (1),
-    .SEED_SIDEBAND             (1)
+    .SEED_SIDEBAND             (1),
+    .EXT_COMMAND               (1)    // the walker loads each pass's command
   ) core (
     .reuse_keygen(cmd_q == FHE_KEYGEN),
     .reuse_limb(active_key_limb),
@@ -538,6 +541,7 @@ module fhe_top
     .dout_ext_low_word  (core_dout_lo),
     .dout_ext_high_word (core_dout_hi),
     .status             (core_status),
+    .ext_command        (core_cmd),
     // The core's own DMA-into-BRAM port is unused: the walker moves data over
     // the debug-IO send64/receive64 path.
     .dma_bram_byte_wea  (8'd0),

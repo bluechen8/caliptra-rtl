@@ -7,10 +7,11 @@
 // Checks, independently of the real core:
 //   - each command raises exactly one `done`;
 //   - only the KEYGEN sampling pass reloads the seed (reseed_en), dina is 0;
-//   - the LDINS payload stream (the patched INS words) matches the TB's own
-//     ins_* builders for the right limb chain + scale -- this is the actual
-//     trace-equivalence assertion (walker encoding == validated TB encoding);
-//   - the per-op (bank, ins_flag, nwords) summary matches the program.
+//   - the command loaded into ComputeCore for each pass (core_cmd as it
+//     rises from 0) matches the TB's own ins_* builders for the right limb
+//     chain + scale -- this is the actual trace-equivalence assertion (walker
+//     encoding == validated TB encoding);
+//   - no write targets the INS buffer, and core_cmd is 0 while the core is reset.
 //
 // No real ComputeCore, no DMA: external poly data flows over ext_* (stubbed).
 //
@@ -20,8 +21,6 @@ module tb_fhe_microseq;
 
   localparam int LOGN = 4;
   localparam int N    = 1 << LOGN;          // 16 -- tiny, fast
-  localparam int INS_BUFFER_SIZE = 16;
-  localparam longint W40 = 64'h1 << 40;
 
   // q chain (Rung-7): q0 qm=9 k=0 ms=0 ; q1 qm=1 k=1 ms=1
   localparam int QM0=9, K0=0, MS0=0, QM1=1, K1=1, MS1=1;
@@ -45,6 +44,11 @@ module tb_fhe_microseq;
   logic [63:0] ext_din;
   wire        ext_dout_we; wire [63:0] ext_dout;
   wire        busy, done, error;
+  wire [39:0] core_cmd;
+  // A pass starts when core_cmd rises from 0 (it is 0 between passes).
+  logic [39:0] core_cmd_q;
+  always_ff @(posedge clk) core_cmd_q <= core_cmd;
+  wire cmd_load = (core_cmd != 40'd0) && (core_cmd_q == 40'd0);
 
   // deterministic external/stub data function
   function automatic logic [63:0] f_data(input logic [3:0] bram, input logic [LOGN:0] addr);
@@ -62,6 +66,7 @@ module tb_fhe_microseq;
     .control_low_word(control_low_word), .control_high_word(control_high_word),
     .dina_low(dina_low), .dina_high(dina_high),
     .dout_low(dout_low), .dout_high(dout_high), .status(status),
+    .core_cmd(core_cmd),
     .ext_sel(ext_sel), .ext_idx(ext_idx), .ext_din(ext_din),
     .ext_dout_we(ext_dout_we), .ext_dout(ext_dout),
     // B' 2c-step-2 DMA handshake: tie idle/ready high for the legacy zero-latency
@@ -76,64 +81,55 @@ module tb_fhe_microseq;
   wire [3:0]  cl_bram = {1'b0, control_low_word[31:29]};
   wire        cl_wea  = control_low_word[FHE_CW_WEA];
   wire        cl_ins  = control_low_word[FHE_CW_INS];
-  wire        cl_grant= control_low_word[FHE_CW_GRANT];
   wire [LOGN:0] cl_addr= control_low_word[LOGN:0];
   always_comb begin
     {dout_high,dout_low} = f_data(cl_bram, cl_addr);
   end
-  // status: cycle_count[30:1], done_all[0]. Model done a fixed latency after start(ch==2).
+  // status[0]: the loaded pass is done, a fixed latency after cmd_load,
+  // until the walker resets the core (control_high_word[0]).
   int start_cnt;
   always_ff @(posedge clk or negedge rst_b) begin
     if (!rst_b) begin status<=32'd0; start_cnt<=0; end
-    else begin
-      if (control_high_word==32'd2) begin
-        if (start_cnt < 4) start_cnt <= start_cnt+1;
-        status <= (start_cnt>=3) ? 32'h1 : 32'h0;     // done_all after a few cycles
-      end else begin start_cnt<=0; status<=32'd0; end
+    else if (control_high_word[0]) begin status<=32'd0; start_cnt<=0; end
+    else if (cmd_load) start_cnt <= 1;
+    else if (start_cnt != 0) begin
+      if (start_cnt < 4) start_cnt <= start_cnt+1;
+      else status <= 32'h1;
     end
   end
 
   // ===================================================================
-  // Scoreboard: collapse pin activity into (WR runs) + (EXE params)
+  // Scoreboard: the EXE params and commands, in order
   // ===================================================================
-  // WR runs
-  int   wr_n   [0:255]; int wr_bram[0:255]; int wr_ins[0:255]; longint wr_pay[0:255];
-  int   nwr;
-  logic run_open; int run_bram, run_ins, run_n; longint run_pay;
   // EXE reseed gate (1 = reload the sampler seed). The seed itself arrives on
   // fhe_top's sideband; dina must carry 0 at every EXE.
   longint exe_p [0:63]; int nexe;
-  int     prev_ch;
+  longint cmd_p [0:63];   // command loaded at each EXE
   // dout strobes
   int     n_dout;
 
   task automatic sb_reset();
-    nwr=0; nexe=0; n_dout=0; run_open=0; prev_ch=1;
+    nexe=0; n_dout=0;
   endtask
 
   always_ff @(posedge clk) begin
     if (rst_b) begin
-      // EXE start edge
-      if (control_high_word==32'd2 && prev_ch!=2) begin
-        exe_p[nexe] = longint'(reseed_en); nexe++;
+      // The core decodes core_cmd directly: it must be 0 whenever the core is
+      // held in reset (between passes).
+      if (control_high_word[0] && core_cmd != 40'd0) begin
+        $display("  core_cmd %h while the core is in reset", core_cmd); errors++;
+      end
+      // EXE: the command load
+      if (cmd_load) begin
+        exe_p[nexe] = longint'(reseed_en); cmd_p[nexe] = longint'(core_cmd); nexe++;
         if ({dina_high,dina_low} != 64'd0) begin
           $display("  EXE dina=%h, expected 0 (seed is on the sideband)", {dina_high,dina_low}); errors++;
         end
       end
-      prev_ch <= control_high_word;
       // dout strobes
       if (ext_dout_we) n_dout++;
-      // WR collapse
-      if (control_low_word==32'd0) begin
-        if (run_open) begin
-          wr_n[nwr]=run_n; wr_bram[nwr]=run_bram; wr_ins[nwr]=run_ins; wr_pay[nwr]=run_pay; nwr++;
-          run_open=0;
-        end
-      end else if (cl_wea) begin
-        if (!run_open) begin run_open=1; run_bram=cl_bram; run_ins=cl_ins; run_n=0; run_pay=64'd0; end
-        run_n++;
-        if (cl_addr == (cl_ins? (LOGN+1)'(1) : '0)) run_pay = {dina_high,dina_low};
-      end
+      // No INS_RAM writes remain: every write is to a data bank.
+      if (cl_wea && cl_ins) begin $display("  INS write at %h", control_low_word); errors++; end
     end
   end
 
@@ -141,23 +137,23 @@ module tb_fhe_microseq;
   // Golden: ins_* builders (ported from tb_ckks_roundtrip.sv) + expected lists
   // ===================================================================
   function automatic longint neg_qm(input int qm); neg_qm = (-qm) & ((1<<17)-1); endfunction
-  function automatic longint g_fft(input bit dif); g_fft = W40 | (1<<4) | (longint'(dif)<<3) | 1; endfunction
+  function automatic longint g_fft(input bit dif); g_fft = (1<<4) | (longint'(dif)<<3) | 1; endfunction
   function automatic longint g_ntt(input bit dif, input int k, input int ms, input int qm);
-    longint q=neg_qm(qm); g_ntt = W40 | (q<<13) | (longint'(ms)<<9) | (longint'(k)<<5) | (longint'(dif)<<3) | 1;
+    longint q=neg_qm(qm); g_ntt = (q<<13) | (longint'(ms)<<9) | (longint'(k)<<5) | (longint'(dif)<<3) | 1;
   endfunction
   function automatic longint g_rns(input int sc, input int k, input int ms, input int qm);
     longint q=neg_qm(qm); longint sh=(sc>>5)&'h7f, sm=(sc>>3)&'h3, sl=sc&'h7;
-    g_rns = W40 | (sh<<33) | (sl<<30) | (q<<13) | (longint'(ms)<<9) | (longint'(k)<<5) | (sm<<3) | 2;
+    g_rns = (sh<<33) | (sl<<30) | (q<<13) | (longint'(ms)<<9) | (longint'(k)<<5) | (sm<<3) | 2;
   endfunction
   function automatic longint g_pwm(input int k, input int qm, input bit neg, input bit enc);
     longint q=neg_qm(qm);
-    g_pwm = W40 | (q<<13) | (longint'(k)<<5) | (longint'(enc)<<4) | (longint'(neg)<<3) | 4;
+    g_pwm = (q<<13) | (longint'(k)<<5) | (longint'(enc)<<4) | (longint'(neg)<<3) | 4;
   endfunction
   function automatic longint g_i2f(input int sc, input int k, input int qm);
     longint q=neg_qm(qm); longint sh=(sc>>>5)&'hf, sm=(sc>>>3)&'h3, sl=sc&'h7;
-    g_i2f = W40 | (sh<<33) | (sl<<30) | (q<<13) | (longint'(k)<<5) | (sm<<3) | 3;
+    g_i2f = (sh<<33) | (sl<<30) | (q<<13) | (longint'(k)<<5) | (sm<<3) | 3;
   endfunction
-  function automatic longint g_proj(); g_proj = W40 | 5; endfunction
+  function automatic longint g_proj(); g_proj = 5; endfunction
 
   int errors=0;
   task automatic chk(input string nm, input longint got, input longint exp);
@@ -180,29 +176,21 @@ module tb_fhe_microseq;
     @(negedge clk);
   endtask
 
-  // expected EXE param + LDINS payload sequences
-  longint exp_exe [0:63]; int n_exp_exe;
-  longint exp_ins [0:63]; int n_exp_ins;
-  task automatic clr_exp(); n_exp_exe=0; n_exp_ins=0; endtask
-  task automatic e_exe(input longint p); exp_exe[n_exp_exe]=p; n_exp_exe++; endtask
-  task automatic e_ins(input longint p); exp_ins[n_exp_ins]=p; n_exp_ins++; endtask
-
-  // collect actual LDINS payloads (ins runs) in order
-  task automatic collect_ins(output longint a[$]);
-    int i; a={};
-    for (i=0;i<nwr;i++) if (wr_ins[i]) a.push_back(wr_pay[i]);
+  // expected passes: (command, reseed) in order
+  longint exp_cmd [0:63]; longint exp_exe [0:63]; int n_exp;
+  task automatic clr_exp(); n_exp=0; endtask
+  task automatic e_pass(input longint cmd, input longint reseed);
+    exp_cmd[n_exp]=cmd; exp_exe[n_exp]=reseed; n_exp++;
   endtask
 
   task automatic compare(input string tag);
-    longint ai[$]; int i;
-    $display("[%s] runs=%0d exe=%0d dout=%0d  (exp ins=%0d exe=%0d)", tag, nwr, nexe, n_dout, n_exp_ins, n_exp_exe);
-    // EXE params
-    if (nexe !== n_exp_exe) begin $display("  EXE COUNT got=%0d exp=%0d", nexe, n_exp_exe); errors++; end
-    for (i=0;i<n_exp_exe && i<nexe;i++) chk($sformatf("exe[%0d]",i), exe_p[i], exp_exe[i]);
-    // LDINS payloads
-    collect_ins(ai);
-    if (ai.size() !== n_exp_ins) begin $display("  INS COUNT got=%0d exp=%0d", ai.size(), n_exp_ins); errors++; end
-    for (i=0;i<n_exp_ins && i<ai.size();i++) chk($sformatf("ins[%0d]",i), ai[i], exp_ins[i]);
+    int i;
+    $display("[%s] passes=%0d dout=%0d  (exp %0d)", tag, nexe, n_dout, n_exp);
+    if (nexe !== n_exp) begin $display("  PASS COUNT got=%0d exp=%0d", nexe, n_exp); errors++; end
+    for (i=0;i<n_exp && i<nexe;i++) begin
+      chk($sformatf("cmd[%0d]",i), cmd_p[i], exp_cmd[i]);
+      chk($sformatf("exe[%0d]",i), exe_p[i], exp_exe[i]);
+    end
   endtask
 
   initial begin
@@ -213,46 +201,46 @@ module tb_fhe_microseq;
     // pass reloads the seed, even when CONFIG.L asks for one limb ----------------
     clr_exp();
     scale = 12'(RNS_KG);
-    e_ins(g_fft(1));                       e_exe(1);
-    e_ins(g_rns(RNS_KG,K0,MS0,QM0));       e_exe(0);
-    e_ins(g_ntt(0,K0,MS0,QM0));            e_exe(0);
-    e_ins(g_pwm(K0,QM0,0,0));              e_exe(0);
-    e_ins(g_rns(RNS_KG,K1,MS1,QM1));       e_exe(0);
-    e_ins(g_ntt(0,K1,MS1,QM1));            e_exe(0);
-    e_ins(g_pwm(K1,QM1,0,0));              e_exe(0);
+    e_pass(g_fft(1),                       1);
+    e_pass(g_rns(RNS_KG,K0,MS0,QM0),       0);
+    e_pass(g_ntt(0,K0,MS0,QM0),            0);
+    e_pass(g_pwm(K0,QM0,0,0),              0);
+    e_pass(g_rns(RNS_KG,K1,MS1,QM1),       0);
+    e_pass(g_ntt(0,K1,MS1,QM1),            0);
+    e_pass(g_pwm(K1,QM1,0,0),              0);
     run_cmd(FHE_KEYGEN, 4'd1);
     compare("KEYGEN (L ignored)");
 
     // ---------------- ENCRYPT (L=1): a and e0 continue the stream ----------------
     clr_exp();
     scale = 12'(RNS_ENC);
-    e_ins(g_fft(1));                       e_exe(0);
-    e_ins(g_rns(RNS_ENC,K0,MS0,QM0));      e_exe(0);
-    e_ins(g_ntt(0,K0,MS0,QM0));            e_exe(0);
-    e_ins(g_pwm(K0,QM0,1,1));              e_exe(0);
+    e_pass(g_fft(1),                       0);
+    e_pass(g_rns(RNS_ENC,K0,MS0,QM0),      0);
+    e_pass(g_ntt(0,K0,MS0,QM0),            0);
+    e_pass(g_pwm(K0,QM0,1,1),              0);
     run_cmd(FHE_ENCRYPT, 4'd1);
     compare("ENCRYPT L=1");
 
     // ---------------- ENCRYPT (L=2) ----------------
     clr_exp();
-    e_ins(g_fft(1));                       e_exe(0);
-    e_ins(g_rns(RNS_ENC,K0,MS0,QM0));      e_exe(0);
-    e_ins(g_ntt(0,K0,MS0,QM0));            e_exe(0);
-    e_ins(g_pwm(K0,QM0,1,1));              e_exe(0);
-    e_ins(g_rns(RNS_ENC,K1,MS1,QM1));      e_exe(0);
-    e_ins(g_ntt(0,K1,MS1,QM1));            e_exe(0);
-    e_ins(g_pwm(K1,QM1,1,1));              e_exe(0);
+    e_pass(g_fft(1),                       0);
+    e_pass(g_rns(RNS_ENC,K0,MS0,QM0),      0);
+    e_pass(g_ntt(0,K0,MS0,QM0),            0);
+    e_pass(g_pwm(K0,QM0,1,1),              0);
+    e_pass(g_rns(RNS_ENC,K1,MS1,QM1),      0);
+    e_pass(g_ntt(0,K1,MS1,QM1),            0);
+    e_pass(g_pwm(K1,QM1,1,1),              0);
     run_cmd(FHE_ENCRYPT, 4'd2);
     compare("ENCRYPT L=2");
 
     // ---------------- DECRYPT (L=1) ----------------
     clr_exp();
     scale = 12'(I2F_DEC);
-    e_ins(g_pwm(K0,QM0,0,0));              e_exe(0);
-    e_ins(g_ntt(1,K0,MS0,QM0));            e_exe(0);
-    e_ins(g_i2f(I2F_DEC,K0,QM0));          e_exe(0);
-    e_ins(g_fft(0));                       e_exe(0);
-    e_ins(g_proj());                       e_exe(0);
+    e_pass(g_pwm(K0,QM0,0,0),              0);
+    e_pass(g_ntt(1,K0,MS0,QM0),            0);
+    e_pass(g_i2f(I2F_DEC,K0,QM0),          0);
+    e_pass(g_fft(0),                       0);
+    e_pass(g_proj(),                       0);
     run_cmd(FHE_DECRYPT, 4'd1);
     compare("DECRYPT L=1");
 

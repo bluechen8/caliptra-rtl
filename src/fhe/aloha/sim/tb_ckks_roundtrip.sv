@@ -6,19 +6,17 @@
 // the INS_RAM microcode sequencer rather than each engine in isolation.
 //
 // A run-mode plusarg selects the flow: +ROUNDTRIP (5c self-contained recovered
-// round-trip), +SKHW (Rung 6 sk keygen + NTT cross-check), +WALKER (2b), or
+// round-trip), +SKHW (Rung 6 sk keygen + NTT cross-check), or
 // +DPICOSIM (7c). There is no default mode. (The old no-plusarg Rung 5a, which
 // checked the ciphertext against shipped SEAL goldens, was retired at the C'-2
 // PRNG swap -- caliptra_prim_trivium no longer reproduces SEAL's a/e.)
 //
 // Golden dir via +TVDIR=<path>. PROVIDE_DEBUG_IO=1 (send64/receive64 path),
-// stored FFT twiddles.
+// generated FFT twiddles. Walker-driven runs live in tb/fhe_top_dma_tb.sv.
 
 `timescale 1ns/1ps
 
 module tb_ckks_roundtrip;
-  import fhe_params_pkg::*;   // Stage-B' 2b: fhe_cmd_e / FHE_L for the walker
-
   localparam int N    = `ifdef N_OVERRIDE `N_OVERRIDE `else 8192 `endif;
   localparam int LOGN = $clog2(N);
   // Rung 6c: build with +define+FHE_SK_HW to elaborate the dedicated secret-key
@@ -94,11 +92,11 @@ module tb_ckks_roundtrip;
       // legacy: reseed every pass, Trivium reset coupled to the core reset (this
       // TB validates the golden per-pass-reload keystream, not free-run).
       .reseed_en(1'b1),
-      .prng_rst_i(core_ch[0]),
-      .control_low_word(core_cl),
-      .control_high_word(core_ch),
-      .dina_ext_low_word(core_dl),
-      .dina_ext_high_word(core_dh),
+      .prng_rst_i(control_high_word[0]),
+      .control_low_word(control_low_word),
+      .control_high_word(control_high_word),
+      .dina_ext_low_word(dina_low),
+      .dina_ext_high_word(dina_high),
       .dout_ext_low_word(dout_low),
       .dout_ext_high_word(dout_high),
       .status(status),
@@ -109,64 +107,6 @@ module tb_ckks_roundtrip;
       .dma_bram_en(dma_en),
       .m_aloha_mem(aloha_mem.req)
     );
-
-  // ====================================================================
-  // Stage-B' 2b: the walker (fhe_microseq) muxed onto the SAME core pins.
-  // In +WALKER mode the walker drives control_low/high + dina; otherwise the
-  // existing TB tasks do (walker_mode=0 preserves every other mode unchanged).
-  // The TB plays "firmware + DMA": a small DRAM model feeds DMA_IN and captures
-  // DMA_OUT, and hands ct pointers from encrypt to decrypt.
-  // ====================================================================
-  logic        walker_mode = 1'b0;
-  wire  [31:0] w_cl, w_ch, w_dl, w_dh;
-  wire  [2:0]  w_sel;  wire [LOGN:0] w_idx;
-  wire         w_dout_we, w_busy, w_done, w_error;
-  wire  [63:0] w_dout;
-  logic        w_rst_b = 1'b0, w_cmd_valid = 1'b0;
-  fhe_cmd_e    w_cmd = FHE_NONE;
-  // The walker carries one per-command scale field and no seeds: in fhe_top the
-  // sampler seed arrives on a sideband. This core keeps the dina seed path
-  // (SEED_SIDEBAND=0) with reseed tied high, so walker mode samples from seed 0;
-  // the secret-key round trip is independent of the key and noise values.
-  logic [11:0] w_scale;
-  logic [63:0] w_r2 [0:FHE_L-1];
-
-  // TB DRAM model, split into single-writer halves to avoid multidriven memory:
-  //   dram_src[ptr] — written by the task (preload/copy), read by DMA_IN
-  //   dram_cap[ptr] — written ONLY by the clocked DMA_OUT capture below
-  longint      dram_src [0:3][0:2*N];
-  longint      dram_cap [0:3][0:2*N];
-  wire  [63:0] w_din = dram_src[w_sel][w_idx];
-  // The dout strobe is valid in the step that hands the word over, with
-  // ext_sel/ext_idx naming that word.
-  always @(posedge clk) begin
-    if (walker_mode && w_dout_we) dram_cap[w_sel][w_idx] <= w_dout;
-  end
-
-  // core control mux
-  wire [31:0] core_cl = walker_mode ? w_cl : control_low_word;
-  wire [31:0] core_ch = walker_mode ? w_ch : control_high_word;
-  wire [31:0] core_dl = walker_mode ? w_dl : dina_low;
-  wire [31:0] core_dh = walker_mode ? w_dh : dina_high;
-
-  fhe_microseq #(.LOGN(LOGN), .N(N)) walker (
-    .active_limb(),
-    .step(1'b1),
-    .clk(clk), .rst_b(w_rst_b), .zeroize(1'b0),
-    .cmd_valid(w_cmd_valid), .cmd(w_cmd),
-    .scale(w_scale), .reseed_en(),
-    .num_limbs(4'd1), .r2modq(w_r2),
-    .control_low_word(w_cl), .control_high_word(w_ch), .dina_low(w_dl), .dina_high(w_dh),
-    .dout_low(dout_low), .dout_high(dout_high), .status(status),
-    .ext_sel(w_sel), .ext_idx(w_idx), .ext_din(w_din),
-    .ext_dout_we(w_dout_we), .ext_dout(w_dout),
-    // B' 2c-step-2 DMA handshake: tie idle/ready high (the 2b round-trip uses the
-    // zero-latency split dram_src/dram_cap array model, no DMA engine).
-    .dma_desc_valid(), .dma_desc_wr(), .dma_desc_ptr(), .dma_desc_limb(),
-    .dma_ready(1'b1), .dma_rd_valid(1'b1), .dma_rd_pop(), .dma_wr_ready(1'b1),
-    .exe_hold(1'b0), .exe_held(),
-    .busy(w_busy), .done(w_done), .error(w_error)
-  );
 
 `ifdef FHE_DPI_COSIM
   // ---- Rung 7c: in-process Lattigo "server" via DPI-C ------------------------
@@ -545,56 +485,6 @@ module tb_ckks_roundtrip;
   //   * c1 = a is a HW passthrough (PWMSk result1), checked here == sampled a.
   //   * single multiply lane (BF0); BF1 unused.
   // ====================================================================
-  // ---- Stage-B' 2b: walker-driven round-trip on the real core --------------
-  // Pulse one command into the walker and wait for its done. sk_mem persists in
-  // the walker across keygen->encrypt->decrypt (one run, never reset between).
-  task automatic fire_cmd(input fhe_cmd_e c, input string nm);
-    int t;
-    @(negedge clk); w_cmd = c; w_cmd_valid = 1'b1;
-    @(negedge clk); w_cmd_valid = 1'b0; w_cmd = FHE_NONE;
-    t = 0;
-    while (!w_done) begin
-      @(posedge clk); t++;
-      if (t > 50_000_000) begin $display("WALKER TIMEOUT in %s", nm); errors++; return; end
-    end
-    $display("  [walker] %s done (%0d cyc)", nm, t);
-    @(negedge clk);
-  endtask
-
-  // Reproduces run_skscheme_hw's keygen->encrypt->decrypt, but driven entirely
-  // by the walker FSM through the muxed core pins, then the SAME recovery check.
-  task automatic run_walker_rt();
-    int i, s; longint r2; logic [127:0] rr;
-    if (SCHEME != 1) begin
-      $display("FAIL: +WALKER requires +define+FHE_SK_HW (SCHEME=1)"); errors++; return;
-    end
-    $readmemh({tvdir, "/input.txt"}, g_input);
-    rr = (128'd1 << 72) % q0; rr = (rr * rr) % q0; r2 = longint'(rr);
-    for (i = 0; i < FHE_L; i++) w_r2[i] = 64'd0;
-    w_r2[0]    = r2;
-    s = RT_SCALE - 52 - 1023 - LOGN; if (s < 0) s += 4096;
-    w_scale  = 12'(s);                        // RNS field for KEYGEN and ENCRYPT
-    // preload the plaintext into ptr0 (encrypt's DMA_IN msg source)
-    to_q(plain_q, g_input, N);
-    for (i = 0; i < N; i++) dram_src[0][i] = plain_q[i];
-
-    walker_mode = 1'b1;
-    w_rst_b = 1'b0; repeat (4) @(negedge clk); w_rst_b = 1'b1; repeat (2) @(negedge clk);
-
-    fire_cmd(FHE_KEYGEN,  "KEYGEN");
-    fire_cmd(FHE_ENCRYPT, "ENCRYPT");
-    // firmware hands the ct pointers to decrypt: enc wrote c0->ptr2, c1->ptr3;
-    // dec reads c0<-ptr0, c1<-ptr1.
-    for (i = 0; i < N; i++) begin dram_src[0][i] = dram_cap[2][i]; dram_src[1][i] = dram_cap[3][i]; end
-    w_scale = 12'(-RT_SCALE);                 // signed I2F decode field
-    fire_cmd(FHE_DECRYPT, "DECRYPT");
-
-    begin longint reco[]; reco = new[N];
-      for (i = 0; i < N; i++) reco[i] = dram_cap[2][i];   // recovered slots (upper N of FFT)
-      check_fft(reco, g_input, N, "WALKER-driven sk round-trip (recovered vs input)", 1.0e-3);
-    end
-  endtask
-
   task automatic run_skscheme_hw();
     int i;
     longint keygen_seed, err_seed, a_seed, r_mod_q, r2;
@@ -1024,15 +914,6 @@ module tb_ckks_roundtrip;
       $finish;
     end
 
-    // Stage-B' 2b: same round-trip, but driven by the walker FSM on the real core.
-    if ($test$plusargs("WALKER")) begin
-      $display("== Stage-B' 2b: WALKER-driven sk round-trip on real ComputeCore, N=%0d ==", N);
-      run_walker_rt();
-      if (errors == 0) $display("RESULT: PASS");
-      else             $display("RESULT: FAIL (%0d mismatches)", errors);
-      $finish;
-    end
-
 `ifdef FHE_DPI_COSIM
     // ==== Rung 7c: single-run client<->server cosim via DPI-C ================
     // ONE RTL run: Aloha keygens+encrypts, the in-process Lattigo server (via the
@@ -1120,7 +1001,7 @@ module tb_ckks_roundtrip;
     // (Rung 6 keygen NTT cross-check), tb_RandomSampling (sampler goldens), and
     // the DPI cosim. There is no default (no-plusarg) run mode any more.
     $display("tb_ckks_roundtrip: no run-mode plusarg given.");
-    $display("  select a mode: +ROUNDTRIP (5c) | +SKHW (6) | +WALKER (2b) | +DPICOSIM (7c)");
+    $display("  select a mode: +ROUNDTRIP (5c) | +SKHW (6) | +DPICOSIM (7c)");
     $finish;
   end
 

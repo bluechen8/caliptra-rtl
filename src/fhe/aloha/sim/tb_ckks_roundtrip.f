@@ -5,5 +5,4 @@
 // C'-3: behavioral storage banks for the lifted fhe_aloha_mem_if (TB-side).
 $ALOHA_PORT/../rtl/fhe_aloha_mem_top.sv
 $ALOHA_PORT/../rtl/fhe_params_pkg.sv
-$ALOHA_PORT/../rtl/fhe_microseq.sv
 $ALOHA_PORT/sim/tb_ckks_roundtrip.sv
