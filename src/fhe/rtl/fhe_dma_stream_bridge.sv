@@ -93,6 +93,7 @@ module fhe_dma_stream_bridge
   wire           half_out = beats_out[0];  // odd count: the high half is next
   logic        ibuf_full, obuf_full;
   logic [63:0] ibuf, obuf;
+  logic [31:0] ilo;           // low beat of the next inbound word
 
   // Per-limb residue bound, a constant table.
   logic [63:0] Q [0:FHE_L-1];
@@ -116,11 +117,15 @@ module fhe_dma_stream_bridge
   wire xfer_live = (state == B_XFER) && !abort_q;
   assign rd_valid = xfer_live && !dir_out && (faked || ibuf_full);
   assign rd_data  = faked ? 64'd0 : ibuf;
-  assign wr_ready = xfer_live && dir_out && (faked || !obuf_full);
+  // The walker pushes the cycle after it sees wr_ready, so the buffer also
+  // counts as free while its last beat leaves.
+  assign wr_ready = xfer_live && dir_out && (faked || !obuf_full || (out_push && half_out));
 
   // DMA side
   wire dma_seg   = (state == B_XFER) && !faked;
-  wire in_pop    = dma_seg && !dir_out && hw_resp.rd_valid && (!ibuf_full || abort_q);
+  // The low beat of the next word may arrive while the walker still holds a
+  // word; the high beat waits for the buffer.
+  wire in_pop    = dma_seg && !dir_out && hw_resp.rd_valid && (!ibuf_full || !half_in || abort_q);
   wire out_push  = dma_seg && dir_out && hw_resp.wr_ready && (beats_out != 0) && (obuf_full || abort_q);
 
   always_comb begin
@@ -143,7 +148,7 @@ module fhe_dma_stream_bridge
       word_error <= 1'b0; xfer_error <= 1'b0;
       dir_out <= 1'b0; aes_q <= 1'b0; msg_q <= 1'b0; ptr_q <= '0; limb_q <= '0; addr_q <= '0;
       left <= '0; beats_out <= '0; half_in <= 1'b0;
-      ibuf_full <= 1'b0; obuf_full <= 1'b0; ibuf <= '0; obuf <= '0;
+      ibuf_full <= 1'b0; obuf_full <= 1'b0; ibuf <= '0; obuf <= '0; ilo <= '0;
       dma_fin <= 1'b0; faked <= 1'b0;
     end else begin
       // ---- lease ----
@@ -184,13 +189,13 @@ module fhe_dma_stream_bridge
         B_XFER: begin
           // inbound: pack two beats, check, hand to the walker
           if (in_pop) begin
-            if (!half_in) ibuf[31:0] <= hw_resp.rd_data;
+            if (!half_in) ilo <= hw_resp.rd_data;
             else begin
-              ibuf[63:32] <= hw_resp.rd_data;
+              ibuf <= {hw_resp.rd_data, ilo};
               if (!abort_q) begin
                 ibuf_full <= 1'b1;
                 if (msg_q ? (hw_resp.rd_data[30:20] == 11'h7FF)     // NaN or infinity
-                          : ({hw_resp.rd_data, ibuf[31:0]} >= Q[limb_q]))
+                          : ({hw_resp.rd_data, ilo} >= Q[limb_q]))
                   word_error <= 1'b1;
               end
             end
@@ -200,14 +205,15 @@ module fhe_dma_stream_bridge
             ibuf_full <= 1'b0;
             left <= left - 1'b1;
           end
-          // outbound: take a walker word, split into two beats
-          if (wr_valid && wr_ready) begin
-            if (!faked) begin obuf <= wr_data; obuf_full <= 1'b1; end
-            left <= left - 1'b1;
-          end
+          // outbound: split the buffered word into two beats; a walker word
+          // taken in the cycle the last beat leaves refills the buffer
           if (out_push) begin
             beats_out <= beats_out - 1'b1;
             if (half_out) obuf_full <= 1'b0;
+          end
+          if (wr_valid && wr_ready) begin
+            if (!faked) begin obuf <= wr_data; obuf_full <= 1'b1; end
+            left <= left - 1'b1;
           end
           if (hw_resp.done || hw_resp.error) dma_fin <= 1'b1;
           if (hw_resp.error) xfer_error <= 1'b1;
