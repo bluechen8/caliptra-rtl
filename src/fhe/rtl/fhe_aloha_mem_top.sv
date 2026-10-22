@@ -64,7 +64,7 @@ module fhe_aloha_mem_top #(parameter bit ILV = 0, SRAM_REUSE = 0, parameter CROM
   `FHE_WORKING_ARRAY(7, fft_higher1, 64, SDP_AW, 64, {64{1'b1}},           1'b1)
   `undef FHE_WORKING_ARRAY
 
-  fhe_table_bank #(.DEPTH(1 << `FHE_CROM_AW), .ILV(ILV), .INIT_FILE(CROM_INIT)) crom (
+  fhe_table_bank #(.DEPTH(1 << `FHE_CROM_AW), .INIT_FILE(CROM_INIT)) crom (
     .clk(clk_i), .step(m.eng_step),
     .we(m.crom_wea), .wa(m.crom_wa), .wd(m.crom_wd), .ra(m.crom_addra), .q(m.crom_douta));
 endmodule
@@ -96,6 +96,8 @@ module fhe_working_array #(
     logic [4*W-1:0] wdata, rdata;
     logic [4*MW-1:0] wmask;
     logic rst_n = 1'b0;
+    logic [AW-1:0] chk = '0;               // row the consistency sweep checks
+    logic [W-1:0] peek [4];
     always @(posedge clk) rst_n <= 1'b1;
     fhe_ilv_bank #(.W(W), .AW(AW), .GRAN(GRAN)) bank (
       .clk, .rst_n, .forward(FORWARD_MASK), .step, .stall, .we, .wa, .wd, .mask, .ra, .q,
@@ -109,6 +111,23 @@ module fhe_working_array #(
             if (wmask[s*MW + b]) mem[addr[s*SAW +: SAW]][b*GRAN +: GRAN] <= wdata[s*W + b*GRAN +: GRAN];
         end else rdata[s*W +: W] <= mem[addr[s*SAW +: SAW]];
       end
+      assign peek[s] = mem[chk[AW-1:2]];
+    end
+    // Sweep one row per clock: sub-bank contents plus the write buffer must
+    // equal the logical contents.
+    logic [1:0] chk_sub;
+    logic [W-1:0] chk_got;
+    always_comb begin
+      chk_sub = '0;
+      for (int i = 0; i < AW; i += 2) chk_sub ^= 2'(chk >> i);
+      chk_got = peek[chk_sub];
+      if (bank.bv && bank.ba == chk)
+        for (int b = 0; b < MW; b++) if (bank.bm[b]) chk_got[b*GRAN +: GRAN] = bank.bd[b*GRAN +: GRAN];
+    end
+    always @(posedge clk) begin
+      if (rst_n) assert (chk_got == mem[chk])
+        else $fatal(1, "%m: row %0d holds %h, expected %h", chk, chk_got, mem[chk]);
+      chk <= chk + 1'b1;
     end
   end else begin : ideal
     assign stall = 1'b0;
@@ -121,8 +140,7 @@ endmodule
 // same-address write reach that clock's read.
 module fhe_shared_bank #(
   parameter int W=64, DEPTH=4096, AW=$clog2(DEPTH), GRAN=W,
-  parameter logic [W-1:0] FORWARD_MASK='0,
-  parameter INIT_FILE=""
+  parameter logic [W-1:0] FORWARD_MASK='0
 )(
   input logic clk, we,
   input logic [AW-1:0] wa,ra,
@@ -132,7 +150,6 @@ module fhe_shared_bank #(
 );
   logic [W-1:0] mem [0:DEPTH-1];
   logic [W-1:0] stage0;
-  initial if (INIT_FILE != "") $readmemh(INIT_FILE,mem);
   always_ff @(posedge clk) begin
     for (int b=0;b<W;b++)
       stage0[b]<=we && wa==ra && mask[b/GRAN] && FORWARD_MASK[b] ? wd[b] : mem[ra][b];
@@ -142,12 +159,11 @@ module fhe_shared_bank #(
   end
 endmodule
 
-// CROM: one 1RW array, read every step (ILV) or every clock. A table write
-// (engine idle) takes the port on any edge; the read data reaches q on the
-// next step, like the working arrays.
+// CROM: one 1RW array, read every step. A table write (engine idle) takes the
+// port on any edge; the read data reaches q on the next step, like the working
+// arrays. Caliptra.scala builds the same pipeline.
 module fhe_table_bank #(
   parameter int DEPTH = 256, AW = $clog2(DEPTH),
-  parameter bit ILV = 1,
   parameter INIT_FILE = ""
 )(
   input logic clk, step, we,
@@ -161,14 +177,9 @@ module fhe_table_bank #(
   initial if (INIT_FILE != "") $readmemh(INIT_FILE, mem);
   always_ff @(posedge clk) begin
     if (we) mem[wa] <= wd;
-    if (ILV) begin
-      if (step && !we) raw <= mem[ra];
-      fresh <= step && !we;
-      if (fresh) stage0 <= raw;
-      if (step) q <= fresh ? raw : stage0;
-    end else begin
-      stage0 <= mem[ra];
-      q <= stage0;
-    end
+    if (step && !we) raw <= mem[ra];
+    fresh <= step && !we;
+    if (fresh) stage0 <= raw;
+    if (step) q <= fresh ? raw : stage0;
   end
 endmodule

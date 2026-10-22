@@ -76,6 +76,7 @@ module tb_ckks_roundtrip;
   // The integration has no stored FFT-twiddle table, so the core generates FFT
   // twiddles; the CROM is preloaded here instead of copied in by firmware.
   fhe_aloha_mem_top #(.CROM_INIT("fft_rns_rom.mem")) u_aloha_mem (.clk_i(clk), .m(aloha_mem.resp));
+  assign aloha_mem.eng_step = 1'b1;   // the core steps every clock here
   assign aloha_mem.crom_wea = 1'b0;
   assign aloha_mem.crom_wa  = '0;
   assign aloha_mem.crom_wd  = '0;

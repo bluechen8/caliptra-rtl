@@ -46,7 +46,7 @@ module ilv_check #(
     endcase
     we   = (rnd() % 4) != 0;
     wd   = {W{1'b0}};
-    for (int i = 0; i < W; i += 16) wd[i +: 16] = 16'(rnd());
+    for (int i = 0; i < W; i += 16) wd = W'({wd, 16'(rnd())});
     mask = MW'(rnd()) | MW'(rnd() % 2);
   endtask
 

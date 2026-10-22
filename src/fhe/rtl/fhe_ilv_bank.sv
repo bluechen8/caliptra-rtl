@@ -75,18 +75,17 @@ module fhe_ilv_bank #(
   logic [AW-1:0] ba;
   logic [W-1:0]  bd;
   logic [MW-1:0] bm;
-  // held copy of the last read address
+  // the last read address; while hv, st0 (or the fresh read) is its current value
   logic          hv;
   logic [AW-1:0] ha;
-  logic [W-1:0]  hd;
-  // read issued last clock, and what to forward into it
+  // read issued last clock, and the buffered or same-step write bits to lay over it
   logic          fresh;
   logic [1:0]    fsub;
-  logic [W-1:0]  fb_d, fb_bits, fn_d, fn_bits;
+  logic [W-1:0]  f_d, f_bits;
   logic [W-1:0]  st0;                      // read data of the last step, once in
 
-  wire [W-1:0] s0     = ((sb_rdata[fsub*W +: W] & ~fb_bits) | (fb_d & fb_bits)) & ~fn_bits | (fn_d & fn_bits);
-  wire [W-1:0] held   = fresh ? s0 : hd;   // the held address's current value
+  wire [W-1:0] s0     = (sb_rdata[fsub*W +: W] & ~f_bits) | (f_d & f_bits);
+  wire [W-1:0] held   = fresh ? s0 : st0;
 
   // this step's plan, assuming it is taken
   wire       rd_need  = !(hv && ra == ha);
@@ -108,7 +107,7 @@ module fhe_ilv_bank #(
       sb_en[rs] = 1'b1;
       sb_addr[rs*SAW +: SAW] = ra[AW-1:2];
     end
-    if (bv && (step ? b_go : 1'b1)) begin
+    if (bv && (!step || b_go)) begin
       sb_en[bs] = 1'b1; sb_we[bs] = 1'b1;
       sb_addr[bs*SAW +: SAW] = ba[AW-1:2];
       sb_wdata[bs*W +: W] = bd;
@@ -126,9 +125,9 @@ module fhe_ilv_bank #(
     if (!rst_n) begin
       bv <= 1'b0; hv <= 1'b0; fresh <= 1'b0;
     end else begin
-      if (fresh) begin st0 <= s0; hd <= s0; end
+      if (fresh) st0 <= s0;
       if (step) begin
-        q <= fresh ? s0 : st0;
+        q <= held;
         // buffer
         if (b_merge) begin
           bd <= (bd & ~bits_of(mask)) | (wd & bits_of(mask));
@@ -136,20 +135,17 @@ module fhe_ilv_bank #(
         end else if (we && !n_go) begin
           bv <= 1'b1; ba <= wa; bd <= wd; bm <= mask;
         end else if (b_go) bv <= 1'b0;
-        // read
+        // read: from a sub-bank (data next clock) or from the held value
         fresh <= rd_need;
+        ha <= ra; hv <= !hit;
         if (rd_need) begin
-          fsub <= rs;
-          fb_d <= bd; fb_bits <= (bv && ba == ra) ? bits_of(bm) : '0;
-          fn_d <= wd; fn_bits <= fwd_bits;
-          ha <= ra; hv <= !hit;
-        end else begin
-          st0 <= (held & ~fwd_bits) | (wd & fwd_bits);
-          hv  <= !hit;
-        end
+          fsub   <= rs;
+          f_bits <= ((bv && ba == ra) ? bits_of(bm) : '0) | fwd_bits;
+          f_d    <= (bd & ~fwd_bits) | (wd & fwd_bits);
+        end else st0 <= (held & ~fwd_bits) | (wd & fwd_bits);
       end else begin
         fresh <= 1'b0;
-        if (bv) bv <= 1'b0;
+        bv <= 1'b0;
       end
     end
   end

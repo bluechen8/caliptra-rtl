@@ -19,6 +19,7 @@ $ALOHA_PORT/../rtl/fhe_kv_seed.sv
 $ALOHA_PORT/../rtl/fhe_1r1w_ram.sv
 $ALOHA_PORT/../rtl/fhe_mem_if.sv
 $ALOHA_PORT/../rtl/fhe_mem_top.sv
+$ALOHA_PORT/../rtl/fhe_ilv_bank.sv
 $ALOHA_PORT/../rtl/fhe_aloha_mem_top.sv
 $ALOHA_PORT/../rtl/fhe_ahb_slv_sif.sv
 $ALOHA_PORT/../rtl/fhe_reg.sv
