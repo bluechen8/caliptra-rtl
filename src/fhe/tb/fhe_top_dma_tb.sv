@@ -133,7 +133,7 @@ module fhe_top_dma_tb
   );
 
   fhe_aloha_mem_if aloha_mem();
-  fhe_aloha_mem_top #(.PHASED(1), .SRAM_REUSE(1)) u_aloha_mem (.clk_i(clk), .m(aloha_mem.resp));
+  fhe_aloha_mem_top #(.ILV(1), .SRAM_REUSE(1)) u_aloha_mem (.clk_i(clk), .m(aloha_mem.resp));
 
   fhe_completion_checker completion_check (
     .clk(clk), .rst_b(rst_b), .zeroize(dut.zeroize),
@@ -180,7 +180,7 @@ module fhe_top_dma_tb
   int refresh_snapshots = 0;
   int refresh_lifts = 0;
   always @(posedge clk) begin
-    if (rst_b && aloha_mem.phase_write && dut.cmd_q == FHE_REFRESH && dut.w_busy) begin
+    if (rst_b && aloha_mem.eng_step && dut.cmd_q == FHE_REFRESH && dut.w_busy) begin
       if (aloha_mem.ntt_msg0_wea && aloha_mem.ntt_msg0_mask == 8'h80) begin
         refresh_noise[2*int'(aloha_mem.ntt_msg0_addra)] = aloha_mem.ntt_msg0_dina[61] ? -int'(aloha_mem.ntt_msg0_dina[60:56]) : int'(aloha_mem.ntt_msg0_dina[60:56]);
         refresh_samples++;
@@ -201,7 +201,7 @@ module fhe_top_dma_tb
     if (!rst_b) begin
       foreach (key_writes[i]) key_writes[i] = 0;
       foreach (key_reads[i]) key_reads[i] = 0;
-    end else if (aloha_mem.phase_read) begin
+    end else if (aloha_mem.eng_step) begin
       assert (!aloha_mem.sk_en) else $fatal(1,"obsolete resident-key copy port used");
       if ((dut.cmd_q == FHE_RECOVER || dut.cmd_q == FHE_REFRESH) && dut.w_busy) begin
         assert (dut.core.CORE.transform_rst || !dut.core.CORE.do_fft)
@@ -1294,25 +1294,24 @@ module fhe_top_dma_tb
     check_crom_window();
     check_cap();
 
-    // Pause the parent clock in each idle phase while lifted SRAMs continue
-    // to receive base-clock edges. No repeated requests/response shifts allowed.
-    for (int phase = 0; phase < 3; phase++) begin
+    // Pause the parent clock while the lifted SRAMs keep receiving base-clock
+    // edges: no engine step reaches them and their responses hold.
+    for (int pause = 0; pause < 3; pause++) begin
       logic [63:0] held_response;
-      while (dut.mem_phase != 2'(phase)) @(negedge clk);
-      held_response = aloha_mem.ntt_msg0_doutb;
+      repeat (pause + 1) @(negedge clk);
       parent_manual_enable = 0;
+      @(negedge clk);
+      held_response = aloha_mem.ntt_msg0_doutb;
       repeat (9) begin
         @(negedge clk);
-        assert ({aloha_mem.phase_read, aloha_mem.phase_execute, aloha_mem.phase_write} == 0)
-          else $fatal(1, "memory request escaped stopped parent clock");
+        assert (!aloha_mem.eng_step) else $fatal(1, "engine step escaped stopped parent clock");
         assert (aloha_mem.ntt_msg0_doutb === held_response)
           else $fatal(1, "memory response advanced while parent clock stopped");
-        assert (dut.mem_phase == 2'(phase)) else $fatal(1, "phase changed while parent clock stopped");
       end
       parent_manual_enable = 1;
       repeat (4) @(negedge clk);
     end
-    $display("PASS idle parent-clock pause/resume in all three phases");
+    $display("PASS idle parent-clock pause/resume");
 
     $display("== fhe_top register map v2 round trip, N=%0d ==", N);
 

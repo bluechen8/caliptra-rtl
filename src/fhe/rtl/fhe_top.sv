@@ -167,16 +167,12 @@ module fhe_top
   logic commit_wait;
   wire  input_commit = ctrl_wr & ctrl_wdata[4] & commit_wait;
 
-  // Phase generator: every logical engine cycle is READ, EXECUTE, WRITE.
-  logic [1:0] mem_phase;
-  wire core_step = (mem_phase == 2'd1) && clock_live && rst_b && !zeroize;
-  wire mem_read  = (mem_phase == 2'd0) && clock_live && rst_b && !zeroize;
-  wire mem_write = (mem_phase == 2'd2) && clock_live && rst_b && !zeroize;
-  always_ff @(posedge clk or negedge rst_b) begin
-    if (!rst_b)       mem_phase <= 2'd0;
-    else if (zeroize) mem_phase <= 2'd0;
-    else              mem_phase <= (mem_phase == 2'd2) ? 2'd0 : mem_phase + 2'd1;
-  end
+  // Engine step: the core, the walker and the working arrays advance together
+  // on every clock the arrays accept. An array stalls a step when its write
+  // buffer cannot take a write that collides with the step's read
+  // (fhe_ilv_bank); the requests are core and walker registers, so the stall
+  // settles before the clock-gate latch opens.
+  wire core_step = clock_live && rst_b && !zeroize && !fhe_aloha_mem.eng_stall;
   // Low-phase latch is the standard glitch-free clock-gate pattern. The core,
   // including the sampler, runs on core_clk; AHB and the stream stay ungated.
   wire core_clk;
@@ -187,9 +183,7 @@ module fhe_top
   always_latch if (!clk) core_clock_enable <= core_step;
   assign core_clk = clk & core_clock_enable;
 `endif
-  assign fhe_aloha_mem.phase_read    = mem_read;
-  assign fhe_aloha_mem.phase_execute = core_step;
-  assign fhe_aloha_mem.phase_write   = mem_write;
+  assign fhe_aloha_mem.eng_step = core_step;
 
   // VeeR firmware copies its table into the CROM (docs/fhe/19). Lanes 0-2 of a
   // word are staged; the lane-3 store writes the whole word. Stores are taken

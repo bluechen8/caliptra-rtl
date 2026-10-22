@@ -80,9 +80,10 @@
   input  ``_sig``_addra, ``_sig``_wea, ``_sig``_wa, ``_sig``_wd, output ``_sig``_douta
 
 interface fhe_aloha_mem_if;
-  // Three physical clock edges per logical ComputeCore edge. Requests are
-  // sampled in READ, the core advances in EXECUTE, saved writes retire in WRITE.
-  logic phase_read, phase_execute, phase_write;
+  // eng_step: the core takes its step this clock; the working arrays sample
+  // the step's requests on it. eng_stall: an array cannot take this step
+  // (fhe_ilv_bank), so the core holds for a clock.
+  logic eng_step, eng_stall;
 
   logic [7:0] ntt_msg0_mask, ntt_msg1_mask;
   logic sk_en, sk_we;
@@ -115,7 +116,7 @@ interface fhe_aloha_mem_if;
   `ALOHA_MEM_ROM_SIG(128, `FHE_CROM_AW, crom)
 
   modport req (
-    output phase_read, phase_execute, phase_write,
+    output eng_step, input eng_stall,
     output ntt_msg0_mask, ntt_msg1_mask,
     output sk_en, sk_we, sk_addr, sk_wdata, input sk_rdata,
     `ALOHA_MEM_SDP_REQ(ntt_msg0),
@@ -137,7 +138,7 @@ interface fhe_aloha_mem_if;
   );
 
   modport resp (
-    input phase_read, phase_execute, phase_write,
+    input eng_step, output eng_stall,
     input ntt_msg0_mask, ntt_msg1_mask,
     input sk_en, sk_we, sk_addr, sk_wdata, output sk_rdata,
     `ALOHA_MEM_SDP_RESP(ntt_msg0),
