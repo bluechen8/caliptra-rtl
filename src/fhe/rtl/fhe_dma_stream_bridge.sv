@@ -117,9 +117,7 @@ module fhe_dma_stream_bridge
   wire xfer_live = (state == B_XFER) && !abort_q;
   assign rd_valid = xfer_live && !dir_out && (faked || ibuf_full);
   assign rd_data  = faked ? 64'd0 : ibuf;
-  // The walker pushes the cycle after it sees wr_ready, so the buffer also
-  // counts as free while its last beat leaves.
-  assign wr_ready = xfer_live && dir_out && (faked || !obuf_full || (out_push && half_out));
+  assign wr_ready = xfer_live && dir_out && (faked || !obuf_full);
 
   // DMA side
   wire dma_seg   = (state == B_XFER) && !faked;
@@ -205,15 +203,14 @@ module fhe_dma_stream_bridge
             ibuf_full <= 1'b0;
             left <= left - 1'b1;
           end
-          // outbound: split the buffered word into two beats; a walker word
-          // taken in the cycle the last beat leaves refills the buffer
-          if (out_push) begin
-            beats_out <= beats_out - 1'b1;
-            if (half_out) obuf_full <= 1'b0;
-          end
+          // outbound: take a walker word, split into two beats
           if (wr_valid && wr_ready) begin
             if (!faked) begin obuf <= wr_data; obuf_full <= 1'b1; end
             left <= left - 1'b1;
+          end
+          if (out_push) begin
+            beats_out <= beats_out - 1'b1;
+            if (half_out) obuf_full <= 1'b0;
           end
           if (hw_resp.done || hw_resp.error) dma_fin <= 1'b1;
           if (hw_resp.error) xfer_error <= 1'b1;

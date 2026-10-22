@@ -137,10 +137,10 @@ module tb_ckks_roundtrip;
   longint      dram_src [0:3][0:2*N];
   longint      dram_cap [0:3][0:2*N];
   wire  [63:0] w_din = dram_src[w_sel][w_idx];
-  logic [2:0]  w_sel_d; logic [LOGN:0] w_idx_d;
+  // The dout strobe is valid in the step that hands the word over, with
+  // ext_sel/ext_idx naming that word.
   always @(posedge clk) begin
-    w_sel_d <= w_sel; w_idx_d <= w_idx;           // align with the 1-cycle-late dout strobe
-    if (walker_mode && w_dout_we) dram_cap[w_sel_d][w_idx_d] <= w_dout;
+    if (walker_mode && w_dout_we) dram_cap[w_sel][w_idx] <= w_dout;
   end
 
   // core control mux

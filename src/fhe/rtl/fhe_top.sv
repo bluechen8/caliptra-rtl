@@ -474,7 +474,7 @@ module fhe_top
   logic [3:0]   active_key_limb;
   logic         exe_hold, exe_held;
 
-  fhe_microseq #(.SRAM_REUSE(1), .STREAM(1), .LOGN(FHE_LOGN), .N(FHE_N)) walker (
+  fhe_microseq #(.SRAM_REUSE(1), .LOGN(FHE_LOGN), .N(FHE_N)) walker (
     .step(core_step),
     .active_limb(active_key_limb),
     .sk_en(fhe_aloha_mem.sk_en), .sk_we(fhe_aloha_mem.sk_we),

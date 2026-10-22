@@ -35,7 +35,6 @@ module fhe_microseq
   import fhe_params_pkg::*;
 #(
   parameter bit SRAM_REUSE = 0, // legacy standalone trace/core driver keeps copies
-  parameter bit STREAM = 0,     // 1: send64/receive64 move one word per step (fhe_top)
   parameter int LOGN = 13,
   parameter int N    = 1 << LOGN
 )(
@@ -397,15 +396,20 @@ module fhe_microseq
   logic [63:0]   wdata;          // data being written this word
   logic [2:0]    rd_wait;
 
-  // Streamed receive64 (STREAM): one read address per step, retired RD_LAT
-  // steps later (address register, bank read, output register). Retired words
-  // wait in rdq while the bridge is not ready; a read issues only when its
-  // word already has a slot, so nothing in flight is ever dropped.
+  // receive64 streams: one read address per step, retired RD_LAT steps later
+  // (address register, bank read, output register). Retired words wait in rdq
+  // while the bridge is not ready; a read issues only when its word already
+  // has a slot, so nothing in flight is ever dropped.
   localparam int RD_LAT = 3;
   logic [LOGN:0]     rd_iss;       // next word index to issue
   logic [RD_LAT-1:0] rd_pipe;      // rd_pipe[k]: a read issued k+1 steps ago
   logic [63:0]       rdq [0:RD_LAT-1];
   logic [1:0]        rdq_n;
+  // DMA_OUT push, like dma_rd_pop: valid in the step that hands the word over
+  // (the queue head, or the word retiring now), so ready and valid meet on one edge.
+  wire rd_retire = rd_pipe[RD_LAT-1];
+  wire rd_push   = step && (st == S_RD) && !cur_sk && ((rdq_n != 0) || rd_retire) && dma_wr_ready;
+  assign ext_dout_we = rd_push;
 
   // INS build (current LDINS)
   logic [63:0]   ins_patched;    // template word with patch applied
@@ -496,11 +500,17 @@ module fhe_microseq
   localparam int INS_BUFFER_SIZE = 16;
 
   // control_low constructor (matches send64/receive64 packing)
+  // bank word address: off reads the upper N of a 2N-word bank
+  function automatic logic [LOGN:0] bank_addr(input logic off, input logic [LOGN:0] idx);
+    bank_addr = off ? ((LOGN+1)'(N) + idx) : idx;
+  endfunction
+
   function automatic logic [31:0] mk_ctrl(input logic [3:0] bank, input logic grant, input logic ins_flag, input logic wea, input logic [LOGN:0] addr);
     mk_ctrl = (32'(bank[2:0]) << 29) | (32'(grant) << FHE_CW_GRANT) | (32'(ins_flag) << FHE_CW_INS) | (32'(wea) << FHE_CW_WEA) | 32'(addr);
   endfunction
 
   wire [63:0] dout = {dout_high, dout_low};
+  assign ext_dout = (rdq_n != 0) ? rdq[0] : dout;  // DMA_OUT word for rd_push
 
   // write-data source for the current send64 word
   function automatic logic [63:0] cur_wr_data();
@@ -529,7 +539,7 @@ module fhe_microseq
       control_low_word <= 32'd0; control_high_word <= 32'd1; // hold reset
       dina_low <= 32'd0; dina_high <= 32'd0;
       busy <= 1'b0; done <= 1'b0; error <= 1'b0;
-      ext_dout_we <= 1'b0; ext_dout <= 64'd0; cur_sk <= 1'b0;
+      cur_sk <= 1'b0;
       limb_active <= 1'b0; limb_idx <= 4'd0; limb_cnt <= 4'd1;
       widx <= '0; wn <= '0; rd_wait <= 3'd0;
       rd_iss <= '0; rd_pipe <= '0; rdq_n <= '0;
@@ -537,10 +547,10 @@ module fhe_microseq
     end else if (zeroize) begin
       st <= S_IDLE; busy <= 1'b0; done <= 1'b0; error <= 1'b0;
       control_low_word <= 32'd0; control_high_word <= 32'd1;
-      ext_dout_we <= 1'b0; limb_active <= 1'b0;
+      limb_active <= 1'b0;
       reseed_en <= 1'b0;
     end else if (step) begin
-      done <= 1'b0; ext_dout_we <= 1'b0;
+      done <= 1'b0;
       unique case (st)
         // -------------------------------------------------------------
         S_IDLE: begin
@@ -637,8 +647,7 @@ module fhe_microseq
               cur_off  <= f_off(op_w);
               widx <= '0; wn <= (LOGN+1)'(N); rd_wait <= 3'd0;
               rd_iss <= '0; rd_pipe <= '0; rdq_n <= '0;
-              control_low_word <= mk_ctrl(f_bank(op_w), 1'b1, 1'b0, 1'b0,
-                                          f_off(op_w) ? (LOGN+1)'(N) : '0);
+              control_low_word <= mk_ctrl(f_bank(op_w), 1'b1, 1'b0, 1'b0, bank_addr(f_off(op_w), '0));
               desc_wr_r <= 1'b1; desc_ptr_r <= f_ptr(op_w); desc_limb_r <= limb_idx;
               st <= S_DMA_REQ;          // kick the DMA write, then drain the core into it
             end
@@ -687,9 +696,9 @@ module fhe_microseq
             dina_low  <= wdata[31:0];
             dina_high <= wdata[63:32];
             control_low_word <= mk_ctrl(cur_bank, !cur_ins, cur_ins, 1'b1, widx);
-            // Streamed: keep wea up and write the next word on the next step;
-            // S_WR_LO only closes the last word.
-            if (STREAM && !cur_sk && (widx != wn - 1)) widx <= widx + 1'b1;
+            // Keep wea up and write the next word on the next step; S_WR_LO
+            // closes the last word (and paces SK-load words).
+            if (!cur_sk && (widx != wn - 1)) widx <= widx + 1'b1;
             else st <= S_WR_LO;
           end
         end
@@ -706,51 +715,40 @@ module fhe_microseq
           end
         end
         // ------------ receive64 word loop (DMA_OUT) -------------------
-        S_RD: if (STREAM && !cur_sk) begin
-          automatic logic        retire = rd_pipe[RD_LAT-1];   // dout holds a word this step
-          automatic logic        push   = ((rdq_n != 0) || retire) && dma_wr_ready;
-          automatic logic [1:0]  n_next = rdq_n + retire - push;
-          automatic logic        issue  = (rd_iss != wn) &&
-                                          (int'(n_next) + $countones(rd_pipe[RD_LAT-2:0]) < RD_LAT);
-          if (push) begin
-            ext_dout    <= (rdq_n != 0) ? rdq[0] : dout;       // oldest first; else bypass
-            ext_dout_we <= 1'b1;
-            widx        <= widx + 1'b1;
-          end
-          if (push && (rdq_n != 0)) begin
+        S_RD: if (!cur_sk) begin
+          // Retire the word read RD_LAT steps ago (pushed now, see rd_push, or
+          // queued), and issue the next address while every read not yet
+          // pushed fits in the queue.
+          automatic logic bypass = rd_push && (rdq_n == 0);  // retired word goes straight out
+          automatic logic issue  = (rd_iss != wn) && (rd_iss - widx - rd_push < RD_LAT);
+          if (rd_push) widx <= widx + 1'b1;
+          if (rd_push && !bypass) begin
             for (int i = 0; i < RD_LAT - 1; i++) rdq[i] <= rdq[i+1];
           end
-          if (retire && !(push && (rdq_n == 0))) rdq[rdq_n - push] <= dout;
-          rdq_n   <= n_next;
+          if (rd_retire && !bypass) rdq[rdq_n - rd_push] <= dout;
+          rdq_n   <= rdq_n + rd_retire - rd_push;
           rd_pipe <= {rd_pipe[RD_LAT-2:0], issue};
           if (issue) begin
-            control_low_word <= mk_ctrl(cur_bank, 1'b1, 1'b0, 1'b0,
-                                        cur_off ? ((LOGN+1)'(N) + rd_iss) : rd_iss);
+            control_low_word <= mk_ctrl(cur_bank, 1'b1, 1'b0, 1'b0, bank_addr(cur_off, rd_iss));
             rd_iss <= rd_iss + 1'b1;
           end
-          if (push && (widx == wn - 1)) begin
+          if (rd_push && (widx == wn - 1)) begin
             control_low_word <= 32'd0;
             pc <= pc + 8'd1;
             st <= S_FETCH;
           end
         end else begin
+          // SK-store: sk_we writes the word at rd_wait 2, one word per three steps.
           if (rd_wait < 3'd2) begin
             rd_wait <= rd_wait + 1'b1;
-          end else if (!cur_sk && !dma_wr_ready) begin
-            // DMA_OUT write stall: the DMA FIFO is full; hold this beat (rd_wait
-            // stays at 2, core read address held) until it can accept the word.
+          end else if (widx == wn - 1) begin
+            control_low_word <= 32'd0;
+            pc <= pc + 8'd1;
+            st <= S_FETCH;
           end else begin
-            if (!cur_sk) begin ext_dout <= dout; ext_dout_we <= 1'b1; end // DMA_OUT push
-            if (widx == wn - 1) begin
-              control_low_word <= 32'd0;
-              pc <= pc + 8'd1;
-              st <= S_FETCH;
-            end else begin
-              widx <= widx + 1'b1;
-              rd_wait <= 3'd0;
-              control_low_word <= mk_ctrl(cur_bank, 1'b1, 1'b0, 1'b0,
-                                          cur_off ? ((LOGN+1)'(N) + widx + 1'b1) : (widx + 1'b1));
-            end
+            widx <= widx + 1'b1;
+            rd_wait <= 3'd0;
+            control_low_word <= mk_ctrl(cur_bank, 1'b1, 1'b0, 1'b0, bank_addr(cur_off, widx + 1'b1));
           end
         end
         // ------------ exe_ins control dance --------------------------
@@ -794,7 +792,7 @@ module fhe_microseq
       endcase
     end else begin
       // Bus-facing event pulses must not stretch across held engine cycles.
-      done <= 1'b0; ext_dout_we <= 1'b0;
+      done <= 1'b0;
     end
   end
 
