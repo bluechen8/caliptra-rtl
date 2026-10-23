@@ -1019,7 +1019,7 @@ module fhe_top_dma_tb
 
     // (1) Commit barrier: an early INPUT_COMMIT is ignored; in COMMIT_WAIT the
     //     walker waits before its first arithmetic pass (ENCRYPT program word
-    //     2, the FFT EXE) and writes nothing; the commit releases it, and the
+    //     1, the FFT EXE) and writes nothing; the commit releases it, and the
     //     result decrypts correctly.
     mark_ct();
     issue_cmd(FHE_ENCRYPT, base);
@@ -1027,7 +1027,7 @@ module fhe_top_dma_tb
     wait_notif(base, "ENCRYPT to COMMIT_WAIT");
     repeat (500) @(negedge clk);
     ahb_read(A_STATUS, d);
-    if (!d[ST_COMMIT_WAIT] || d[ST_VALID] || !d[ST_DMA_LEASED] || dut.br_active || dut.walker.pc != 8'd18 ||
+    if (!d[ST_COMMIT_WAIT] || d[ST_VALID] || !d[ST_DMA_LEASED] || dut.br_active || dut.walker.pc != 8'd17 ||
         !ct_untouched()) begin
       $display("FAIL: commit barrier (STATUS 0x%08h, active %0d, pc %0d, ciphertext untouched %0d)", d,
                dut.br_active, dut.walker.pc, ct_untouched()); errors++;

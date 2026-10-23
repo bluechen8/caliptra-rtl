@@ -86,11 +86,11 @@ module tb_fhe_microseq;
     {dout_high,dout_low} = f_data(cl_bram, cl_addr);
   end
   // status[0]: the loaded pass is done, a fixed latency after cmd_load,
-  // until the walker resets the core (control_high_word[0]).
+  // until the command drops to 0 (or the core is reset).
   int start_cnt;
   always_ff @(posedge clk or negedge rst_b) begin
     if (!rst_b) begin status<=32'd0; start_cnt<=0; end
-    else if (control_high_word[0]) begin status<=32'd0; start_cnt<=0; end
+    else if (control_high_word[0] || core_cmd == 40'd0) begin status<=32'd0; start_cnt<=0; end
     else if (cmd_load) start_cnt <= 1;
     else if (start_cnt != 0) begin
       if (start_cnt < 4) start_cnt <= start_cnt+1;

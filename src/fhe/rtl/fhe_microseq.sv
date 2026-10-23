@@ -19,9 +19,11 @@
 //   sequence of Aloha-HE ComputeCore engine passes that implements it. Data
 //   moves over the ComputeCoreWrapper debug-IO pins (control_low_word /
 //   control_high_word / dina_ext / status / dout_ext) as send64 / receive64;
-//   each pass's 40-bit command is built from a template (LDINS) and held in
-//   core_cmd for the pass (EXE), which ComputeCore decodes directly, so the
-//   wrapper's ISA_control, INS_RAM and the core's command register are not used.
+//   each EXE op is one pass: its 40-bit command, built from a template, is held
+//   on core_cmd until the pass is done, and ComputeCore decodes it directly, so
+//   the wrapper's ISA_control, INS_RAM and the core's command register are not
+//   used. core_cmd is 0 between passes, which holds every unit in reset; the
+//   core reset itself is held only while the walker is idle.
 //
 //   Macro-op word + ROM layout: see microsequencer doc section 5.1/5.2.
 //
@@ -68,8 +70,8 @@ module fhe_microseq
   input  logic [31:0] dout_low,
   input  logic [31:0] dout_high,
   input  logic [31:0] status,         // [0] = the loaded pass is done
-  // ComputeCore's command (ComputeCoreWrapper EXT_COMMAND=1): LDINS builds it,
-  // EXE presents it for the whole pass; 0 between passes, so its rise is the start.
+  // ComputeCore's command (ComputeCoreWrapper EXT_COMMAND=1): EXE presents it
+  // for the whole pass; 0 between passes, so its rise is the start.
   output logic [39:0] core_cmd,
 
   // ----- external poly data (TB/DMA stub in 2a) -----
@@ -115,7 +117,7 @@ module fhe_microseq
   // Macro-op encoding (FROZEN -- doc section 5.1)
   // =====================================================================
   localparam logic [3:0] OP_NOP=4'd0, OP_DMA_IN=4'd1, OP_DMA_OUT=4'd2,
-                         OP_CONST=4'd3, OP_LDINS=4'd4, OP_EXE=4'd5,
+                         OP_CONST=4'd3, OP_EXE=4'd5,
                          OP_MOVE=4'd6, OP_LIMB=4'd7, OP_DONE=4'd8;
 
   // BANK ids (mirror Aloha bram_sel; SK=8 is new in B'/C')
@@ -138,7 +140,7 @@ module fhe_microseq
 
   // =====================================================================
   // Command templates: ComputeCore's 40-bit command, pre-patch. doc section 5.2.
-  //   The per-limb (neg_qm,modsel,k)+scale patch is applied by LDINS below.
+  //   The per-limb (neg_qm,modsel,k)+scale patch is applied at EXE decode.
   // =====================================================================
 
   // base template words (opcode + fixed flags only)
@@ -191,12 +193,12 @@ module fhe_microseq
   function automatic logic [27:0] pl_const(input logic [3:0] bank, input logic [1:0] cid);
     pl_const = {bank, cid, 22'd0};
   endfunction
-  // LDINS : template[27:20] reserved[19:16]=0 patch[15] scalesel[14:13]
-  function automatic logic [27:0] pl_ldins(input logic [7:0] tmpl, input logic patch, input logic [1:0] sc);
-    pl_ldins = {tmpl, 4'd0, patch, sc, 13'd0};
+  // EXE : one engine pass. template[27:20] reserved[19:16]=0 patch[15] scalesel[14:13]
+  //       paramsel[12:11] r2[10] (dina = R^2 mod q of the active limb during the pass)
+  function automatic logic [27:0] pl_exe(input logic [7:0] tmpl, input logic patch, input logic [1:0] sc,
+                                         input logic [1:0] ps, input logic r2 = 1'b0);
+    pl_exe = {tmpl, 4'd0, patch, sc, ps, r2, 10'd0};
   endfunction
-  // EXE : paramsel[27:26] r2[25] (dina = R^2 mod q of the active limb during the pass)
-  function automatic logic [27:0] pl_exe(input logic [1:0] ps, input logic r2 = 1'b0); pl_exe = {ps, r2, 25'd0}; endfunction
   // MOVE : srcbank[27:24] dstbank[23:20] srcstr[19] dststr[18]
   function automatic logic [27:0] pl_move(input logic [3:0] sb, input logic [3:0] db, input logic ss, input logic ds);
     pl_move = {sb, db, ss, ds, 18'd0};
@@ -216,8 +218,8 @@ module fhe_microseq
   function automatic logic [7:0]  f_tmpl(input logic [31:0] w); f_tmpl = w[27:20]; endfunction
   function automatic logic        f_pat (input logic [31:0] w); f_pat  = w[15];    endfunction
   function automatic logic [1:0]  f_sc  (input logic [31:0] w); f_sc   = w[14:13]; endfunction
-  function automatic logic [1:0]  f_ps  (input logic [31:0] w); f_ps   = w[27:26]; endfunction
-  function automatic logic        f_r2  (input logic [31:0] w); f_r2   = w[25];    endfunction
+  function automatic logic [1:0]  f_ps  (input logic [31:0] w); f_ps   = w[12:11]; endfunction
+  function automatic logic        f_r2  (input logic [31:0] w); f_r2   = w[10];    endfunction
   function automatic logic [3:0]  f_sb  (input logic [31:0] w); f_sb   = w[27:24]; endfunction
   function automatic logic [3:0]  f_db  (input logic [31:0] w); f_db   = w[23:20]; endfunction
   function automatic logic        f_ss  (input logic [31:0] w); f_ss   = w[19];    endfunction
@@ -242,16 +244,12 @@ module fhe_microseq
   function automatic logic [31:0] kg_reuse_rom(input logic [7:0] a);
     kg_reuse_rom = mk(OP_NOP, 28'd0);
     case (a)
-      KG_ENTRY+0: kg_reuse_rom = mk(OP_LDINS, pl_ldins(T_SAMPLE[7:0], 1'b0, SC_NONE));
-      KG_ENTRY+1: kg_reuse_rom = mk(OP_EXE,   pl_exe(PS_KG));
-      KG_ENTRY+2: kg_reuse_rom = mk(OP_LIMB,  pl_limb(8'd6));         // body = next 6 words
-      KG_ENTRY+3: kg_reuse_rom = mk(OP_LDINS, pl_ldins(T_RNS[7:0], 1'b1, SC_RNSKG));
-      KG_ENTRY+4: kg_reuse_rom = mk(OP_EXE,   pl_exe(PS_ZERO));
-      KG_ENTRY+5: kg_reuse_rom = mk(OP_LDINS, pl_ldins(T_NTTFWD[7:0], 1'b1, SC_NONE));
-      KG_ENTRY+6: kg_reuse_rom = mk(OP_EXE,   pl_exe(PS_ZERO));
-      KG_ENTRY+7: kg_reuse_rom = mk(OP_LDINS, pl_ldins(T_PWMKG[7:0], 1'b1, SC_NONE));
-      KG_ENTRY+8: kg_reuse_rom = mk(OP_EXE,   pl_exe(PS_ZERO, 1'b1)); // dina = R^2 mod q_limb
-      KG_ENTRY+9: kg_reuse_rom = mk(OP_DONE,  pl_done(1'b0));
+      KG_ENTRY+0:   kg_reuse_rom = mk(OP_EXE, pl_exe(T_SAMPLE[7:0], 1'b0, SC_NONE, PS_KG));
+      KG_ENTRY+1:   kg_reuse_rom = mk(OP_LIMB, pl_limb(8'd3));         // body = next 3 words
+      KG_ENTRY+2:   kg_reuse_rom = mk(OP_EXE, pl_exe(T_RNS[7:0], 1'b1, SC_RNSKG, PS_ZERO));
+      KG_ENTRY+3:   kg_reuse_rom = mk(OP_EXE, pl_exe(T_NTTFWD[7:0], 1'b1, SC_NONE, PS_ZERO));
+      KG_ENTRY+4:   kg_reuse_rom = mk(OP_EXE, pl_exe(T_PWMKG[7:0], 1'b1, SC_NONE, PS_ZERO, 1'b1)); // dina = R^2 mod q_limb
+      KG_ENTRY+5:   kg_reuse_rom = mk(OP_DONE,  pl_done(1'b0));
       default: ;
     endcase
   endfunction
@@ -266,89 +264,67 @@ module fhe_microseq
       // The sampler only runs inside a transform pass here (sample-only needs
       // shared storage), so this sequence keeps the FFT over zeroed FFT_EXP and
       // the CONST fills; its pin trace is what tb_fhe_microseq checks.
-      KG_ENTRY+0:  prog_rom = mk(OP_CONST, pl_const(B_FFTEXP, C_ZEROS));
-      KG_ENTRY+1:  prog_rom = mk(OP_LDINS, pl_ldins(T_FFTDIF[7:0], 1'b0, SC_NONE));
-      KG_ENTRY+2:  prog_rom = mk(OP_EXE,   pl_exe(PS_KG));
-      KG_ENTRY+3:  prog_rom = mk(OP_LIMB,  pl_limb(8'd9));        // body = next 9 words
-      KG_ENTRY+4:  prog_rom = mk(OP_LDINS, pl_ldins(T_RNS[7:0], 1'b1, SC_RNSKG));
-      KG_ENTRY+5:  prog_rom = mk(OP_EXE,   pl_exe(PS_ZERO));
-      KG_ENTRY+6:  prog_rom = mk(OP_LDINS, pl_ldins(T_NTTFWD[7:0], 1'b1, SC_NONE));
-      KG_ENTRY+7:  prog_rom = mk(OP_EXE,   pl_exe(PS_ZERO));
-      KG_ENTRY+8:  prog_rom = mk(OP_CONST, pl_const(B_NTTKEY, C_R2));
-      KG_ENTRY+9:  prog_rom = mk(OP_CONST, pl_const(B_NTTMSG, C_ZEROS));
-      KG_ENTRY+10: prog_rom = mk(OP_LDINS, pl_ldins(T_PWMDEC[7:0], 1'b1, SC_NONE));
-      KG_ENTRY+11: prog_rom = mk(OP_EXE,   pl_exe(PS_ZERO));
-      KG_ENTRY+12: prog_rom = mk(OP_MOVE,  pl_move(B_NTTMSG, B_SK, 1'b0, 1'b1));
-      KG_ENTRY+13: prog_rom = mk(OP_DONE,  pl_done(1'b0));
+      KG_ENTRY+0:   prog_rom = mk(OP_CONST, pl_const(B_FFTEXP, C_ZEROS));
+      KG_ENTRY+1:   prog_rom = mk(OP_EXE, pl_exe(T_FFTDIF[7:0], 1'b0, SC_NONE, PS_KG));
+      KG_ENTRY+2:   prog_rom = mk(OP_LIMB, pl_limb(8'd6));        // body = next 6 words
+      KG_ENTRY+3:   prog_rom = mk(OP_EXE, pl_exe(T_RNS[7:0], 1'b1, SC_RNSKG, PS_ZERO));
+      KG_ENTRY+4:   prog_rom = mk(OP_EXE, pl_exe(T_NTTFWD[7:0], 1'b1, SC_NONE, PS_ZERO));
+      KG_ENTRY+5:   prog_rom = mk(OP_CONST, pl_const(B_NTTKEY, C_R2));
+      KG_ENTRY+6:   prog_rom = mk(OP_CONST, pl_const(B_NTTMSG, C_ZEROS));
+      KG_ENTRY+7:   prog_rom = mk(OP_EXE, pl_exe(T_PWMDEC[7:0], 1'b1, SC_NONE, PS_ZERO));
+      KG_ENTRY+8:   prog_rom = mk(OP_MOVE,  pl_move(B_NTTMSG, B_SK, 1'b0, 1'b1));
+      KG_ENTRY+9:   prog_rom = mk(OP_DONE,  pl_done(1'b0));
 
       // ---------- ENCRYPT (entry 16) ----------
       ENC_ENTRY+0:  prog_rom = mk(OP_DMA_IN, pl_dma(B_FFTEXP, 3'd0, 1'b0, 2'd0, 1'b0)); // PTR0=msg
-      ENC_ENTRY+1:  prog_rom = mk(OP_LDINS,  pl_ldins(T_FFTDIF[7:0], 1'b0, SC_NONE));
-      ENC_ENTRY+2:  prog_rom = mk(OP_EXE,    pl_exe(PS_ERR));
-      ENC_ENTRY+3:  prog_rom = mk(OP_LIMB,   pl_limb(8'd9));
-      ENC_ENTRY+4:  prog_rom = mk(OP_LDINS,  pl_ldins(T_RNS[7:0], 1'b1, SC_RNSENC));
-      ENC_ENTRY+5:  prog_rom = mk(OP_EXE,    pl_exe(PS_ZERO));
-      ENC_ENTRY+6:  prog_rom = mk(OP_LDINS,  pl_ldins(T_NTTFWD[7:0], 1'b1, SC_NONE));
-      ENC_ENTRY+7:  prog_rom = mk(OP_EXE,    pl_exe(PS_A));
-      ENC_ENTRY+8:  prog_rom = SRAM_REUSE ? mk(OP_NOP, 28'd0) : mk(OP_MOVE,   pl_move(B_SK, B_NTTV, 1'b1, 1'b0));
-      ENC_ENTRY+9:  prog_rom = mk(OP_LDINS,  pl_ldins(T_PWMENC[7:0], 1'b1, SC_NONE));
-      ENC_ENTRY+10: prog_rom = mk(OP_EXE,    pl_exe(PS_ZERO));
-      ENC_ENTRY+11: prog_rom = mk(OP_DMA_OUT,pl_dma(B_NTTMSG, 3'd2, 1'b1, 2'd0, 1'b0)); // c0->PTR2
-      ENC_ENTRY+12: prog_rom = mk(OP_DMA_OUT,pl_dma(B_NTTKEY, 3'd3, 1'b1, 2'd0, 1'b0)); // c1->PTR3
-      ENC_ENTRY+13: prog_rom = mk(OP_DONE,   pl_done(1'b0));
+      ENC_ENTRY+1:  prog_rom = mk(OP_EXE, pl_exe(T_FFTDIF[7:0], 1'b0, SC_NONE, PS_ERR));
+      ENC_ENTRY+2:  prog_rom = mk(OP_LIMB, pl_limb(8'd6));
+      ENC_ENTRY+3:  prog_rom = mk(OP_EXE, pl_exe(T_RNS[7:0], 1'b1, SC_RNSENC, PS_ZERO));
+      ENC_ENTRY+4:  prog_rom = mk(OP_EXE, pl_exe(T_NTTFWD[7:0], 1'b1, SC_NONE, PS_A));
+      ENC_ENTRY+5:  prog_rom = SRAM_REUSE ? mk(OP_NOP, 28'd0) : mk(OP_MOVE,   pl_move(B_SK, B_NTTV, 1'b1, 1'b0));
+      ENC_ENTRY+6:  prog_rom = mk(OP_EXE, pl_exe(T_PWMENC[7:0], 1'b1, SC_NONE, PS_ZERO));
+      ENC_ENTRY+7:  prog_rom = mk(OP_DMA_OUT,pl_dma(B_NTTMSG, 3'd2, 1'b1, 2'd0, 1'b0)); // c0->PTR2
+      ENC_ENTRY+8:  prog_rom = mk(OP_DMA_OUT,pl_dma(B_NTTKEY, 3'd3, 1'b1, 2'd0, 1'b0)); // c1->PTR3
+      ENC_ENTRY+9:  prog_rom = mk(OP_DONE,   pl_done(1'b0));
 
       // ---------- DECRYPT (entry 32, L=1) ----------
       DEC_ENTRY+0:  prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTMSG, 3'd0, 1'b0, 2'd0, 1'b0)); // c0<-PTR0
       DEC_ENTRY+1:  prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTKEY, 3'd1, 1'b0, 2'd0, 1'b0)); // c1<-PTR1
       DEC_ENTRY+2:  prog_rom = SRAM_REUSE ? mk(OP_NOP, 28'd0) : mk(OP_MOVE,   pl_move(B_SK, B_NTTV, 1'b0, 1'b0));
-      DEC_ENTRY+3:  prog_rom = mk(OP_LDINS,  pl_ldins(T_PWMDEC[7:0], 1'b1, SC_NONE));
-      DEC_ENTRY+4:  prog_rom = mk(OP_EXE,    pl_exe(PS_ZERO));
-      DEC_ENTRY+5:  prog_rom = mk(OP_LDINS,  pl_ldins(T_NTTINV[7:0], 1'b1, SC_NONE));
-      DEC_ENTRY+6:  prog_rom = mk(OP_EXE,    pl_exe(PS_ZERO));
-      DEC_ENTRY+7:  prog_rom = mk(OP_LDINS,  pl_ldins(T_I2F[7:0], 1'b1, SC_I2F));
-      DEC_ENTRY+8:  prog_rom = mk(OP_EXE,    pl_exe(PS_ZERO));
-      DEC_ENTRY+9:  prog_rom = mk(OP_LDINS,  pl_ldins(T_FFTDIT[7:0], 1'b0, SC_NONE));
-      DEC_ENTRY+10: prog_rom = mk(OP_EXE,    pl_exe(PS_ZERO));
-      DEC_ENTRY+11: prog_rom = mk(OP_LDINS,  pl_ldins(T_PROJ[7:0], 1'b0, SC_NONE));
-      DEC_ENTRY+12: prog_rom = mk(OP_EXE,    pl_exe(PS_ZERO));
-      DEC_ENTRY+13: prog_rom = mk(OP_DMA_OUT,pl_dma(B_FFT, 3'd2, 1'b0, 2'd0, 1'b1));    // out<-upper N of 2N
-      DEC_ENTRY+14: prog_rom = mk(OP_DONE,   pl_done(1'b0));
+      DEC_ENTRY+3:  prog_rom = mk(OP_EXE, pl_exe(T_PWMDEC[7:0], 1'b1, SC_NONE, PS_ZERO));
+      DEC_ENTRY+4:  prog_rom = mk(OP_EXE, pl_exe(T_NTTINV[7:0], 1'b1, SC_NONE, PS_ZERO));
+      DEC_ENTRY+5:  prog_rom = mk(OP_EXE, pl_exe(T_I2F[7:0], 1'b1, SC_I2F, PS_ZERO));
+      DEC_ENTRY+6:  prog_rom = mk(OP_EXE, pl_exe(T_FFTDIT[7:0], 1'b0, SC_NONE, PS_ZERO));
+      DEC_ENTRY+7:  prog_rom = mk(OP_EXE, pl_exe(T_PROJ[7:0], 1'b0, SC_NONE, PS_ZERO));
+      DEC_ENTRY+8:  prog_rom = mk(OP_DMA_OUT,pl_dma(B_FFT, 3'd2, 1'b0, 2'd0, 1'b1));    // out<-upper N of 2N
+      DEC_ENTRY+9:  prog_rom = mk(OP_DONE,   pl_done(1'b0));
 `ifdef FHE_RECOVER_CMD  // FHE_RECOVER_EN; the dispatch below refuses RECOVER otherwise
       // Coefficient recovery: each limb stays in the modular datapath.
       // PTR0/PTR1 input and PTR2 output are limb-major, N u64 words per limb.
-      REC_ENTRY+0: prog_rom = mk(OP_LIMB, pl_limb(8'd8));
-      REC_ENTRY+1: prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTMSG, 3'd0, 1'b1, 2'd0, 1'b0));
-      REC_ENTRY+2: prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTKEY, 3'd1, 1'b1, 2'd0, 1'b0));
-      REC_ENTRY+3: prog_rom = SRAM_REUSE ? mk(OP_NOP, 28'd0) : mk(OP_MOVE, pl_move(B_SK, B_NTTV, 1'b1, 1'b0));
-      REC_ENTRY+4: prog_rom = mk(OP_LDINS, pl_ldins(T_PWMDEC[7:0], 1'b1, SC_NONE));
-      REC_ENTRY+5: prog_rom = mk(OP_EXE, pl_exe(PS_ZERO));
-      REC_ENTRY+6: prog_rom = mk(OP_LDINS, pl_ldins(T_NTTINV[7:0], 1'b1, SC_NONE));
-      REC_ENTRY+7: prog_rom = mk(OP_EXE, pl_exe(PS_ZERO));
-      REC_ENTRY+8: prog_rom = mk(OP_DMA_OUT, pl_dma(B_NTTMSG, 3'd2, 1'b1, 2'd0, 1'b0));
-      REC_ENTRY+9: prog_rom = mk(OP_DONE, pl_done(1'b0));
+      REC_ENTRY+0:  prog_rom = mk(OP_LIMB, pl_limb(8'd6));
+      REC_ENTRY+1:  prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTMSG, 3'd0, 1'b1, 2'd0, 1'b0));
+      REC_ENTRY+2:  prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTKEY, 3'd1, 1'b1, 2'd0, 1'b0));
+      REC_ENTRY+3:  prog_rom = SRAM_REUSE ? mk(OP_NOP, 28'd0) : mk(OP_MOVE, pl_move(B_SK, B_NTTV, 1'b1, 1'b0));
+      REC_ENTRY+4:  prog_rom = mk(OP_EXE, pl_exe(T_PWMDEC[7:0], 1'b1, SC_NONE, PS_ZERO));
+      REC_ENTRY+5:  prog_rom = mk(OP_EXE, pl_exe(T_NTTINV[7:0], 1'b1, SC_NONE, PS_ZERO));
+      REC_ENTRY+6:  prog_rom = mk(OP_DMA_OUT, pl_dma(B_NTTMSG, 3'd2, 1'b1, 2'd0, 1'b0));
+      REC_ENTRY+7:  prog_rom = mk(OP_DONE, pl_done(1'b0));
 `endif
 
       // Single q0 input -> raw snapshot R -> fresh e0 -> centre/lift into each target limb.
-      REF_ENTRY+0: prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTMSG, 3'd0, 1'b0, 2'd0, 1'b0));
-      REF_ENTRY+1: prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTKEY, 3'd1, 1'b0, 2'd0, 1'b0));
-      REF_ENTRY+2: prog_rom = mk(OP_LDINS, pl_ldins(T_PWMDEC[7:0], 1'b1, SC_NONE));
-      REF_ENTRY+3: prog_rom = mk(OP_EXE, pl_exe(PS_ZERO));
-      REF_ENTRY+4: prog_rom = mk(OP_LDINS, pl_ldins(T_NTTINV[7:0], 1'b1, SC_NONE));
-      REF_ENTRY+5: prog_rom = mk(OP_EXE, pl_exe(PS_ZERO));
-      REF_ENTRY+6: prog_rom = mk(OP_LDINS, pl_ldins(T_SNAPSHOT[7:0], 1'b0, SC_NONE));
-      REF_ENTRY+7: prog_rom = mk(OP_EXE, pl_exe(PS_ZERO));
-      REF_ENTRY+8: prog_rom = mk(OP_LDINS, pl_ldins(T_SAMPLE[7:0], 1'b0, SC_NONE));
-      REF_ENTRY+9: prog_rom = mk(OP_EXE, pl_exe(PS_ERR));
-      REF_ENTRY+10: prog_rom = mk(OP_LIMB, pl_limb(8'd8));
-      REF_ENTRY+11: prog_rom = mk(OP_LDINS, pl_ldins(T_LIFT[7:0], 1'b1, SC_NONE));
-      REF_ENTRY+12: prog_rom = mk(OP_EXE, pl_exe(PS_ZERO));
-      REF_ENTRY+13: prog_rom = mk(OP_LDINS, pl_ldins(T_NTTFWD[7:0], 1'b1, SC_NONE));
-      REF_ENTRY+14: prog_rom = mk(OP_EXE, pl_exe(PS_A));
-      REF_ENTRY+15: prog_rom = mk(OP_LDINS, pl_ldins(T_PWMENC[7:0], 1'b1, SC_NONE));
-      REF_ENTRY+16: prog_rom = mk(OP_EXE, pl_exe(PS_ZERO));
-      REF_ENTRY+17: prog_rom = mk(OP_DMA_OUT, pl_dma(B_NTTMSG, 3'd2, 1'b1, 2'd0, 1'b0));
-      REF_ENTRY+18: prog_rom = mk(OP_DMA_OUT, pl_dma(B_NTTKEY, 3'd3, 1'b1, 2'd0, 1'b0));
-      REF_ENTRY+19: prog_rom = mk(OP_DONE, pl_done(1'b0));
+      REF_ENTRY+0:  prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTMSG, 3'd0, 1'b0, 2'd0, 1'b0));
+      REF_ENTRY+1:  prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTKEY, 3'd1, 1'b0, 2'd0, 1'b0));
+      REF_ENTRY+2:  prog_rom = mk(OP_EXE, pl_exe(T_PWMDEC[7:0], 1'b1, SC_NONE, PS_ZERO));
+      REF_ENTRY+3:  prog_rom = mk(OP_EXE, pl_exe(T_NTTINV[7:0], 1'b1, SC_NONE, PS_ZERO));
+      REF_ENTRY+4:  prog_rom = mk(OP_EXE, pl_exe(T_SNAPSHOT[7:0], 1'b0, SC_NONE, PS_ZERO));
+      REF_ENTRY+5:  prog_rom = mk(OP_EXE, pl_exe(T_SAMPLE[7:0], 1'b0, SC_NONE, PS_ERR));
+      REF_ENTRY+6:  prog_rom = mk(OP_LIMB, pl_limb(8'd5));
+      REF_ENTRY+7:  prog_rom = mk(OP_EXE, pl_exe(T_LIFT[7:0], 1'b1, SC_NONE, PS_ZERO));
+      REF_ENTRY+8:  prog_rom = mk(OP_EXE, pl_exe(T_NTTFWD[7:0], 1'b1, SC_NONE, PS_A));
+      REF_ENTRY+9:  prog_rom = mk(OP_EXE, pl_exe(T_PWMENC[7:0], 1'b1, SC_NONE, PS_ZERO));
+      REF_ENTRY+10: prog_rom = mk(OP_DMA_OUT, pl_dma(B_NTTMSG, 3'd2, 1'b1, 2'd0, 1'b0));
+      REF_ENTRY+11: prog_rom = mk(OP_DMA_OUT, pl_dma(B_NTTKEY, 3'd3, 1'b1, 2'd0, 1'b0));
+      REF_ENTRY+12: prog_rom = mk(OP_DONE, pl_done(1'b0));
       default: ;
     endcase
   endfunction
@@ -361,7 +337,7 @@ module fhe_microseq
     S_DMA_REQ,
     S_WR, S_WR_LO, S_SK_READ,
     S_RD,
-    S_EXE_RSTREQ, S_EXE_RST, S_EXE_START, S_EXE_POLL, S_EXE_CLR1, S_EXE_CLR0,
+    S_EXE_POLL,
     S_DONE
   } state_e;
 
@@ -388,6 +364,7 @@ module fhe_microseq
   logic          cur_off;        // read upper-N offset
   logic [63:0]   wdata;          // data being written this word
   logic [2:0]    rd_wait;
+  logic          cur_sk;         // word loop is an SK-load / SK-store (MOVE)
 
   // receive64 streams: one read address per step, retired RD_LAT steps later
   // (address register, bank read, output register). Retired words wait in rdq
@@ -404,11 +381,8 @@ module fhe_microseq
   wire rd_push   = step && (st == S_RD) && !cur_sk && ((rdq_n != 0) || rd_retire) && dma_wr_ready;
   assign ext_dout_we = rd_push;
 
-  // Command built by the current LDINS; core_cmd presents it in S_EXE_POLL
+  // Command of the current pass; core_cmd presents it in S_EXE_POLL
   logic [39:0]   pass_cmd;
-
-  // exe
-  logic [2:0]    exe_rstc;
 
   // DMA descriptor (B' 2c-step-2): captured at a DMA op decode, presented to the
   // DMA engine in S_DMA_REQ. The word stream then flows with valid/ready.
@@ -418,7 +392,6 @@ module fhe_microseq
 
   // Resident +sk_ntt: one synchronous read/write port. The integrated path
   // exports this storage; the trace-only walker TB uses the same latency model.
-  logic          cur_sk;
   logic [3:0]    mv_limb;
 `ifndef FHE_WALKER
   logic sk_en, sk_we;
@@ -534,9 +507,12 @@ module fhe_microseq
       unique case (st)
         // -------------------------------------------------------------
         S_IDLE: begin
-          control_high_word <= 32'd0;   // release reset, idle
+          // The core stays in reset while idle; a command releases it. That
+          // also restarts Expand's slot counter before ENCRYPT's message load.
+          control_high_word <= 32'd1;
           control_low_word  <= 32'd0;
           if (cmd_valid && (cmd != FHE_NONE)) begin
+            control_high_word <= 32'd0;
             busy        <= 1'b1;
             error       <= 1'b0;
             limb_active <= 1'b0;
@@ -600,7 +576,8 @@ module fhe_microseq
               reseed_en <= (f_ps(op_w) == PS_KG);
               {dina_high, dina_low} <= f_r2(op_w) ? r2_cur : 64'd0;
               control_low_word <= 32'd0;
-              st <= S_EXE_RSTREQ;
+              pass_cmd <= patch_word(f_tmpl(op_w), f_pat(op_w), f_sc(op_w), limb_idx);
+              st <= S_EXE_POLL;
             end
             OP_CONST: begin
               cur_bank <= f_bank(op_w); cur_sk <= 1'b0;
@@ -614,12 +591,6 @@ module fhe_microseq
               widx <= '0; wn <= (LOGN+1)'(N);
               desc_wr_r <= 1'b0; desc_ptr_r <= f_ptr(op_w); desc_limb_r <= limb_idx;
               st <= S_DMA_REQ;          // kick the DMA read, then stream into the core
-            end
-            OP_LDINS: begin
-              // Every program here is one pass, so only the command is kept.
-              pass_cmd <= patch_word(f_tmpl(op_w), f_pat(op_w), f_sc(op_w), limb_idx);
-              pc <= pc + 8'd1;
-              st <= S_FETCH;
             end
             OP_DMA_OUT: begin
               cur_bank <= f_bank(op_w); cur_ptr <= f_ptr(op_w); cur_sk <= 1'b0;
@@ -730,30 +701,10 @@ module fhe_microseq
             control_low_word <= mk_ctrl(cur_bank, 1'b0, bank_addr(cur_off, widx + 1'b1));
           end
         end
-        // ------------ pass: reset, present core_cmd, poll done ---------
-        S_EXE_RSTREQ: begin
-          control_high_word <= 32'd1;  // reset the core
-          exe_rstc <= 3'd0;
-          st <= S_EXE_RST;
-        end
-        S_EXE_RST: begin
-          if (exe_rstc < 3'd2) exe_rstc <= exe_rstc + 1'b1;
-          else begin control_high_word <= 32'd0; st <= S_EXE_START; end // release reset
-        end
-        S_EXE_START: begin
-          st <= S_EXE_POLL;     // core_cmd = pass_cmd from here
-        end
-        S_EXE_POLL: begin
-          // Pass done: reset the core and drop the command, which puts every
-          // unit back in reset (the core uses core_cmd directly).
-          if (status[0]) begin control_high_word <= 32'd1; st <= S_EXE_CLR1; end
-        end
-        S_EXE_CLR1: begin
-          control_high_word <= 32'd0;
-          st <= S_EXE_CLR0;
-        end
-        S_EXE_CLR0: begin
-          // advance program
+        // ------------ pass: core_cmd = pass_cmd until done -------------
+        // Leaving the state drops core_cmd to 0, which puts the pass's unit
+        // back in reset and clears the wrapper's done before the next pass.
+        S_EXE_POLL: if (status[0]) begin
           pc <= pc + 8'd1;
           st <= S_FETCH;
         end
@@ -765,6 +716,7 @@ module fhe_microseq
             busy        <= 1'b0;
             done        <= 1'b1;
             limb_active <= 1'b0;
+            control_high_word <= 32'd1;  // reset the core for at least the idle step
             st          <= S_IDLE;
           end
         end
