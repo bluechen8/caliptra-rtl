@@ -91,9 +91,8 @@ module fhe_top_dma_tb
   logic rst_b;
   logic parent_clock_live;
   logic parent_manual_enable = 1'b1;
-  logic cpu_sleep = 1'b0;
-  always_latch if (!clk)
-    parent_clock_live <= parent_manual_enable && (!cpu_sleep || busy_o || error_intr || notif_intr);
+  // The parent gate as in caliptra_top: FHE does not hold it open.
+  always_latch if (!clk) parent_clock_live <= parent_manual_enable;
   wire parent_clk = clk & parent_clock_live;
   always #5 clk = ~clk;
 
@@ -108,7 +107,7 @@ module fhe_top_dma_tb
   // wait states and the two-cycle ERROR response behave as on the real fabric.
   assign hready = hreadyout;
   logic [DW-1:0]  hrdata;
-  logic busy_o, error_intr, notif_intr;
+  logic error_intr, notif_intr;
 
   fhe_mem_if mem_if();
   axi_pkg::axi_dma_hw_req_t  dma_req;
@@ -122,7 +121,7 @@ module fhe_top_dma_tb
     .haddr_i(haddr), .hwdata_i(hwdata), .hsel_i(hsel), .hwrite_i(hwrite),
     .hready_i(hready), .htrans_i(htrans), .hsize_i(hsize),
     .hresp_o(hresp), .hreadyout_o(hreadyout), .hrdata_o(hrdata),
-    .busy_o(busy_o), .error_intr(error_intr), .notif_intr(notif_intr),
+    .busy_o(), .error_intr(error_intr), .notif_intr(notif_intr),
     .fhe_memory_export(mem_if),
     // KeyVault seed port, backed by the single-entry model below.
     .fhe_kv_read(dut_kv_read), .fhe_kv_rd_resp(dut_kv_rd_resp),
@@ -710,7 +709,6 @@ module fhe_top_dma_tb
   task automatic finish_cmd(input fhe_cmd_e c, input int base, input string nm,
                             input logic [3:0] cause = FHE_EC_NONE);
     logic [31:0] st;
-    cpu_sleep = 1; // parent must stay awake through the stream and completion delivery
     wait_notif(base, nm);
     if (c == FHE_ENCRYPT) begin
       bit tag_ok;
@@ -721,8 +719,6 @@ module fhe_top_dma_tb
       commit_and_wait(nm, tag_ok);
       if (!tag_ok) begin $display("  FAIL: %s message tag mismatch", nm); errors++; end
     end
-    @(negedge clk);
-    cpu_sleep = 0;
     ahb_read(A_STATUS, st);
     if (st[ST_ERROR] != (cause != FHE_EC_NONE) || st[7:4] != cause) begin
       $display("  FAIL: %s completed with STATUS 0x%08h, expected cause %0d", nm, st, cause); errors++;

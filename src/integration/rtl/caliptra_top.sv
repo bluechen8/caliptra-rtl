@@ -273,7 +273,6 @@ module caliptra_top
     wire abr_notif_intr;
     wire fhe_error_intr;
     wire fhe_notif_intr;
-    logic fhe_busy;
 `ifdef FHE_WALKER
     // FHE stream bridge <-> axi_dma hardware requester port
     axi_pkg::axi_dma_hw_req_t  fhe_dma_req;
@@ -844,7 +843,8 @@ clk_gate cg (
     .cptra_rst_b(cptra_noncore_rst_b),
     .psel(|s_axi_active || s_axi_r_if.arvalid || s_axi_w_if.awvalid),
     .clk_gate_en(clk_gating_en),
-    .cpu_halt_status(o_cpu_halt_status && !(fhe_busy || fhe_error_intr || fhe_notif_intr)),
+    // FHE does not hold the clock: firmware halts only while FHE STATUS is READY.
+    .cpu_halt_status(o_cpu_halt_status),
     .rdc_clk_dis(rdc_clk_dis),
     .rdc_clk_dis_uc (fw_update_rst_window),
     .clk_cg (clk_cg),
@@ -1185,7 +1185,7 @@ fhe_top #(
      .hresp_o           (responder_inst[`CALIPTRA_SLAVE_SEL_FHE].hresp),
      .hreadyout_o       (responder_inst[`CALIPTRA_SLAVE_SEL_FHE].hreadyout),
      .hrdata_o          (responder_inst[`CALIPTRA_SLAVE_SEL_FHE].hrdata),
-     .busy_o            (fhe_busy),
+     .busy_o            ( ),
      .error_intr        (fhe_error_intr),
      .notif_intr        (fhe_notif_intr),
      .fhe_memory_export (fhe_memory_export)
@@ -1209,7 +1209,6 @@ fhe_top #(
 );
 `else
     // FHE accelerator removed — tie off signals
-    assign fhe_busy        = 1'b0;
     assign fhe_error_intr  = 1'b0;
     assign fhe_notif_intr  = 1'b0;
     assign responder_inst[`CALIPTRA_SLAVE_SEL_FHE].hreadyout = 1'b1;
