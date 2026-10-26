@@ -10,7 +10,6 @@ module fhe_aloha_mem_top #(parameter bit ILV = 0, SRAM_REUSE = 0, parameter CROM
   input logic clk_i, fhe_aloha_mem_if.resp m
 );
   localparam int SDP_AW = $clog2(`FHE_N) - 1;
-  localparam int K_AW   = $clog2(`FHE_N*`FHE_L/2);
 
   // Retired logical ports have no backing storage.
   assign m.sk_rdata = '0;
@@ -56,8 +55,8 @@ module fhe_aloha_mem_top #(parameter bit ILV = 0, SRAM_REUSE = 0, parameter CROM
       .ra(m.``_sig``_addrb), .q(m.``_sig``_doutb));
   `FHE_WORKING_ARRAY(0, ntt_msg0,    64, SDP_AW, 8,  64'hff00000000000000, m.ntt_msg0_mask)
   `FHE_WORKING_ARRAY(1, ntt_msg1,    64, SDP_AW, 8,  64'hff00000000000000, m.ntt_msg1_mask)
-  `FHE_WORKING_ARRAY(2, ntt_v0,      54, K_AW,   54, 54'd0,                1'b1)
-  `FHE_WORKING_ARRAY(3, ntt_v1,      54, K_AW,   54, 54'd0,                1'b1)
+  `FHE_WORKING_ARRAY(2, ntt_v0,      64, SDP_AW, 8,  64'hff00000000000000, m.ntt_v0_mask)
+  `FHE_WORKING_ARRAY(3, ntt_v1,      64, SDP_AW, 8,  64'hff00000000000000, m.ntt_v1_mask)
   `FHE_WORKING_ARRAY(4, fft_lower0,  64, SDP_AW, 64, 64'd0,                1'b1)
   `FHE_WORKING_ARRAY(5, fft_lower1,  64, SDP_AW, 64, 64'd0,                1'b1)
   `FHE_WORKING_ARRAY(6, fft_higher0, 64, SDP_AW, 64, {64{1'b1}},           1'b1)

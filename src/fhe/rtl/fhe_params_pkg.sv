@@ -117,15 +117,15 @@ package fhe_params_pkg;
   function automatic logic [63:0] fhe_q(input logic [3:0] i);
     fhe_q = (64'd1 << (46 + i[2:0])) - (64'(fhe_qm(i)) << 24) + 64'd1;
   endfunction
-  // R^2 mod q_i, R = 2^72: KEYGEN's Montgomery conversion. Elaboration-time
-  // only (144 modular doublings); index with a constant.
-  function automatic logic [63:0] fhe_r2modq(input logic [3:0] i);
+  // R mod q_i, R = 2^72: the unit of the one-limb key's ternary map, so the
+  // forward NTT yields the Montgomery-form key. Elaboration-time only.
+  function automatic logic [63:0] fhe_rmodq(input logic [3:0] i);
     logic [63:0] q;
     q = fhe_q(i);
-    fhe_r2modq = 64'd1;
-    for (int b = 0; b < 144; b++) begin
-      fhe_r2modq = fhe_r2modq << 1;
-      if (fhe_r2modq >= q) fhe_r2modq = fhe_r2modq - q;
+    fhe_rmodq = 64'd1;
+    for (int b = 0; b < 72; b++) begin
+      fhe_rmodq = fhe_rmodq << 1;
+      if (fhe_rmodq >= q) fhe_rmodq = fhe_rmodq - q;
     end
   endfunction
 

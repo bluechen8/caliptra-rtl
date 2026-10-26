@@ -84,7 +84,9 @@ module fhe_top
   logic [AHB_ADDR_WIDTH-1:0] cif_addr;
   // The CROM window takes 0x4000-0x5FFF; the register block never sees it.
   wire crom_window = cif_addr[AHB_ADDR_WIDTH-1:13] == (CROM_BASE >> 13);
-  assign cif_rdata = crom_window ? 32'd0 : reg_rdata;  // the window is write-only
+  // Registers take 0x00-0x7F; any other offset reads 0 and ignores writes.
+  wire reg_window = cif_addr[AHB_ADDR_WIDTH-1:FHE_REG_ADDR_WIDTH] == '0;
+  assign cif_rdata = reg_window ? reg_rdata : 32'd0;  // the CROM window is write-only
 
   fhe_ahb_slv_sif #(
     .AHB_DATA_WIDTH    (AHB_DATA_WIDTH),
@@ -119,7 +121,7 @@ module fhe_top
   fhe_reg i_fhe_reg (
     .clk                 (clk),
     .rst                 (1'b0),
-    .s_cpuif_req         (dv & ~crom_window),
+    .s_cpuif_req         (dv & reg_window),
     .s_cpuif_req_is_wr   (cif_write),
     .s_cpuif_addr        (cif_addr[FHE_REG_ADDR_WIDTH-1:0]),
     .s_cpuif_wr_data     (cif_wdata),
@@ -254,7 +256,9 @@ module fhe_top
     hwif_in.FHE_KV_RD_SEED_CTRL.pcr_hash_extend.swwe  = ready;
     hwif_in.FHE_KV_RD_SEED_CTRL.rsvd.swwe             = ready;
     hwif_in.FHE_KV_RD_SEED_STATUS.READY.next = ~kv_busy;
-    hwif_in.FHE_KV_RD_SEED_STATUS.VALID.hwset = kv_seed_valid;
+    // Same priority as seed_fresh: a wipe or new read in the completion
+    // clock leaves VALID clear (the generated field gives set priority).
+    hwif_in.FHE_KV_RD_SEED_STATUS.VALID.hwset = kv_seed_valid & ~(seed_wipe | kv_start);
     hwif_in.FHE_KV_RD_SEED_STATUS.VALID.hwclr = seed_wipe | kv_start;
     hwif_in.FHE_KV_RD_SEED_STATUS.ERROR.next  = kv_seed_error ? 8'h01 : 8'h00;
   end
@@ -443,10 +447,11 @@ module fhe_top
   //----------------------------------------------------------------
   // Walker and core
   //----------------------------------------------------------------
-  // Per-modulus R^2 mod q_i for keygen's Montgomery conversion (R = 2^72).
-  logic [63:0] R2MODQ [0:FHE_L-1];
-  for (genvar i = 0; i < FHE_L; i++) begin : g_r2modq
-    assign R2MODQ[i] = fhe_r2modq(4'(i));
+  // Per-modulus R mod q_i, R = 2^72: the one-limb key's ternary map unit.
+  // R^2 mod q_i is only for the separate-storage KEYGEN, which this build lacks.
+  logic [63:0] RMODQ [0:FHE_L-1];
+  for (genvar i = 0; i < FHE_L; i++) begin : g_rmodq
+    assign RMODQ[i] = fhe_rmodq(4'(i));
   end
 
   logic [31:0] w_cl, w_ch, w_dl, w_dh;
@@ -466,12 +471,13 @@ module fhe_top
   logic [2:0]   w_desc_ptr;
   logic [3:0]   w_desc_limb;
   logic         w_dma_ready, w_rd_valid, w_rd_pop, w_wr_ready;
-  logic [3:0]   active_key_limb;
+  logic         k_kg, k_kw;     // walker -> core: this pass's KEYGEN mode and K writes
+  logic [53:0]  k_scale;
   logic         exe_hold, exe_held;
 
   fhe_microseq #(.SRAM_REUSE(1), .LOGN(FHE_LOGN), .N(FHE_N)) walker (
     .step(core_step),
-    .active_limb(active_key_limb),
+    .k_kg(k_kg), .k_kw(k_kw), .k_scale(k_scale),
     .sk_en(fhe_aloha_mem.sk_en), .sk_we(fhe_aloha_mem.sk_we),
     .sk_addr(fhe_aloha_mem.sk_addr), .sk_wdata(fhe_aloha_mem.sk_wdata),
     .sk_rdata(fhe_aloha_mem.sk_rdata),
@@ -482,7 +488,8 @@ module fhe_top
     .cmd            (cmd_q),
     .scale          (cfg_scale),
     .num_limbs      (cfg_l),
-    .r2modq         (R2MODQ),
+    .r2modq         ('{default: '0}),
+    .rmodq          (RMODQ),
     .control_low_word  (w_cl),
     .control_high_word (w_ch),
     .dina_low          (w_dl),
@@ -522,8 +529,7 @@ module fhe_top
     .SEED_SIDEBAND             (1),
     .EXT_COMMAND               (1)    // the walker loads each pass's command
   ) core (
-    .reuse_keygen(cmd_q == FHE_KEYGEN),
-    .reuse_limb(active_key_limb),
+    .k_kg(k_kg), .k_kw(k_kw), .k_scale(k_scale),
     .clk                (core_clk),
     .reseed_en          (w_reseed_en),
     .prng_rst_i         (fhe_prng_rst),

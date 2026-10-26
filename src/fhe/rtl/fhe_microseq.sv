@@ -25,6 +25,12 @@
 //   used. core_cmd is 0 between passes, which holds every unit in reset; the
 //   core reset itself is held only while the walker is idle.
 //
+//   With SRAM_REUSE, K holds the ternary secret and one key limb (docs/fhe/20).
+//   Limb loops run from L-1 down to 0, and the RNS/LIFT and NTT passes in them
+//   rebuild limb i in K (KW), so every completed command leaves limb 0 there.
+//   k0_ok records that K holds a complete limb 0; SKIPK skips the standalone
+//   rebuild in front of DECRYPT and REFRESH when it is set.
+//
 //   Macro-op word + ROM layout: see microsequencer doc section 5.1/5.2.
 //
 module fhe_microseq
@@ -50,7 +56,11 @@ module fhe_microseq
 
   // command issue (1-cycle pulse)
   input  logic        cmd_valid,
-  output logic [3:0] active_limb,
+  // One-limb resident key (SRAM_REUSE), held for the pass: KEYGEN mode, K.low
+  // writes, and R mod q of the pass's limb (ComputeCore k_kg/k_kw/k_scale).
+  output logic        k_kg,
+  output logic        k_kw,
+  output logic [53:0] k_scale,
   input  fhe_cmd_e    cmd,
 
   // Per-command instruction scale field (CONFIG.SCALE), written by firmware.
@@ -61,6 +71,8 @@ module fhe_microseq
 
   // per-limb R^2 mod q_i constant for keygen Montgomery-convert (CONST R2MODQ)
   input  logic [63:0] r2modq [0:FHE_L-1],
+  // per-limb R mod q_i, the one-limb key's ternary map unit (k_scale)
+  input  logic [63:0] rmodq [0:FHE_L-1],
 
   // ----- ComputeCoreWrapper debug-IO master (the pins we drive) -----
   output logic [31:0] control_low_word,
@@ -118,7 +130,7 @@ module fhe_microseq
   // =====================================================================
   localparam logic [3:0] OP_NOP=4'd0, OP_DMA_IN=4'd1, OP_DMA_OUT=4'd2,
                          OP_CONST=4'd3, OP_EXE=4'd5,
-                         OP_MOVE=4'd6, OP_LIMB=4'd7, OP_DONE=4'd8;
+                         OP_MOVE=4'd6, OP_LIMB=4'd7, OP_DONE=4'd8, OP_SKIPK=4'd9;
 
   // BANK ids (mirror Aloha bram_sel; SK=8 is new in B'/C')
   localparam logic [3:0] B_FFT=4'd0, B_NTTMSG=4'd1, B_NTTV=4'd3,
@@ -136,7 +148,7 @@ module fhe_microseq
   // command-template indices
   localparam int unsigned T_FFTDIF=0, T_FFTDIT=1, T_RNS=2, T_NTTFWD=3,
                           T_NTTINV=4, T_PWMENC=5, T_PWMDEC=6, T_I2F=7, T_PROJ=8,
-                          T_SAMPLE=9, T_SNAPSHOT=10, T_LIFT=11, T_PWMKG=12;
+                          T_SAMPLE=9, T_SNAPSHOT=10, T_LIFT=11;
 
   // =====================================================================
   // Command templates: ComputeCore's 40-bit command, pre-patch. doc section 5.2.
@@ -152,8 +164,7 @@ module fhe_microseq
       T_NTTFWD: tmpl_base =              40'd1;             // NTT is_dif=0
       T_NTTINV: tmpl_base = (40'd1<<3) | 40'd1;            // NTT is_dif=1
       T_PWMENC: tmpl_base = (40'd1<<4) | (40'd1<<3) | 40'd4;// PWM enc=1,neg=1
-      // PWM enc=0,neg=0; T_PWMKG adds OP1[6]: b = scalar on dina, zero addend
-      T_PWMDEC, T_PWMKG: tmpl_base = (t==T_PWMKG ? 40'd1<<9 : 40'd0) | 40'd4;
+      T_PWMDEC: tmpl_base = 40'd4;                          // PWM enc=0,neg=0
       T_I2F   : tmpl_base = 40'd3;                          // I2F
       T_PROJ  : tmpl_base = 40'd5;                          // PROJECT
       T_SAMPLE: tmpl_base = 40'd6;
@@ -164,7 +175,7 @@ module fhe_microseq
   endfunction
   // which fields the template needs patched
   function automatic logic tmpl_use_q  (input int unsigned t);
-    tmpl_use_q  = (t==T_RNS)||(t==T_NTTFWD)||(t==T_NTTINV)||(t==T_PWMENC)||(t==T_PWMDEC)||(t==T_I2F)||(t==T_LIFT)||(t==T_PWMKG);
+    tmpl_use_q  = (t==T_RNS)||(t==T_NTTFWD)||(t==T_NTTINV)||(t==T_PWMENC)||(t==T_PWMDEC)||(t==T_I2F)||(t==T_LIFT);
   endfunction
   function automatic logic tmpl_use_rom(input int unsigned t);
     tmpl_use_rom = (t==T_RNS)||(t==T_NTTFWD)||(t==T_NTTINV);
@@ -194,10 +205,11 @@ module fhe_microseq
     pl_const = {bank, cid, 22'd0};
   endfunction
   // EXE : one engine pass. template[27:20] reserved[19:16]=0 patch[15] scalesel[14:13]
-  //       paramsel[12:11] r2[10] (dina = R^2 mod q of the active limb during the pass)
+  //       paramsel[12:11] reserved[10]=0
+  //       kw[9] (K.low takes this pass's key-limb writes) kg[8] (KEYGEN mode)
   function automatic logic [27:0] pl_exe(input logic [7:0] tmpl, input logic patch, input logic [1:0] sc,
-                                         input logic [1:0] ps, input logic r2 = 1'b0);
-    pl_exe = {tmpl, 4'd0, patch, sc, ps, r2, 10'd0};
+                                         input logic [1:0] ps, input logic kg = 1'b0, input logic kw = 1'b0);
+    pl_exe = {tmpl, 4'd0, patch, sc, ps, 1'b0, kw, kg, 8'd0};
   endfunction
   // MOVE : srcbank[27:24] dstbank[23:20] srcstr[19] dststr[18]
   function automatic logic [27:0] pl_move(input logic [3:0] sb, input logic [3:0] db, input logic ss, input logic ds);
@@ -207,6 +219,8 @@ module fhe_microseq
   function automatic logic [27:0] pl_limb(input logic [7:0] bl); pl_limb = {bl, 20'd0}; endfunction
   // DONE : irq[27]
   function automatic logic [27:0] pl_done(input logic irq); pl_done = {irq, 27'd0}; endfunction
+  // SKIPK : count[27:20], words skipped when K holds limb 0 (k0_ok)
+  function automatic logic [27:0] pl_skipk(input logic [7:0] n); pl_skipk = {n, 20'd0}; endfunction
 
   // field extractors
   function automatic logic [3:0]  f_op  (input logic [31:0] w); f_op   = w[31:28]; endfunction
@@ -219,7 +233,9 @@ module fhe_microseq
   function automatic logic        f_pat (input logic [31:0] w); f_pat  = w[15];    endfunction
   function automatic logic [1:0]  f_sc  (input logic [31:0] w); f_sc   = w[14:13]; endfunction
   function automatic logic [1:0]  f_ps  (input logic [31:0] w); f_ps   = w[12:11]; endfunction
-  function automatic logic        f_r2  (input logic [31:0] w); f_r2   = w[10];    endfunction
+  function automatic logic        f_kw  (input logic [31:0] w); f_kw   = w[9];     endfunction
+  function automatic logic        f_kg  (input logic [31:0] w); f_kg   = w[8];     endfunction
+  function automatic logic [7:0]  f_skip(input logic [31:0] w); f_skip = w[27:20]; endfunction
   function automatic logic [3:0]  f_sb  (input logic [31:0] w); f_sb   = w[27:24]; endfunction
   function automatic logic [3:0]  f_db  (input logic [31:0] w); f_db   = w[23:20]; endfunction
   function automatic logic        f_ss  (input logic [31:0] w); f_ss   = w[19];    endfunction
@@ -237,19 +253,73 @@ module fhe_microseq
   localparam int REC_ENTRY = 48;
   localparam int REF_ENTRY = 64;
 
-  // KEYGEN with shared storage (entry 0): a sample-only pass draws the secret
-  // from the KeyVault seed; per limb, RNS reduces it mod q (ComputeCore feeds
-  // its float input zeros during KEYGEN), NTT transforms it, and PWM multiplies
-  // by R^2 from dina with a zero addend, writing the resident Montgomery key.
-  function automatic logic [31:0] kg_reuse_rom(input logic [7:0] a);
-    kg_reuse_rom = mk(OP_NOP, 28'd0);
+  // Shared storage, one-limb resident key (docs/fhe/20). A rebuild of limb 0 is
+  // RNS (KG, KW) then NTT (KG, KW): the v lane maps K.sample to s*R mod q into
+  // K.low and the NTT transforms it in place. It runs before any DMA_IN, so the
+  // M and A it scratches are loaded afterwards.
+  function automatic logic [31:0] reuse_rom(input logic [7:0] a);
+    reuse_rom = mk(OP_NOP, 28'd0);
     case (a)
-      KG_ENTRY+0:   kg_reuse_rom = mk(OP_EXE, pl_exe(T_SAMPLE[7:0], 1'b0, SC_NONE, PS_KG));
-      KG_ENTRY+1:   kg_reuse_rom = mk(OP_LIMB, pl_limb(8'd3));         // body = next 3 words
-      KG_ENTRY+2:   kg_reuse_rom = mk(OP_EXE, pl_exe(T_RNS[7:0], 1'b1, SC_RNSKG, PS_ZERO));
-      KG_ENTRY+3:   kg_reuse_rom = mk(OP_EXE, pl_exe(T_NTTFWD[7:0], 1'b1, SC_NONE, PS_ZERO));
-      KG_ENTRY+4:   kg_reuse_rom = mk(OP_EXE, pl_exe(T_PWMKG[7:0], 1'b1, SC_NONE, PS_ZERO, 1'b1)); // dina = R^2 mod q_limb
-      KG_ENTRY+5:   kg_reuse_rom = mk(OP_DONE,  pl_done(1'b0));
+      // ---------- KEYGEN (entry 0): s -> K.sample, then limb 0 ----------
+      KG_ENTRY+0:  reuse_rom = mk(OP_EXE, pl_exe(T_SAMPLE[7:0], 1'b0, SC_NONE, PS_KG, 1'b1, 1'b0));
+      KG_ENTRY+1:  reuse_rom = mk(OP_EXE, pl_exe(T_RNS[7:0], 1'b1, SC_RNSKG, PS_ZERO, 1'b1, 1'b1));
+      KG_ENTRY+2:  reuse_rom = mk(OP_EXE, pl_exe(T_NTTFWD[7:0], 1'b1, SC_NONE, PS_ZERO, 1'b1, 1'b1));
+      KG_ENTRY+3:  reuse_rom = mk(OP_DONE, pl_done(1'b0));
+
+      // ---------- ENCRYPT (entry 16): RNS and NTT also build key limb i ----------
+      ENC_ENTRY+0: reuse_rom = mk(OP_DMA_IN, pl_dma(B_FFTEXP, 3'd0, 1'b0, 2'd0, 1'b0)); // PTR0=msg
+      ENC_ENTRY+1: reuse_rom = mk(OP_EXE, pl_exe(T_FFTDIF[7:0], 1'b0, SC_NONE, PS_ERR));
+      ENC_ENTRY+2: reuse_rom = mk(OP_LIMB, pl_limb(8'd5));
+      ENC_ENTRY+3: reuse_rom = mk(OP_EXE, pl_exe(T_RNS[7:0], 1'b1, SC_RNSENC, PS_ZERO, 1'b0, 1'b1));
+      ENC_ENTRY+4: reuse_rom = mk(OP_EXE, pl_exe(T_NTTFWD[7:0], 1'b1, SC_NONE, PS_A, 1'b0, 1'b1));
+      ENC_ENTRY+5: reuse_rom = mk(OP_EXE, pl_exe(T_PWMENC[7:0], 1'b1, SC_NONE, PS_ZERO));
+      ENC_ENTRY+6: reuse_rom = mk(OP_DMA_OUT, pl_dma(B_NTTMSG, 3'd2, 1'b1, 2'd0, 1'b0)); // c0->PTR2
+      ENC_ENTRY+7: reuse_rom = mk(OP_DMA_OUT, pl_dma(B_NTTKEY, 3'd3, 1'b1, 2'd0, 1'b0)); // c1->PTR3
+      ENC_ENTRY+8: reuse_rom = mk(OP_DONE, pl_done(1'b0));
+
+      // ---------- DECRYPT (entry 32, L=1): limb 0 is normally resident ----------
+      DEC_ENTRY+0:  reuse_rom = mk(OP_SKIPK, pl_skipk(8'd2));
+      DEC_ENTRY+1:  reuse_rom = mk(OP_EXE, pl_exe(T_RNS[7:0], 1'b1, SC_NONE, PS_ZERO, 1'b1, 1'b1));
+      DEC_ENTRY+2:  reuse_rom = mk(OP_EXE, pl_exe(T_NTTFWD[7:0], 1'b1, SC_NONE, PS_ZERO, 1'b1, 1'b1));
+      DEC_ENTRY+3:  reuse_rom = mk(OP_DMA_IN, pl_dma(B_NTTMSG, 3'd0, 1'b0, 2'd0, 1'b0)); // c0<-PTR0
+      DEC_ENTRY+4:  reuse_rom = mk(OP_DMA_IN, pl_dma(B_NTTKEY, 3'd1, 1'b0, 2'd0, 1'b0)); // c1<-PTR1
+      DEC_ENTRY+5:  reuse_rom = mk(OP_EXE, pl_exe(T_PWMDEC[7:0], 1'b1, SC_NONE, PS_ZERO));
+      DEC_ENTRY+6:  reuse_rom = mk(OP_EXE, pl_exe(T_NTTINV[7:0], 1'b1, SC_NONE, PS_ZERO));
+      DEC_ENTRY+7:  reuse_rom = mk(OP_EXE, pl_exe(T_I2F[7:0], 1'b1, SC_I2F, PS_ZERO));
+      DEC_ENTRY+8:  reuse_rom = mk(OP_EXE, pl_exe(T_FFTDIT[7:0], 1'b0, SC_NONE, PS_ZERO));
+      DEC_ENTRY+9:  reuse_rom = mk(OP_EXE, pl_exe(T_PROJ[7:0], 1'b0, SC_NONE, PS_ZERO));
+      DEC_ENTRY+10: reuse_rom = mk(OP_DMA_OUT, pl_dma(B_FFT, 3'd2, 1'b0, 2'd0, 1'b1));   // out<-upper N of 2N
+      DEC_ENTRY+11: reuse_rom = mk(OP_DONE, pl_done(1'b0));
+`ifdef FHE_RECOVER_CMD  // FHE_RECOVER_EN; the dispatch below refuses RECOVER otherwise
+      // ---------- RECOVER (entry 48): every limb is rebuilt, no SKIPK ----------
+      REC_ENTRY+0:  reuse_rom = mk(OP_LIMB, pl_limb(8'd7));
+      REC_ENTRY+1:  reuse_rom = mk(OP_EXE, pl_exe(T_RNS[7:0], 1'b1, SC_NONE, PS_ZERO, 1'b1, 1'b1));
+      REC_ENTRY+2:  reuse_rom = mk(OP_EXE, pl_exe(T_NTTFWD[7:0], 1'b1, SC_NONE, PS_ZERO, 1'b1, 1'b1));
+      REC_ENTRY+3:  reuse_rom = mk(OP_DMA_IN, pl_dma(B_NTTMSG, 3'd0, 1'b1, 2'd0, 1'b0));
+      REC_ENTRY+4:  reuse_rom = mk(OP_DMA_IN, pl_dma(B_NTTKEY, 3'd1, 1'b1, 2'd0, 1'b0));
+      REC_ENTRY+5:  reuse_rom = mk(OP_EXE, pl_exe(T_PWMDEC[7:0], 1'b1, SC_NONE, PS_ZERO));
+      REC_ENTRY+6:  reuse_rom = mk(OP_EXE, pl_exe(T_NTTINV[7:0], 1'b1, SC_NONE, PS_ZERO));
+      REC_ENTRY+7:  reuse_rom = mk(OP_DMA_OUT, pl_dma(B_NTTMSG, 3'd2, 1'b1, 2'd0, 1'b0));
+      REC_ENTRY+8:  reuse_rom = mk(OP_DONE, pl_done(1'b0));
+`endif
+
+      // ---------- REFRESH (entry 64): q0 decrypt, then LIFT and NTT build limb i ----------
+      REF_ENTRY+0:  reuse_rom = mk(OP_SKIPK, pl_skipk(8'd2));
+      REF_ENTRY+1:  reuse_rom = mk(OP_EXE, pl_exe(T_RNS[7:0], 1'b1, SC_NONE, PS_ZERO, 1'b1, 1'b1));
+      REF_ENTRY+2:  reuse_rom = mk(OP_EXE, pl_exe(T_NTTFWD[7:0], 1'b1, SC_NONE, PS_ZERO, 1'b1, 1'b1));
+      REF_ENTRY+3:  reuse_rom = mk(OP_DMA_IN, pl_dma(B_NTTMSG, 3'd0, 1'b0, 2'd0, 1'b0));
+      REF_ENTRY+4:  reuse_rom = mk(OP_DMA_IN, pl_dma(B_NTTKEY, 3'd1, 1'b0, 2'd0, 1'b0));
+      REF_ENTRY+5:  reuse_rom = mk(OP_EXE, pl_exe(T_PWMDEC[7:0], 1'b1, SC_NONE, PS_ZERO));
+      REF_ENTRY+6:  reuse_rom = mk(OP_EXE, pl_exe(T_NTTINV[7:0], 1'b1, SC_NONE, PS_ZERO));
+      REF_ENTRY+7:  reuse_rom = mk(OP_EXE, pl_exe(T_SNAPSHOT[7:0], 1'b0, SC_NONE, PS_ZERO));
+      REF_ENTRY+8:  reuse_rom = mk(OP_EXE, pl_exe(T_SAMPLE[7:0], 1'b0, SC_NONE, PS_ERR));
+      REF_ENTRY+9:  reuse_rom = mk(OP_LIMB, pl_limb(8'd5));
+      REF_ENTRY+10: reuse_rom = mk(OP_EXE, pl_exe(T_LIFT[7:0], 1'b1, SC_NONE, PS_ZERO, 1'b0, 1'b1));
+      REF_ENTRY+11: reuse_rom = mk(OP_EXE, pl_exe(T_NTTFWD[7:0], 1'b1, SC_NONE, PS_A, 1'b0, 1'b1));
+      REF_ENTRY+12: reuse_rom = mk(OP_EXE, pl_exe(T_PWMENC[7:0], 1'b1, SC_NONE, PS_ZERO));
+      REF_ENTRY+13: reuse_rom = mk(OP_DMA_OUT, pl_dma(B_NTTMSG, 3'd2, 1'b1, 2'd0, 1'b0));
+      REF_ENTRY+14: reuse_rom = mk(OP_DMA_OUT, pl_dma(B_NTTKEY, 3'd3, 1'b1, 2'd0, 1'b0));
+      REF_ENTRY+15: reuse_rom = mk(OP_DONE, pl_done(1'b0));
       default: ;
     endcase
   endfunction
@@ -258,7 +328,7 @@ module fhe_microseq
   // array would be dropped by synthesis). Unlisted addresses decode to NOP.
   function automatic logic [31:0] prog_rom(input logic [7:0] a);
     prog_rom = mk(OP_NOP, 28'd0);
-    if (SRAM_REUSE && a < 8'(ENC_ENTRY)) prog_rom = kg_reuse_rom(a);
+    if (SRAM_REUSE) prog_rom = reuse_rom(a);
     else case (a)
       // ---------- KEYGEN, separate-copy trace builds (entry 0) ----------
       // The sampler only runs inside a transform pass here (sample-only needs
@@ -281,7 +351,7 @@ module fhe_microseq
       ENC_ENTRY+2:  prog_rom = mk(OP_LIMB, pl_limb(8'd6));
       ENC_ENTRY+3:  prog_rom = mk(OP_EXE, pl_exe(T_RNS[7:0], 1'b1, SC_RNSENC, PS_ZERO));
       ENC_ENTRY+4:  prog_rom = mk(OP_EXE, pl_exe(T_NTTFWD[7:0], 1'b1, SC_NONE, PS_A));
-      ENC_ENTRY+5:  prog_rom = SRAM_REUSE ? mk(OP_NOP, 28'd0) : mk(OP_MOVE,   pl_move(B_SK, B_NTTV, 1'b1, 1'b0));
+      ENC_ENTRY+5:  prog_rom = mk(OP_MOVE,   pl_move(B_SK, B_NTTV, 1'b1, 1'b0));
       ENC_ENTRY+6:  prog_rom = mk(OP_EXE, pl_exe(T_PWMENC[7:0], 1'b1, SC_NONE, PS_ZERO));
       ENC_ENTRY+7:  prog_rom = mk(OP_DMA_OUT,pl_dma(B_NTTMSG, 3'd2, 1'b1, 2'd0, 1'b0)); // c0->PTR2
       ENC_ENTRY+8:  prog_rom = mk(OP_DMA_OUT,pl_dma(B_NTTKEY, 3'd3, 1'b1, 2'd0, 1'b0)); // c1->PTR3
@@ -290,7 +360,7 @@ module fhe_microseq
       // ---------- DECRYPT (entry 32, L=1) ----------
       DEC_ENTRY+0:  prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTMSG, 3'd0, 1'b0, 2'd0, 1'b0)); // c0<-PTR0
       DEC_ENTRY+1:  prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTKEY, 3'd1, 1'b0, 2'd0, 1'b0)); // c1<-PTR1
-      DEC_ENTRY+2:  prog_rom = SRAM_REUSE ? mk(OP_NOP, 28'd0) : mk(OP_MOVE,   pl_move(B_SK, B_NTTV, 1'b0, 1'b0));
+      DEC_ENTRY+2:  prog_rom = mk(OP_MOVE,   pl_move(B_SK, B_NTTV, 1'b0, 1'b0));
       DEC_ENTRY+3:  prog_rom = mk(OP_EXE, pl_exe(T_PWMDEC[7:0], 1'b1, SC_NONE, PS_ZERO));
       DEC_ENTRY+4:  prog_rom = mk(OP_EXE, pl_exe(T_NTTINV[7:0], 1'b1, SC_NONE, PS_ZERO));
       DEC_ENTRY+5:  prog_rom = mk(OP_EXE, pl_exe(T_I2F[7:0], 1'b1, SC_I2F, PS_ZERO));
@@ -304,27 +374,13 @@ module fhe_microseq
       REC_ENTRY+0:  prog_rom = mk(OP_LIMB, pl_limb(8'd6));
       REC_ENTRY+1:  prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTMSG, 3'd0, 1'b1, 2'd0, 1'b0));
       REC_ENTRY+2:  prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTKEY, 3'd1, 1'b1, 2'd0, 1'b0));
-      REC_ENTRY+3:  prog_rom = SRAM_REUSE ? mk(OP_NOP, 28'd0) : mk(OP_MOVE, pl_move(B_SK, B_NTTV, 1'b1, 1'b0));
+      REC_ENTRY+3:  prog_rom = mk(OP_MOVE, pl_move(B_SK, B_NTTV, 1'b1, 1'b0));
       REC_ENTRY+4:  prog_rom = mk(OP_EXE, pl_exe(T_PWMDEC[7:0], 1'b1, SC_NONE, PS_ZERO));
       REC_ENTRY+5:  prog_rom = mk(OP_EXE, pl_exe(T_NTTINV[7:0], 1'b1, SC_NONE, PS_ZERO));
       REC_ENTRY+6:  prog_rom = mk(OP_DMA_OUT, pl_dma(B_NTTMSG, 3'd2, 1'b1, 2'd0, 1'b0));
       REC_ENTRY+7:  prog_rom = mk(OP_DONE, pl_done(1'b0));
 `endif
 
-      // Single q0 input -> raw snapshot R -> fresh e0 -> centre/lift into each target limb.
-      REF_ENTRY+0:  prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTMSG, 3'd0, 1'b0, 2'd0, 1'b0));
-      REF_ENTRY+1:  prog_rom = mk(OP_DMA_IN, pl_dma(B_NTTKEY, 3'd1, 1'b0, 2'd0, 1'b0));
-      REF_ENTRY+2:  prog_rom = mk(OP_EXE, pl_exe(T_PWMDEC[7:0], 1'b1, SC_NONE, PS_ZERO));
-      REF_ENTRY+3:  prog_rom = mk(OP_EXE, pl_exe(T_NTTINV[7:0], 1'b1, SC_NONE, PS_ZERO));
-      REF_ENTRY+4:  prog_rom = mk(OP_EXE, pl_exe(T_SNAPSHOT[7:0], 1'b0, SC_NONE, PS_ZERO));
-      REF_ENTRY+5:  prog_rom = mk(OP_EXE, pl_exe(T_SAMPLE[7:0], 1'b0, SC_NONE, PS_ERR));
-      REF_ENTRY+6:  prog_rom = mk(OP_LIMB, pl_limb(8'd5));
-      REF_ENTRY+7:  prog_rom = mk(OP_EXE, pl_exe(T_LIFT[7:0], 1'b1, SC_NONE, PS_ZERO));
-      REF_ENTRY+8:  prog_rom = mk(OP_EXE, pl_exe(T_NTTFWD[7:0], 1'b1, SC_NONE, PS_A));
-      REF_ENTRY+9:  prog_rom = mk(OP_EXE, pl_exe(T_PWMENC[7:0], 1'b1, SC_NONE, PS_ZERO));
-      REF_ENTRY+10: prog_rom = mk(OP_DMA_OUT, pl_dma(B_NTTMSG, 3'd2, 1'b1, 2'd0, 1'b0));
-      REF_ENTRY+11: prog_rom = mk(OP_DMA_OUT, pl_dma(B_NTTKEY, 3'd3, 1'b1, 2'd0, 1'b0));
-      REF_ENTRY+12: prog_rom = mk(OP_DONE, pl_done(1'b0));
       default: ;
     endcase
   endfunction
@@ -348,8 +404,15 @@ module fhe_microseq
   // limb loop
   logic        limb_active;
   logic [3:0]  limb_idx;
-  assign active_limb = limb_idx;
   wire [63:0] r2_cur = r2modq[limb_idx];  // R^2 mod q of the active limb
+
+  // One-limb key controls of the current pass, and k0_ok: K holds a complete
+  // limb 0. A KW pass clears it when it starts; the KW NTT pass sets it when it
+  // completes for limb 0. ZEROIZE, reset and KEYGEN acceptance clear it.
+  logic        kg_q, kw_q, k0_ok;
+  assign k_kg    = (st == S_EXE_POLL) && kg_q;
+  assign k_kw    = (st == S_EXE_POLL) && kw_q;
+  assign k_scale = rmodq[limb_idx][53:0];
   logic [3:0]  limb_cnt;         // = num_limbs for this cmd (1 if decrypt)
   logic [7:0]  limb_base;        // pc of first body word
   logic [7:0]  limb_len;
@@ -493,6 +556,7 @@ module fhe_microseq
       dina_low <= 32'd0; dina_high <= 32'd0;
       busy <= 1'b0; done <= 1'b0; error <= 1'b0;
       cur_sk <= 1'b0;
+      kg_q <= 1'b0; kw_q <= 1'b0; k0_ok <= 1'b0;
       limb_active <= 1'b0; limb_idx <= 4'd0; limb_cnt <= 4'd1;
       widx <= '0; wn <= '0; rd_wait <= 3'd0;
       rd_iss <= '0; rd_pipe <= '0; rdq_n <= '0;
@@ -502,6 +566,7 @@ module fhe_microseq
       control_low_word <= 32'd0; control_high_word <= 32'd1;
       limb_active <= 1'b0;
       reseed_en <= 1'b0;
+      k0_ok <= 1'b0;
     end else if (step) begin
       done <= 1'b0;
       unique case (st)
@@ -517,7 +582,7 @@ module fhe_microseq
             error       <= 1'b0;
             limb_active <= 1'b0;
             limb_idx    <= 4'd0;
-            // KEYGEN always fills every installed key limb.
+            if (cmd == FHE_KEYGEN) k0_ok <= 1'b0;
             limb_cnt    <= (cmd == FHE_KEYGEN) ? 4'(FHE_L) :
                            (cmd == FHE_ENCRYPT || recover || cmd == FHE_REFRESH)
                              ? ((num_limbs==4'd0)?4'd1:num_limbs) : 4'd1;
@@ -529,6 +594,7 @@ module fhe_microseq
             // and a build without RECOVER has no program for it.
             if (((recover || cmd == FHE_REFRESH) &&
                  (num_limbs == 0 || num_limbs > FHE_L)) ||
+                (cmd == FHE_ENCRYPT && num_limbs > FHE_L) ||
                 (cmd == FHE_RECOVER && !FHE_RECOVER_EN) ||
                 (cmd == FHE_REFRESH && !SRAM_REUSE)) begin
               error <= 1'b1;
@@ -540,9 +606,10 @@ module fhe_microseq
         S_FETCH: begin
           // limb-loop body wrap: when the body (limb_len words from limb_base)
           // is exhausted, either re-run it for the next limb or fall through.
+          // Shared storage walks the limbs down to 0, so K ends on limb 0.
           if (limb_active && (pc == (limb_base + limb_len))) begin
-            if ((limb_idx + 1'b1) < limb_cnt) begin
-              limb_idx <= limb_idx + 1'b1;
+            if (SRAM_REUSE ? (limb_idx != 4'd0) : ((limb_idx + 1'b1) < limb_cnt)) begin
+              limb_idx <= SRAM_REUSE ? limb_idx - 1'b1 : limb_idx + 1'b1;
               pc       <= limb_base;
               op_w     <= prog_rom(limb_base);
             end else begin
@@ -563,7 +630,7 @@ module fhe_microseq
             end
             OP_LIMB: begin
               limb_active <= 1'b1;
-              limb_idx    <= 4'd0;
+              limb_idx    <= SRAM_REUSE ? limb_cnt - 1'b1 : 4'd0;
               limb_base   <= pc + 8'd1;
               limb_len    <= f_bl(op_w);
               pc          <= pc + 8'd1;
@@ -571,10 +638,13 @@ module fhe_microseq
             end
             OP_EXE: if (!exe_hold) begin
               // The sampler seed arrives on fhe_top's sideband; only the KEYGEN
-              // key-sampling pass reloads it. dina carries no seed; it holds the
-              // limb's R^2 for the keygen-convert PWM and is zero otherwise.
+              // key-sampling pass reloads it. dina carries no seed and is zero.
               reseed_en <= (f_ps(op_w) == PS_KG);
-              {dina_high, dina_low} <= f_r2(op_w) ? r2_cur : 64'd0;
+              {dina_high, dina_low} <= 64'd0;
+              kg_q <= f_kg(op_w);
+              kw_q <= f_kw(op_w);
+              // Any pass that may rewrite K (either field) invalidates limb 0.
+              if (f_kw(op_w) || f_kg(op_w)) k0_ok <= 1'b0;
               control_low_word <= 32'd0;
               pass_cmd <= patch_word(f_tmpl(op_w), f_pat(op_w), f_sc(op_w), limb_idx);
               st <= S_EXE_POLL;
@@ -619,6 +689,10 @@ module fhe_microseq
                 control_low_word <= mk_ctrl(f_sb(op_w), 1'b0, '0);
                 st <= S_RD;
               end
+            end
+            OP_SKIPK: begin
+              pc <= pc + 8'd1 + (k0_ok ? f_skip(op_w) : 8'd0);
+              st <= S_FETCH;
             end
             default: begin // NOP -> advance
               pc <= pc + 8'd1; st <= S_FETCH;
@@ -705,6 +779,7 @@ module fhe_microseq
         // Leaving the state drops core_cmd to 0, which puts the pass's unit
         // back in reset and clears the wrapper's done before the next pass.
         S_EXE_POLL: if (status[0]) begin
+          if (kw_q && f_tmpl(op_w) == T_NTTFWD[7:0] && limb_idx == 4'd0) k0_ok <= 1'b1;
           pc <= pc + 8'd1;
           st <= S_FETCH;
         end

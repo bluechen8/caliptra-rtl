@@ -170,8 +170,6 @@ module fhe_top_dma_tb
     $display("PASS legal input/output stream backpressure injection");
   end
 
-  // Banked resident keys are transformed in place and never written by
-  // application commands. Count only final representation-conversion writes.
   // Independent refresh oracle: record the sampler's committed signed errors,
   // then compare decrypted output to centered input + exactly these samples.
   int refresh_noise [0:N-1];
@@ -194,13 +192,60 @@ module fhe_top_dma_tb
       end
     end
   end
-  int key_writes [0:FHE_L-1];
-  int key_reads [0:FHE_L-1];
+  // One-limb resident key (docs/fhe/20). K.sample is written only by KEYGEN's
+  // sample pass; K.low only by passes the walker marks KW (or KEYGEN mode).
+  // Each NTT pass that completes a limb is captured here, so the key golden
+  // and the stand-alone rebuilds can be checked limb by limb.
+  localparam logic [7:0] T_NTTFWD_CODE = 8'd3;
+  int key_samples;                       // K.sample writes since the last KEYGEN
+  int key_used [0:FHE_L-1];              // ENCRYPT PWM passes that found limb i in K
+  bit pwm_rst_q = 1;
+  logic [53:0] key_cap [0:FHE_L-1][0:N-1];
+  bit key_cap_valid [0:FHE_L-1];
+  int rebuilds;                          // KG NTT passes outside KEYGEN
+  bit rebuild_expected = 0;              // a test cleared k0_ok on purpose
+  int unexpected_rebuilds = 0;
+  // A stand-alone rebuild of limb 0 must reproduce rebuild_ref exactly.
+  logic [53:0] rebuild_ref [0:N-1];
+  bit rebuild_ref_valid = 0;
+  int rebuild_checked = 0, rebuild_bad = 0;
   always @(posedge clk) begin
-    if (!rst_b) begin
-      foreach (key_writes[i]) key_writes[i] = 0;
-      foreach (key_reads[i]) key_reads[i] = 0;
-    end else if (aloha_mem.eng_step) begin
+    if (rst_b && aloha_mem.eng_step && dut.k_kw && dut.core_status[0] &&
+        dut.walker.op_w[27:20] == T_NTTFWD_CODE) begin
+      automatic int li = dut.walker.limb_idx;
+      automatic bit standalone = dut.k_kg && dut.cmd_q != FHE_KEYGEN;
+      if (standalone) begin
+        rebuilds++;
+        if ((dut.cmd_q == FHE_DECRYPT || dut.cmd_q == FHE_REFRESH) && !rebuild_expected)
+          unexpected_rebuilds++;
+      end
+      @(negedge clk);   // the pass's last K write has landed
+      for (int i = 0; i < N; i++)
+        key_cap[li][i] = i%2==0 ? u_aloha_mem.ntt_v0.mem[i/2][53:0] : u_aloha_mem.ntt_v1.mem[i/2][53:0];
+      key_cap_valid[li] = 1;
+      if (standalone && li == 0 && rebuild_ref_valid) begin
+        rebuild_checked++;
+        for (int i = 0; i < N; i++) if (key_cap[0][i] !== rebuild_ref[i]) rebuild_bad++;
+        rebuild_ref_valid = 0;
+      end
+    end
+  end
+  // Captures describe the current key only.
+  always @(posedge clk)
+    if (!rst_b || (dut.cmd_accept && dut.cmd_in == FHE_KEYGEN))
+      foreach (key_cap_valid[i]) key_cap_valid[i] = 0;
+  // k0_ok never claims limb 0 while a pass may still be rewriting K.low.
+  always @(posedge clk)
+    if (rst_b) assert (!(dut.k_kw && dut.walker.k0_ok)) else $fatal(1, "k0_ok set during a KW pass");
+  always @(posedge clk) begin
+    if (!rst_b || (dut.cmd_accept && dut.cmd_in == FHE_KEYGEN)) begin
+      key_samples = 0;
+      foreach (key_used[i]) key_used[i] = 0;
+    end
+    // Every successful KEYGEN writes the secret exactly once.
+    if (rst_b && dut.w_done && dut.cmd_q == FHE_KEYGEN && !dut.w_error)
+      assert (key_samples == N) else $fatal(1, "KEYGEN wrote %0d secret coefficients, expected %0d", key_samples, N);
+    if (rst_b && aloha_mem.eng_step) begin
       assert (!aloha_mem.sk_en) else $fatal(1,"obsolete resident-key copy port used");
       if ((dut.cmd_q == FHE_RECOVER || dut.cmd_q == FHE_REFRESH) && dut.w_busy) begin
         assert (dut.core.CORE.transform_rst || !dut.core.CORE.do_fft)
@@ -210,19 +255,32 @@ module fhe_top_dma_tb
         if (dut.cmd_q == FHE_RECOVER) assert (!aloha_mem.fft_higher0_wea && !aloha_mem.fft_higher1_wea)
           else $fatal(1,"recovery modified FFT real workspace");
       end
-      if (dut.cmd_q != FHE_KEYGEN)
-        assert (!aloha_mem.ntt_v0_wea && !aloha_mem.ntt_v1_wea)
-          else $fatal(1,"application command overwrote persistent key");
-      if (dut.cmd_q == FHE_KEYGEN && !dut.core.CORE.pwm_rst) begin
-        if(aloha_mem.ntt_v0_wea) key_writes[int'(aloha_mem.ntt_v0_addra)/(N/2)]++;
-        if(aloha_mem.ntt_v1_wea) key_writes[int'(aloha_mem.ntt_v1_addra)/(N/2)]++;
+      // K.low only in KW passes; K.sample only in KEYGEN's sample pass (KG, no KW).
+      if ((aloha_mem.ntt_v0_wea && aloha_mem.ntt_v0_mask == 8'h7f) ||
+          (aloha_mem.ntt_v1_wea && aloha_mem.ntt_v1_mask == 8'h7f))
+        assert (dut.k_kw) else $fatal(1,"K.low written outside a KW pass");
+      if ((aloha_mem.ntt_v0_wea && aloha_mem.ntt_v0_mask == 8'h80) ||
+          (aloha_mem.ntt_v1_wea && aloha_mem.ntt_v1_mask == 8'h80)) begin
+        assert (dut.cmd_q == FHE_KEYGEN && dut.k_kg && !dut.k_kw)
+          else $fatal(1,"secret written outside KEYGEN's sample pass");
+        key_samples++;
       end
-      if (dut.cmd_q == FHE_ENCRYPT && !dut.core.CORE.pwm_rst)
-        key_reads[int'(aloha_mem.ntt_v0_addrb)/(N/2)]++;
+      // When an ENCRYPT PWM pass starts, K.low must hold the limb it encrypts.
+      if (dut.cmd_q == FHE_ENCRYPT && pwm_rst_q && !dut.core.CORE.pwm_rst) begin
+        automatic int li = dut.walker.limb_idx;
+        automatic bit same = key_cap_valid[li];
+        for (int i = 0; i < N; i++)
+          if ((i%2==0 ? u_aloha_mem.ntt_v0.mem[i/2][53:0] : u_aloha_mem.ntt_v1.mem[i/2][53:0]) !== key_cap[li][i])
+            same = 0;
+        if (same) key_used[li]++;
+      end
+      pwm_rst_q = dut.core.CORE.pwm_rst;
       // Modular writes must never clobber samples; sampler writes touch only
       // the upper byte. The stream must serialize only residue bits.
       assert (aloha_mem.ntt_msg0_mask inside {8'h7f,8'h80});
       assert (aloha_mem.ntt_msg1_mask inside {8'h7f,8'h80});
+      assert (aloha_mem.ntt_v0_mask inside {8'h7f,8'h80});
+      assert (aloha_mem.ntt_v1_mask inside {8'h7f,8'h80});
     end
   end
 
@@ -234,10 +292,8 @@ module fhe_top_dma_tb
       assert(fd!=0) else $fatal(1,"cannot open state dump");
       for(int limb=0;limb<tb_limbs();limb++)
         for(int i=0;i<N;i++) begin
-          if(keys) begin
-            if(i%2==0) $fdisplay(fd,"%014h",u_aloha_mem.ntt_v0.mem[limb*(N/2)+i/2]);
-            else $fdisplay(fd,"%014h",u_aloha_mem.ntt_v1.mem[limb*(N/2)+i/2]);
-          end else begin
+          if(keys) $fdisplay(fd,"%014h",key_cap[limb][i]);
+          else begin
             $fdisplay(fd,"%016h",dram[ADDR_C0/8+limb*N+i]);
             $fdisplay(fd,"%016h",dram[ADDR_C1/8+limb*N+i]);
           end
@@ -245,7 +301,7 @@ module fhe_top_dma_tb
       $fclose(fd);
     end
   endtask
-  task automatic check_baseline(input bit keys);
+  task automatic check_baseline(input bit keys, input int glimbs = 2);
     string dir;
     // The golden holds two limbs; with more installed, limbs 0 and 1 of the
     // key and of a level-2 ciphertext must still match it.
@@ -255,11 +311,12 @@ module fhe_top_dma_tb
     if($value$plusargs("GOLDEN_DIR=%s",dir)) begin
       assert(N==256 && FHE_L>=GL && $test$plusargs("LIMBS2")) else $fatal(1,"golden geometry mismatch");
       $readmemh({dir,keys ? "/key.hex" : "/ciphertext.hex"},expected,0,keys ? N*GL-1 : 2*N*GL-1);
-      for(int limb=0;limb<GL;limb++)
+      // K holds one limb at a time: compare each limb as last captured.
+      for(int limb=0;limb<(keys ? glimbs : GL);limb++)
         for(int i=0;i<N;i++) begin
           if(keys) begin
-            actual=i%2==0 ? {10'd0,u_aloha_mem.ntt_v0.mem[limb*(N/2)+i/2]} :
-                           {10'd0,u_aloha_mem.ntt_v1.mem[limb*(N/2)+i/2]};
+            assert(key_cap_valid[limb]) else $fatal(1,"baseline key limb %0d never built",limb);
+            actual={10'd0,key_cap[limb][i]};
             assert(actual===expected[limb*N+i]) else $fatal(1,"baseline key mismatch limb=%0d i=%0d",limb,i);
           end else begin
             assert(dram[ADDR_C0/8+limb*N+i]===expected[2*(limb*N+i)])
@@ -268,7 +325,7 @@ module fhe_top_dma_tb
               else $fatal(1,"baseline c1 mismatch limb=%0d i=%0d",limb,i);
           end
         end
-      $display("PASS pre-reuse baseline %s: both limbs bit-exact",keys ? "secret" : "ciphertext");
+      $display("PASS pre-reuse baseline %s: %0d limb(s) bit-exact",keys ? "secret" : "ciphertext",keys ? glimbs : GL);
     end
   endtask
   longint measured_cycles;
@@ -289,17 +346,17 @@ module fhe_top_dma_tb
   // and the 160-bit seed (at its source register) reproduces that, so the pre-reuse ciphertext
   // golden can still be checked bit-exact.
   localparam logic [3:0] OP_EXE_CODE = 4'd5;
-  localparam logic [1:0] PS_A_CODE = 2'd2, PS_ERR_CODE = 2'd3;
+  localparam logic [1:0] PS_A_CODE = 2'd2, PS_ERR_CODE = 2'd3;  // EXE PARAMSEL, op_w[12:11]
   bit replay_on = 0;
   // Re-force constants every clock (a force with a changing expression is not
   // re-evaluated by every simulator). The walker holds op_w for the whole EXE,
   // and the sampler's reseed pulse comes several cycles after decode.
   always @(posedge clk) begin
     if (replay_on) begin
-      if (dut.walker.op_w[31:28] == OP_EXE_CODE && dut.walker.op_w[27:26] == PS_A_CODE) begin
+      if (dut.walker.op_w[31:28] == OP_EXE_CODE && dut.walker.op_w[12:11] == PS_A_CODE) begin
         force dut.i_fhe_kv_seed.seed_q = {96'd0, REPLAY_A_SEED};
         force dut.w_reseed_en = 1'b1;
-      end else if (dut.walker.op_w[31:28] == OP_EXE_CODE && dut.walker.op_w[27:26] == PS_ERR_CODE) begin
+      end else if (dut.walker.op_w[31:28] == OP_EXE_CODE && dut.walker.op_w[12:11] == PS_ERR_CODE) begin
         force dut.i_fhe_kv_seed.seed_q = {96'd0, REPLAY_ERR_SEED};
         force dut.w_reseed_en = 1'b1;
       end else begin
@@ -524,10 +581,13 @@ module fhe_top_dma_tb
   task automatic provision_kv(input logic [159:0] seed);
     for (int i = 0; i < KV_NUM_DWORDS; i++) kv_ent[i] = (i < 5) ? seed[32*i +: 32] : 32'd0;
   endtask
+  task automatic kv_seed_start(input int entry);
+    ahb_write(A_KV_CTRL, {26'd0, 5'(entry), 1'b1});
+  endtask
   task automatic kv_seed_read(input int entry, output logic [7:0] kv_err);
     logic [31:0] d;
     int guard = 0;
-    ahb_write(A_KV_CTRL, {26'd0, 5'(entry), 1'b1});
+    kv_seed_start(entry);
     do begin ahb_read(A_KV_STATUS, d); guard++; end while (!(d[0] && d[1]) && guard < 1000);
     if (!(d[0] && d[1])) begin $display("FAIL: KeyVault seed read never completed"); errors++; end
     kv_err = d[9:2];
@@ -758,17 +818,17 @@ module fhe_top_dma_tb
     for (int i = 0; i < N; i++) dst[i] = dram[(base/8) + i];
   endtask
 
-  // Resident key snapshot, to compare a later KEYGEN against.
-  logic [53:0] key0 [0:N*FHE_L/2-1], key1 [0:N*FHE_L/2-1];
+  // Resident key snapshot (secret and limb 0), to compare a later KEYGEN against.
+  logic [63:0] key0 [0:N/2-1], key1 [0:N/2-1];
   task automatic save_key();
-    for (int i = 0; i < N*FHE_L/2; i++) begin
+    for (int i = 0; i < N/2; i++) begin
       key0[i] = u_aloha_mem.ntt_v0.mem[i];
       key1[i] = u_aloha_mem.ntt_v1.mem[i];
     end
   endtask
   function automatic int key_diff();
     key_diff = 0;
-    for (int i = 0; i < N*FHE_L/2; i++)
+    for (int i = 0; i < N/2; i++)
       if (u_aloha_mem.ntt_v0.mem[i] !== key0[i] || u_aloha_mem.ntt_v1.mem[i] !== key1[i]) key_diff++;
   endfunction
 
@@ -819,13 +879,136 @@ module fhe_top_dma_tb
     return (v > q/2) ? longint'(v - q) : longint'(v);
   endfunction
 
+  // Corrupt K.low in both the logical and the sub-bank copies, keeping
+  // K.sample; a row still in the bank's write buffer is left alone. Idle only.
+  localparam logic [53:0] K_POISON = 54'h2a_aaaa_5555_5555;
+  `define FHE_TB_POISON(_arr) \
+    for (int r = 0; r < N/2; r++) begin \
+      automatic logic [1:0] sb = '0; \
+      if (u_aloha_mem._arr.ilv.bank.bv && u_aloha_mem._arr.ilv.bank.ba == r) continue; \
+      for (int i = 0; i < $clog2(N/2); i += 2) sb ^= 2'(r >> i); \
+      u_aloha_mem._arr.mem[r][53:0] ^= K_POISON; \
+      case (sb) \
+        2'd0: u_aloha_mem._arr.ilv.sub[0].mem[r >> 2][53:0] ^= K_POISON; \
+        2'd1: u_aloha_mem._arr.ilv.sub[1].mem[r >> 2][53:0] ^= K_POISON; \
+        2'd2: u_aloha_mem._arr.ilv.sub[2].mem[r >> 2][53:0] ^= K_POISON; \
+        default: u_aloha_mem._arr.ilv.sub[3].mem[r >> 2][53:0] ^= K_POISON; \
+      endcase \
+    end
+  task automatic poison_key_low();
+    @(negedge clk);
+    `FHE_TB_POISON(ntt_v0)
+    `FHE_TB_POISON(ntt_v1)
+  endtask
+  `undef FHE_TB_POISON
+
+  // Lose limb 0 as an abort that kept the key would: poison K.low and clear
+  // k0_ok. The command must rebuild limb 0 (SKIPK falls through) bit-exactly
+  // before using it, and still be correct.
+  task automatic run_rebuilding(input fhe_cmd_e c, input string nm);
+    int r0 = rebuilds, c0 = rebuild_checked;
+    if (!dut.walker.k0_ok) $fatal(1, "%s: K must hold limb 0 before the test", nm);
+    for (int i = 0; i < N; i++)
+      rebuild_ref[i] = i%2==0 ? u_aloha_mem.ntt_v0.mem[i/2][53:0] : u_aloha_mem.ntt_v1.mem[i/2][53:0];
+    rebuild_bad = 0;
+    rebuild_ref_valid = 1;
+    rebuild_expected = 1;
+    poison_key_low();
+    force dut.walker.k0_ok = 1'b0;
+    @(posedge clk);
+    release dut.walker.k0_ok;
+    run_cmd(c, nm);
+    rebuild_expected = 0;
+    if (rebuilds == r0 + 1 && rebuild_checked == c0 + 1 && rebuild_bad == 0 && dut.walker.k0_ok)
+      $display("PASS %s rebuilt a poisoned limb 0 bit-exactly first", nm);
+    else begin
+      $display("FAIL: %s ran %0d rebuilds, %0d checked, %0d words wrong, k0_ok %0d", nm,
+               rebuilds - r0, rebuild_checked - c0, rebuild_bad, dut.walker.k0_ok);
+      errors++;
+    end
+    rebuild_ref_valid = 0;
+  endtask
+
+  // ZEROIZE (one clock of the decoded strobe) at a chosen point of a limb-0
+  // rebuild, or of KEYGEN's sample pass. KEY_VALID and k0_ok must end clear,
+  // and the completion is ABORTED. point: 0 during the KW RNS pass, 1 the clock
+  // after it completes, 2 during the KW NTT pass, 3 on the NTT's completion
+  // clock (the one that would set k0_ok), 4 during KEYGEN's sample pass.
+  localparam logic [7:0] T_RNS_CODE = 8'd2, T_SAMPLE_CODE = 8'd9;
+  task automatic zeroize_in_rebuild(input int point, input string nm);
+    int base, guard = 0;
+    logic [31:0] d;
+    bit hit;
+    load_seed(SEED_B);
+    cfg(tb_limbs(), 12'(rns_scale));
+    if (point == 4) issue_cmd(FHE_KEYGEN, base);
+    else begin
+      run_cmd(FHE_KEYGEN, {nm, ": KEYGEN"});
+      dec_slots();
+      force dut.walker.k0_ok = 1'b0;   // DECRYPT starts with the limb-0 rebuild
+      @(posedge clk);
+      release dut.walker.k0_ok;
+      rebuild_expected = 1;
+      issue_cmd(FHE_DECRYPT, base);
+    end
+    do begin
+      @(negedge clk); guard++;
+      unique case (point)
+        0, 1: hit = dut.k_kw && dut.walker.op_w[27:20] == T_RNS_CODE && dut.walker.limb_idx == 0 &&
+                    (point == 0 || (aloha_mem.eng_step && dut.core_status[0]));
+        2, 3: hit = dut.k_kw && dut.walker.op_w[27:20] == T_NTTFWD_CODE && dut.walker.limb_idx == 0 &&
+                    (point == 2 || (aloha_mem.eng_step && dut.core_status[0]));
+        default: hit = dut.k_kg && dut.walker.op_w[27:20] == T_SAMPLE_CODE;
+      endcase
+    end while (!hit && guard < 10_000_000);
+    if (!hit) $fatal(1, "%s: never reached the ZEROIZE point", nm);
+    if (point == 1) @(negedge clk);    // the walker is between the two passes
+    force dut.zeroize = 1'b1;
+    @(negedge clk);
+    release dut.zeroize;
+    rebuild_expected = 0;
+    wait_status(ST_VALID, nm);
+    ahb_read(A_STATUS, d);
+    if (d[ST_READY] && d[ST_ERROR] && d[7:4] == FHE_EC_ABORTED && !d[ST_KEY_VALID] && !dut.walker.k0_ok)
+      $display("PASS %s: aborted, KEY_VALID and k0_ok clear", nm);
+    else begin $display("FAIL: %s left STATUS=0x%08h k0_ok %0d", nm, d, dut.walker.k0_ok); errors++; end
+    gcm_discard();
+  endtask
+
+  // The core's debug-read mux must not expose K (docs/fhe/20.9): with a key
+  // resident, NTT_V reads 0 and so does the ERROR bank's v field.
+  task automatic check_debug_reads();
+    logic [63:0] d;
+    int bad = 0, nz = 0;
+    // The secret really is in K.sample, so a zero read means it is hidden.
+    for (int i = 0; i < N/2; i++)
+      nz += (u_aloha_mem.ntt_v0.mem[i][57:56] != 0) + (u_aloha_mem.ntt_v1.mem[i][57:56] != 0);
+    assert (nz > N/4) else $fatal(1, "K.sample holds only %0d nonzero secret coefficients", nz);
+    for (int sel = 3; sel <= 4; sel++)       // NTT_V_BRAM_ID, ERROR_BRAM_ID
+      for (int i = 0; i < N/2; i++) begin
+        force dut.w_cl = (32'(sel) << 29) | (32'd1 << FHE_CW_GRANT) | 32'(i);
+        repeat (4) @(posedge clk);
+        d = {dut.core_dout_hi, dut.core_dout_lo};
+        if (sel == 3 ? d != 0 : d[13:12] != 0) bad++;
+      end
+    release dut.w_cl;
+    @(posedge clk);
+    if (bad == 0) $display("PASS debug reads of NTT_V and the ERROR v field return 0");
+    else begin $display("FAIL: %0d debug reads exposed K", bad); errors++; end
+  endtask
+
   // RECOVER the ciphertext in slots 0/1 at level l; every limb must give the
-  // same centred coefficient as limb 0.
+  // same centred coefficient as limb 0. RECOVER rebuilds each limb it uses.
   task automatic check_limbs_agree(input int l, input string nm);
     if (!FHE_RECOVER_EN) return;  // production build: no RECOVER
     cfg(l, 12'(rns_scale));
     dec_slots();
-    run_cmd(FHE_RECOVER, {nm, ": RECOVER"});
+    begin
+      int r0 = rebuilds;
+      run_cmd(FHE_RECOVER, {nm, ": RECOVER"});
+      assert (rebuilds == r0 + l && dut.walker.k0_ok)
+        else $fatal(1, "%s: RECOVER ran %0d rebuilds for %0d limbs, k0_ok %0d", nm, rebuilds - r0, l, dut.walker.k0_ok);
+    end
     for (int i = 0; i < N; i++) begin
       longint signed c0;
       c0 = centred(0, dram[ADDR_OUT/8 + i]);
@@ -840,6 +1023,9 @@ module fhe_top_dma_tb
     string mnist_dir;
     level_sweep();
     if ($value$plusargs("MNIST=%s",mnist_dir)) run_mnist(mnist_dir);
+    if (unexpected_rebuilds != 0) begin
+      $display("FAIL: %0d DECRYPT/REFRESH rebuilds with limb 0 resident", unexpected_rebuilds); errors++;
+    end else $display("PASS no DECRYPT or REFRESH rebuilt a resident limb 0 (%0d rebuilds in all)", rebuilds);
     if (errors == 0) $display("fhe_top_dma_tb RESULT: PASS");
     else             $display("fhe_top_dma_tb RESULT: FAIL (%0d error(s))", errors);
     $finish;
@@ -885,7 +1071,8 @@ module fhe_top_dma_tb
       cfg(l, 12'(rns_scale));
       dec_slots();
       set_slot(2, 64'(ADDR_C0)); set_slot(3, 64'(ADDR_C1));
-      run_cmd(FHE_REFRESH, $sformatf("REFRESH to level %0d", l));
+      if (l == 1) run_rebuilding(FHE_REFRESH, "REFRESH to level 1 with k0_ok cleared");
+      else run_cmd(FHE_REFRESH, $sformatf("REFRESH to level %0d", l));
       check_limbs_agree(l, $sformatf("REFRESH level %0d", l));
       cfg(1, 12'(i2f_val));
       dec_slots();
@@ -974,6 +1161,39 @@ module fhe_top_dma_tb
     if (rd_err || wr_err || d != 0) begin
       $display("FAIL: unmapped 0x50 err %0d/%0d data 0x%08h", rd_err, wr_err, d); errors++;
     end else $display("PASS CAP.DMA_STREAM; 0x50 unmapped");
+  endtask
+
+  // Offsets past the register block (0x80 and up, outside the CROM window)
+  // read 0 and ignore writes: no alias of CTRL or CONFIG. Needs a key loaded.
+  task automatic check_no_alias();
+    logic [31:0] cfg_before, d;
+    ahb_read(A_CONFIG, cfg_before);
+    ahb_write(A_CTRL + 'h80, CTRL_ZEROIZE);
+    ahb_write(A_CONFIG + 'h80, ~cfg_before);
+    ahb_write(A_CONFIG + 'h180, ~cfg_before);
+    ahb_read(A_STATUS, d);
+    if (!d[ST_KEY_VALID]) begin $display("FAIL: write at 0x%0h zeroized the key", A_CTRL + 'h80); errors++; end
+    ahb_read(A_CONFIG, d);
+    if (d != cfg_before) begin $display("FAIL: write past 0x80 changed CONFIG to 0x%08h", d); errors++; end
+    ahb_read(A_CONFIG + 'h80, d);
+    if (d != 0) begin $display("FAIL: 0x%0h reads 0x%08h, not 0", A_CONFIG + 'h80, d); errors++; end
+    else $display("PASS offsets past 0x80 do not alias registers");
+  endtask
+
+  // A wipe in the clock the seed read completes wins: KV STATUS.VALID stays
+  // clear, matching the wiped seed. Leaves no seed loaded.
+  task automatic check_seed_wipe_race();
+    logic [31:0] d;
+    provision_kv(SEED_A);
+    kv_seed_start(KV_ENTRY);
+    @(negedge clk iff dut.kv_seed_valid);
+    force dut.seed_wipe = 1'b1;
+    @(negedge clk);
+    release dut.seed_wipe;
+    ahb_read(A_KV_STATUS, d);
+    if (d[1] || dut.seed_fresh || dut.kv_seed !== '0) begin
+      $display("FAIL: wipe at seed completion left KV STATUS=0x%08h fresh=%0d", d, dut.seed_fresh); errors++;
+    end else $display("PASS wipe at seed completion leaves KV STATUS.VALID clear");
   endtask
 
   // Fill `words` 64-bit words at `addr` with a marker; count words still marked.
@@ -1328,8 +1548,7 @@ module fhe_top_dma_tb
 
     // ---- firmware: KeyVault seed, then KEYGEN ----
     rekey("KEYGEN");
-    dump_state(1);
-    check_baseline(1);
+    check_baseline(1, 1);
     begin
       logic [31:0] d;
       ahb_read(A_STATUS, d);
@@ -1338,12 +1557,14 @@ module fhe_top_dma_tb
       if (d[1]) begin $display("FAIL: seed still valid after KEYGEN consumed it"); errors++; end
       if (dut.kv_seed !== '0) begin $display("FAIL: seed copy not wiped after KEYGEN"); errors++; end
     end
+    check_no_alias();
+    check_seed_wipe_race();
 
-    // KEYGEN always fills every installed limb.
-    for (int limb=0; limb < FHE_L; limb++) begin
-      assert (key_writes[limb] == N)
-        else $fatal(1, "key limb %0d: expected %0d writes, got %0d", limb, N, key_writes[limb]);
-    end
+    // KEYGEN writes the secret once and builds limb 0 only.
+    assert (key_cap_valid[0] && dut.walker.k0_ok) else $fatal(1, "KEYGEN did not build limb 0");
+    for (int limb=1; limb < FHE_L; limb++)
+      assert (!key_cap_valid[limb]) else $fatal(1, "KEYGEN built key limb %0d", limb);
+    check_debug_reads();
 
     // ---- ENCRYPT: msg <- slot 0, c0 -> slot 2, c1 -> slot 3 ----
     cfg(tb_limbs(), 12'(rns_scale));
@@ -1357,15 +1578,18 @@ module fhe_top_dma_tb
         run_cmd(FHE_ENCRYPT, "ENCRYPT (testbench v1 seed replay)");
         replay_v1_seeds(0);
         dump_state(0);
+        check_baseline(0);
         rekey("KEYGEN (restart stream after replay)");
         cfg(tb_limbs(), 12'(rns_scale));
       end
     end
     run_cmd(FHE_ENCRYPT, "ENCRYPT");
+    dump_state(1);
+    check_baseline(1);   // ENCRYPT built limb 1 on the way down to limb 0
     for (int i = 0; i < N; i++) first_a[i] = dram[ADDR_C1/8 + i];
     for (int limb=0; limb < tb_limbs(); limb++) begin
-      assert (key_reads[limb] >= N)
-        else $fatal(1, "key limb %0d: expected %0d reads, got %0d", limb, N, key_reads[limb]);
+      assert (key_used[limb] >= 1)
+        else $fatal(1, "key limb %0d: no ENCRYPT PWM pass found it resident in K", limb);
     end
 
     // ---- DECRYPT: c0 <- slot 0, c1 <- slot 1, slots -> slot 2 ----
@@ -1384,6 +1608,11 @@ module fhe_top_dma_tb
       reco = new[N];
       capture_slots(reco, ADDR_OUT);
       check_fft(reco, g_input, N, "fhe_top round-trip (recovered vs input)", 1.0e-3);
+      cfg(tb_limbs(), 12'(i2f_val));
+      dec_slots();
+      run_rebuilding(FHE_DECRYPT, "DECRYPT with k0_ok cleared");
+      capture_slots(reco, ADDR_OUT);
+      check_fft(reco, g_input, N, "round trip through a limb-0 rebuild", 1.0e-3);
     end
 
     // Production build (no RECOVER): RECOVER is illegal; the level sweep checks
@@ -1394,8 +1623,7 @@ module fhe_top_dma_tb
     end
 
     // Interoperate with the stored-FFT reference, not just an OTF round trip.
-    // (Generated twiddles round differently, so the ciphertext itself is not
-    // bit-exact against that reference.)
+    // (The replayed ENCRYPT above already matches it bit for bit.)
     begin
       string dir;
       logic [63:0] reference [0:4*N-1], saved0 [0:2*N-1], saved1 [0:2*N-1];
@@ -1648,12 +1876,18 @@ module fhe_top_dma_tb
       ahb_write(A_CTRL, CTRL_ZEROIZE);
       wait_status(ST_VALID, "ZEROIZE mid-ENCRYPT");
       ahb_read(A_STATUS, d);
-      if (d[ST_READY] && d[ST_VALID] && d[ST_ERROR] && d[7:4] == FHE_EC_ABORTED && !d[ST_KEY_VALID])
-        $display("PASS ZEROIZE mid-ENCRYPT reports an aborted completion and clears KEY_VALID");
+      if (d[ST_READY] && d[ST_VALID] && d[ST_ERROR] && d[7:4] == FHE_EC_ABORTED && !d[ST_KEY_VALID] && !dut.walker.k0_ok)
+        $display("PASS ZEROIZE mid-ENCRYPT reports an aborted completion and clears KEY_VALID and k0_ok");
       else begin $display("FAIL: ZEROIZE mid-ENCRYPT left STATUS=0x%08h", d); errors++; end
       ahb_read(A_XFER_STATUS, d);
       if (d != 0) begin $display("FAIL: ZEROIZE left XFER_STATUS=0x%08h", d); errors++; end
       gcm_discard();   // abandon the GCM context
+
+      zeroize_in_rebuild(0, "ZEROIZE during the limb-0 rebuild's RNS");
+      zeroize_in_rebuild(1, "ZEROIZE between the limb-0 rebuild's RNS and NTT");
+      zeroize_in_rebuild(2, "ZEROIZE during the limb-0 rebuild's NTT");
+      zeroize_in_rebuild(3, "ZEROIZE on the clock the limb-0 NTT completes");
+      zeroize_in_rebuild(4, "ZEROIZE during KEYGEN's sample pass");
 
       dma_stream_tests();
 

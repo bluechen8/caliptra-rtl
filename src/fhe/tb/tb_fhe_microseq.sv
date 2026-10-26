@@ -60,9 +60,10 @@ module tb_fhe_microseq;
     .step(1'b1),
     .clk(clk), .rst_b(rst_b), .zeroize(zeroize),
     .cmd_valid(cmd_valid), .cmd(cmd),
-    .active_limb(),
+    .k_kg(), .k_kw(), .k_scale(),
     .scale(scale), .reseed_en(reseed_en),
     .num_limbs(num_limbs), .r2modq(r2modq),
+    .rmodq('{default: '0}),   // the one-limb key's table; unused without shared storage
     .control_low_word(control_low_word), .control_high_word(control_high_word),
     .dina_low(dina_low), .dina_high(dina_high),
     .dout_low(dout_low), .dout_high(dout_high), .status(status),

@@ -89,7 +89,7 @@ module tb_fhe_ilv_bank;
   bit  done [3];
   int  err [3];
   ilv_check #(.W(64), .AW(7), .GRAN(8),  .FORWARD_MASK(64'hff00000000000000), .SEED(11)) m_like (clk, done[0], err[0]);
-  ilv_check #(.W(54), .AW(8), .GRAN(54), .FORWARD_MASK('0),                   .SEED(22)) k_like (clk, done[1], err[1]);
+  ilv_check #(.W(64), .AW(8), .GRAN(8),  .FORWARD_MASK(64'hff00000000000000), .SEED(22)) k_like (clk, done[1], err[1]);
   ilv_check #(.W(64), .AW(6), .GRAN(64), .FORWARD_MASK('1),                   .SEED(33)) r_like (clk, done[2], err[2]);
   initial begin
     wait (done[0] && done[1] && done[2]);

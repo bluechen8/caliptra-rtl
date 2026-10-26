@@ -13,8 +13,9 @@
 // limitations under the License.
 //
 // Shared-SRAM boundary. SRAM_REUSE=1 uses packed 64-bit message banks,
-// two 64-bit FFT bank pairs, banked 54-bit resident keys and the CROM.
-// The ntt_v request names now address resident K with a limb offset. Retired
+// two 64-bit FFT bank pairs, the one-limb resident key K and the CROM.
+// The ntt_v request names address K: like M, 64-bit rows with a sample byte
+// (the ternary secret) and byte masks, N/2 rows per parity at any L. Retired
 // ntt_key/e0/vt/sk-copy ports remain for the standalone reference mode only;
 // the integrated Chisel implementation does not instantiate their storage.
 // Module-facing read/write requests are time-multiplexed onto physical 1RW
@@ -86,16 +87,17 @@ interface fhe_aloha_mem_if;
   logic eng_step, eng_stall;
 
   logic [7:0] ntt_msg0_mask, ntt_msg1_mask;
+  logic [7:0] ntt_v0_mask, ntt_v1_mask;
   logic sk_en, sk_we;
   logic [$clog2(`FHE_N*`FHE_L)-1:0] sk_addr;
   logic [53:0] sk_wdata, sk_rdata;
 
-  // M is 64-bit with byte masks; ntt_v ports are resident K (NL/2 per bank).
+  // M and K are 64-bit with byte masks; ntt_v ports are resident K.
   // e1/key requests below are retained for reference-mode compatibility.
   `ALOHA_MEM_SDP_SIG(64, `ALOHA_SDP_AW, ntt_msg0)
   `ALOHA_MEM_SDP_SIG(64, `ALOHA_SDP_AW, ntt_msg1)
-  `ALOHA_MEM_SDP_SIG(54, $clog2(`FHE_N*`FHE_L/2), ntt_v0)
-  `ALOHA_MEM_SDP_SIG(54, $clog2(`FHE_N*`FHE_L/2), ntt_v1)
+  `ALOHA_MEM_SDP_SIG(64, `ALOHA_SDP_AW, ntt_v0)
+  `ALOHA_MEM_SDP_SIG(64, `ALOHA_SDP_AW, ntt_v1)
   `ALOHA_MEM_SDP_SIG(54, `ALOHA_SDP_AW, ntt_e1_0)
   `ALOHA_MEM_SDP_SIG(54, `ALOHA_SDP_AW, ntt_e1_1)
   `ALOHA_MEM_SDP_SIG(54, `ALOHA_SDP_AW, ntt_key0)
@@ -117,7 +119,7 @@ interface fhe_aloha_mem_if;
 
   modport req (
     output eng_step, input eng_stall,
-    output ntt_msg0_mask, ntt_msg1_mask,
+    output ntt_msg0_mask, ntt_msg1_mask, ntt_v0_mask, ntt_v1_mask,
     output sk_en, sk_we, sk_addr, sk_wdata, input sk_rdata,
     `ALOHA_MEM_SDP_REQ(ntt_msg0),
     `ALOHA_MEM_SDP_REQ(ntt_msg1),
@@ -139,7 +141,7 @@ interface fhe_aloha_mem_if;
 
   modport resp (
     input eng_step, output eng_stall,
-    input ntt_msg0_mask, ntt_msg1_mask,
+    input ntt_msg0_mask, ntt_msg1_mask, ntt_v0_mask, ntt_v1_mask,
     input sk_en, sk_we, sk_addr, sk_wdata, output sk_rdata,
     `ALOHA_MEM_SDP_RESP(ntt_msg0),
     `ALOHA_MEM_SDP_RESP(ntt_msg1),
