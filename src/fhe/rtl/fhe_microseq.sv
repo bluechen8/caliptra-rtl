@@ -15,7 +15,7 @@
 // Description:
 //   Stage-B' FHE microsequencer (the "walker").
 //
-//   Turns one high-level command (KEYGEN / ENCRYPT / DECRYPT / RECOVER / REFRESH) into the
+//   Turns one high-level command (KEYGEN / ENCRYPT / DECRYPT / RECOVER / REFRESH / EVKGEN) into the
 //   sequence of Aloha-HE ComputeCore engine passes that implements it. Data
 //   moves over the ComputeCoreWrapper debug-IO pins (control_low_word /
 //   control_high_word / dina_ext / status / dout_ext) as send64 / receive64;
@@ -30,6 +30,12 @@
 //   rebuild limb i in K (KW), so every completed command leaves limb 0 there.
 //   k0_ok records that K holds a complete limb 0; SKIPK skips the standalone
 //   rebuild in front of DECRYPT and REFRESH when it is set.
+//
+//   EVKGEN (docs/fhe/21) writes one row j of an evaluation key at level L: an
+//   RLWE sample of G_j*m under s' for each of the L + 1 primes q_0..q_{L-1}, P,
+//   with P = q_{FHE_L-1}. It is REFRESH's re-encrypt loop with a zero message,
+//   plus a gadget pass on limb j (SKIPROW), and PWM_ENC reads the key at
+//   pi_h(k) for a Galois key.
 //
 //   Macro-op word + ROM layout: see microsequencer doc section 5.1/5.2.
 //
@@ -62,6 +68,13 @@ module fhe_microseq
   output logic        k_kw,
   output logic [53:0] k_scale,
   input  fhe_cmd_e    cmd,
+
+  // EVKGEN row (EVK register, held while busy): the Galois element h (0 for
+  // the relinearization key), the row j, and the per-prime gadget P mod q_j.
+  input  logic [15:0] evk_h,
+  input  logic [3:0]  evk_row,
+  input  logic [63:0] gadget [0:FHE_L-1],
+  output logic [53:0] k_gad,
 
   // Per-command instruction scale field (CONFIG.SCALE), written by firmware.
   // KEYGEN/ENCRYPT patch it into the RNS pass (unsigned); DECRYPT patches its
@@ -130,7 +143,8 @@ module fhe_microseq
   // =====================================================================
   localparam logic [3:0] OP_NOP=4'd0, OP_DMA_IN=4'd1, OP_DMA_OUT=4'd2,
                          OP_CONST=4'd3, OP_EXE=4'd5,
-                         OP_MOVE=4'd6, OP_LIMB=4'd7, OP_DONE=4'd8, OP_SKIPK=4'd9;
+                         OP_MOVE=4'd6, OP_LIMB=4'd7, OP_DONE=4'd8, OP_SKIPK=4'd9,
+                         OP_SKIPROW=4'd10;
 
   // BANK ids (mirror Aloha bram_sel; SK=8 is new in B'/C')
   localparam logic [3:0] B_FFT=4'd0, B_NTTMSG=4'd1, B_NTTV=4'd3,
@@ -148,7 +162,11 @@ module fhe_microseq
   // command-template indices
   localparam int unsigned T_FFTDIF=0, T_FFTDIT=1, T_RNS=2, T_NTTFWD=3,
                           T_NTTINV=4, T_PWMENC=5, T_PWMDEC=6, T_I2F=7, T_PROJ=8,
-                          T_SAMPLE=9, T_SNAPSHOT=10, T_LIFT=11;
+                          T_SAMPLE=9, T_SNAPSHOT=10, T_LIFT=11,
+                          T_PWMGAD=12, T_LIFTZ=13;
+  // Pass-command bits a PWM pass otherwise ignores, set at EXE decode for a
+  // key row: square the key (OP1[7]), read it at pi_h (OP1[8]).
+  localparam int unsigned PC_SQUARE = 10, PC_PERM = 11;
 
   // =====================================================================
   // Command templates: ComputeCore's 40-bit command, pre-patch. doc section 5.2.
@@ -170,12 +188,17 @@ module fhe_microseq
       T_SAMPLE: tmpl_base = 40'd6;
       T_SNAPSHOT: tmpl_base = (40'd1<<3) | 40'd7;
       T_LIFT: tmpl_base = 40'd7;
+      // PWM with the gadget scalar as multiplier (OP1[6]); enc=1 so the
+      // multiplier port reads A, which the pass leaves as it is.
+      T_PWMGAD: tmpl_base = (40'd1<<9) | (40'd1<<4) | 40'd4;
+      T_LIFTZ: tmpl_base = (40'd1<<4) | 40'd7;            // LIFT a zero message
       default : tmpl_base = '0;
     endcase
   endfunction
   // which fields the template needs patched
   function automatic logic tmpl_use_q  (input int unsigned t);
-    tmpl_use_q  = (t==T_RNS)||(t==T_NTTFWD)||(t==T_NTTINV)||(t==T_PWMENC)||(t==T_PWMDEC)||(t==T_I2F)||(t==T_LIFT);
+    tmpl_use_q  = (t==T_RNS)||(t==T_NTTFWD)||(t==T_NTTINV)||(t==T_PWMENC)||(t==T_PWMDEC)||(t==T_I2F)||(t==T_LIFT)||
+                  (t==T_PWMGAD)||(t==T_LIFTZ);
   endfunction
   function automatic logic tmpl_use_rom(input int unsigned t);
     tmpl_use_rom = (t==T_RNS)||(t==T_NTTFWD)||(t==T_NTTINV);
@@ -204,12 +227,14 @@ module fhe_microseq
   function automatic logic [27:0] pl_const(input logic [3:0] bank, input logic [1:0] cid);
     pl_const = {bank, cid, 22'd0};
   endfunction
-  // EXE : one engine pass. template[27:20] reserved[19:16]=0 patch[15] scalesel[14:13]
-  //       paramsel[12:11] reserved[10]=0
+  // EXE : one engine pass. template[27:20] reserved[19:17]=0 sq[16] (a relinearization
+  //       key's PWM squares K) patch[15] scalesel[14:13]
+  //       paramsel[12:11] perm[10] (a Galois key's PWM reads K at pi_h(k))
   //       kw[9] (K.low takes this pass's key-limb writes) kg[8] (KEYGEN mode)
   function automatic logic [27:0] pl_exe(input logic [7:0] tmpl, input logic patch, input logic [1:0] sc,
-                                         input logic [1:0] ps, input logic kg = 1'b0, input logic kw = 1'b0);
-    pl_exe = {tmpl, 4'd0, patch, sc, ps, 1'b0, kw, kg, 8'd0};
+                                         input logic [1:0] ps, input logic kg = 1'b0, input logic kw = 1'b0,
+                                         input logic perm = 1'b0, input logic sq = 1'b0);
+    pl_exe = {tmpl, 3'd0, sq, patch, sc, ps, perm, kw, kg, 8'd0};
   endfunction
   // MOVE : srcbank[27:24] dstbank[23:20] srcstr[19] dststr[18]
   function automatic logic [27:0] pl_move(input logic [3:0] sb, input logic [3:0] db, input logic ss, input logic ds);
@@ -220,6 +245,7 @@ module fhe_microseq
   // DONE : irq[27]
   function automatic logic [27:0] pl_done(input logic irq); pl_done = {irq, 27'd0}; endfunction
   // SKIPK : count[27:20], words skipped when K holds limb 0 (k0_ok)
+  // SKIPROW: count[27:20], words skipped unless the limb is the EVKGEN row
   function automatic logic [27:0] pl_skipk(input logic [7:0] n); pl_skipk = {n, 20'd0}; endfunction
 
   // field extractors
@@ -230,9 +256,11 @@ module fhe_microseq
   function automatic logic        f_off (input logic [31:0] w); f_off  = w[17];    endfunction
   function automatic logic [1:0]  f_cid (input logic [31:0] w); f_cid  = w[23:22]; endfunction
   function automatic logic [7:0]  f_tmpl(input logic [31:0] w); f_tmpl = w[27:20]; endfunction
+  function automatic logic        f_sq  (input logic [31:0] w); f_sq   = w[16];    endfunction
   function automatic logic        f_pat (input logic [31:0] w); f_pat  = w[15];    endfunction
   function automatic logic [1:0]  f_sc  (input logic [31:0] w); f_sc   = w[14:13]; endfunction
   function automatic logic [1:0]  f_ps  (input logic [31:0] w); f_ps   = w[12:11]; endfunction
+  function automatic logic        f_perm(input logic [31:0] w); f_perm = w[10];    endfunction
   function automatic logic        f_kw  (input logic [31:0] w); f_kw   = w[9];     endfunction
   function automatic logic        f_kg  (input logic [31:0] w); f_kg   = w[8];     endfunction
   function automatic logic [7:0]  f_skip(input logic [31:0] w); f_skip = w[27:20]; endfunction
@@ -252,6 +280,7 @@ module fhe_microseq
   localparam int DEC_ENTRY = 32;
   localparam int REC_ENTRY = 48;
   localparam int REF_ENTRY = 64;
+  localparam int EVK_ENTRY = 80;
 
   // Shared storage, one-limb resident key (docs/fhe/20). A rebuild of limb 0 is
   // RNS (KG, KW) then NTT (KG, KW): the v lane maps K.sample to s*R mod q into
@@ -320,6 +349,18 @@ module fhe_microseq
       REF_ENTRY+13: reuse_rom = mk(OP_DMA_OUT, pl_dma(B_NTTMSG, 3'd2, 1'b1, 2'd0, 1'b0));
       REF_ENTRY+14: reuse_rom = mk(OP_DMA_OUT, pl_dma(B_NTTKEY, 3'd3, 1'b1, 2'd0, 1'b0));
       REF_ENTRY+15: reuse_rom = mk(OP_DONE, pl_done(1'b0));
+
+      // ---------- EVKGEN (entry 80): one key row, limbs L (= P) down to 0 ----------
+      EVK_ENTRY+0:  reuse_rom = mk(OP_EXE, pl_exe(T_SAMPLE[7:0], 1'b0, SC_NONE, PS_ERR));     // row error e
+      EVK_ENTRY+1:  reuse_rom = mk(OP_LIMB, pl_limb(8'd7));
+      EVK_ENTRY+2:  reuse_rom = mk(OP_EXE, pl_exe(T_LIFTZ[7:0], 1'b1, SC_NONE, PS_ZERO, 1'b0, 1'b1));
+      EVK_ENTRY+3:  reuse_rom = mk(OP_EXE, pl_exe(T_NTTFWD[7:0], 1'b1, SC_NONE, PS_A, 1'b0, 1'b1));
+      EVK_ENTRY+4:  reuse_rom = mk(OP_SKIPROW, pl_skipk(8'd1));
+      EVK_ENTRY+5:  reuse_rom = mk(OP_EXE, pl_exe(T_PWMGAD[7:0], 1'b1, SC_NONE, PS_ZERO, .sq(1'b1)));  // M += G_j*m
+      EVK_ENTRY+6:  reuse_rom = mk(OP_EXE, pl_exe(T_PWMENC[7:0], 1'b1, SC_NONE, PS_ZERO, .perm(1'b1)));
+      EVK_ENTRY+7:  reuse_rom = mk(OP_DMA_OUT, pl_dma(B_NTTMSG, 3'd2, 1'b1, 2'd0, 1'b0)); // c0->PTR2
+      EVK_ENTRY+8:  reuse_rom = mk(OP_DMA_OUT, pl_dma(B_NTTKEY, 3'd3, 1'b1, 2'd0, 1'b0)); // c1->PTR3
+      EVK_ENTRY+9:  reuse_rom = mk(OP_DONE, pl_done(1'b0));
       default: ;
     endcase
   endfunction
@@ -404,7 +445,12 @@ module fhe_microseq
   // limb loop
   logic        limb_active;
   logic [3:0]  limb_idx;
-  wire [63:0] r2_cur = r2modq[limb_idx];  // R^2 mod q of the active limb
+  logic [3:0]  limb_cnt;         // = num_limbs for this cmd (1 if decrypt)
+  // Prime of the active limb: limb i uses q_i, except an EVKGEN row's top
+  // limb L, which is P = q_{FHE_L-1}. DMA limb offsets stay limb_idx.
+  wire         evkgen = cmd == FHE_EVKGEN;
+  wire [3:0]   prime_idx = (evkgen && limb_idx == num_limbs) ? 4'(FHE_L - 1) : limb_idx;
+  wire [63:0]  r2_cur = r2modq[prime_idx];  // R^2 mod q of the active limb's prime
 
   // One-limb key controls of the current pass, and k0_ok: K holds a complete
   // limb 0. A KW pass clears it when it starts; the KW NTT pass sets it when it
@@ -412,8 +458,9 @@ module fhe_microseq
   logic        kg_q, kw_q, k0_ok;
   assign k_kg    = (st == S_EXE_POLL) && kg_q;
   assign k_kw    = (st == S_EXE_POLL) && kw_q;
-  assign k_scale = rmodq[limb_idx][53:0];
-  logic [3:0]  limb_cnt;         // = num_limbs for this cmd (1 if decrypt)
+  assign k_scale = rmodq[prime_idx][53:0];
+  // The gadget pass runs only on limb j, where the prime is q_j.
+  assign k_gad   = gadget[limb_idx][53:0];
   logic [7:0]  limb_base;        // pc of first body word
   logic [7:0]  limb_len;
   wire         recover = FHE_RECOVER_EN && (cmd == FHE_RECOVER);  // constant 0 without RECOVER
@@ -584,19 +631,24 @@ module fhe_microseq
             limb_idx    <= 4'd0;
             if (cmd == FHE_KEYGEN) k0_ok <= 1'b0;
             limb_cnt    <= (cmd == FHE_KEYGEN) ? 4'(FHE_L) :
+                           evkgen ? num_limbs + 4'd1 :     // the Q limbs and P
                            (cmd == FHE_ENCRYPT || recover || cmd == FHE_REFRESH)
                              ? ((num_limbs==4'd0)?4'd1:num_limbs) : 4'd1;
             pc <= (cmd == FHE_KEYGEN)  ? KG_ENTRY[7:0] :
                   (cmd == FHE_ENCRYPT) ? ENC_ENTRY[7:0] :
                   (cmd == FHE_REFRESH) ? REF_ENTRY[7:0] :
+                  evkgen               ? EVK_ENTRY[7:0] :
                   recover              ? REC_ENTRY[7:0] : DEC_ENTRY[7:0];
             // Recovery must never address a key/table limb outside this build,
-            // and a build without RECOVER has no program for it.
+            // and a build without RECOVER has no program for it. An EVKGEN row
+            // needs a key level below FHE_L (P is the top prime) and j < L.
             if (((recover || cmd == FHE_REFRESH) &&
                  (num_limbs == 0 || num_limbs > FHE_L)) ||
                 (cmd == FHE_ENCRYPT && num_limbs > FHE_L) ||
                 (cmd == FHE_RECOVER && !FHE_RECOVER_EN) ||
-                (cmd == FHE_REFRESH && !SRAM_REUSE)) begin
+                (cmd == FHE_REFRESH && !SRAM_REUSE) ||
+                (evkgen && (!SRAM_REUSE || num_limbs == 0 || num_limbs >= FHE_L ||
+                            evk_row >= num_limbs))) begin
               error <= 1'b1;
               st <= S_DONE;
             end else st <= S_FETCH;
@@ -646,7 +698,12 @@ module fhe_microseq
               // Any pass that may rewrite K (either field) invalidates limb 0.
               if (f_kw(op_w) || f_kg(op_w)) k0_ok <= 1'b0;
               control_low_word <= 32'd0;
-              pass_cmd <= patch_word(f_tmpl(op_w), f_pat(op_w), f_sc(op_w), limb_idx);
+              // Evaluation-key modes: square the key (OP1[7]) in a
+              // relinearization key's gadget pass, read it at pi_h (OP1[8])
+              // in a Galois key's PERM pass.
+              pass_cmd <= patch_word(f_tmpl(op_w), f_pat(op_w), f_sc(op_w), prime_idx);
+              if (f_sq(op_w) && evk_h == 16'd0) pass_cmd[PC_SQUARE] <= 1'b1;
+              if (f_perm(op_w) && evk_h != 16'd0) pass_cmd[PC_PERM] <= 1'b1;
               st <= S_EXE_POLL;
             end
             OP_CONST: begin
@@ -692,6 +749,12 @@ module fhe_microseq
             end
             OP_SKIPK: begin
               pc <= pc + 8'd1 + (k0_ok ? f_skip(op_w) : 8'd0);
+              st <= S_FETCH;
+            end
+            // Separate from SKIPK: the gadget term belongs to limb j alone,
+            // whatever K holds.
+            OP_SKIPROW: begin
+              pc <= pc + 8'd1 + ((limb_idx != evk_row) ? f_skip(op_w) : 8'd0);
               st <= S_FETCH;
             end
             default: begin // NOP -> advance

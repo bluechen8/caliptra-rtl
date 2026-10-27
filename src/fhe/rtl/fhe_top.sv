@@ -271,6 +271,13 @@ module fhe_top
   assign cfg_l     = hwif_out.FHE_CONFIG.L.value;
   assign cfg_logn  = hwif_out.FHE_CONFIG.LOGN.value;
   assign cfg_scale = hwif_out.FHE_CONFIG.SCALE.value;
+  // EVKGEN row (docs/fhe/21): Galois element h (0 = relinearization) and row j.
+  logic [15:0] evk_h;
+  logic [3:0]  evk_row;
+  assign evk_h   = hwif_out.FHE_EVK.GALOIS.value;
+  assign evk_row = hwif_out.FHE_EVK.ROW.value;
+  // EVKGEN needs a key-switching prime above the key level, so FHE_L >= 2.
+  localparam bit EVKGEN_EN = FHE_L >= 2;
 
   // The slots a command uses must be 16-byte aligned and must not run past the
   // DMA's address space: BASE + limbs*N*8 <= 2^DMA_AW.
@@ -298,7 +305,7 @@ module fhe_top
   always_comb begin
     precheck = FHE_EC_NONE;
     if (!(cmd_in inside {FHE_ENCRYPT, FHE_KEYGEN, FHE_DECRYPT, FHE_REFRESH} ||
-          (FHE_RECOVER_EN && cmd_in == FHE_RECOVER)))
+          (FHE_RECOVER_EN && cmd_in == FHE_RECOVER) || (EVKGEN_EN && cmd_in == FHE_EVKGEN)))
       precheck = FHE_EC_BAD_OPCODE;  // RECOVER only in verification builds
     else if (cfg_logn != 4'(FHE_LOGN))
       precheck = FHE_EC_BAD_LOGN;
@@ -307,8 +314,16 @@ module fhe_top
       else if (kv_seed_error) precheck = FHE_EC_KV_READ;
     end else begin
       if (!key_valid) precheck = FHE_EC_NO_KEY;
-      else if (cmd_in != FHE_DECRYPT && (cfg_l == 4'd0 || cfg_l > 4'(FHE_L)))
+      // EVKGEN's P = q_{FHE_L-1} must lie above the key level.
+      else if (cmd_in != FHE_DECRYPT &&
+               (cfg_l == 4'd0 || cfg_l > 4'(FHE_L) - 4'(cmd_in == FHE_EVKGEN)))
         precheck = FHE_EC_BAD_L;
+      // h = 0 (relinearization) or odd with 1 < h < 2N.
+      else if (cmd_in == FHE_EVKGEN && evk_h != 16'd0 &&
+               (!evk_h[0] || evk_h == 16'd1 || 17'(evk_h) >= 17'(2 * FHE_N)))
+        precheck = FHE_EC_BAD_GALOIS;
+      else if (cmd_in == FHE_EVKGEN && evk_row >= cfg_l)
+        precheck = FHE_EC_BAD_ROW;
       else if (!slots_ok)
         precheck = FHE_EC_BAD_ADDR;
       else if (!dma_idle)
@@ -350,6 +365,8 @@ module fhe_top
     if (reject_done)                done_cause = reject_cause;
     else if (w_done & br_xfer_error) done_cause = FHE_EC_TRANSPORT;
     else if (w_done & br_word_error) done_cause = FHE_EC_BAD_WORD;
+    // The walker's own range guard, behind the prechecks: never cause 0.
+    else if (w_error)                done_cause = FHE_EC_BAD_L;
     else                            done_cause = FHE_EC_NONE;
   end
 
@@ -424,6 +441,7 @@ module fhe_top
     hwif_in.FHE_CAP.N.next             = 16'(FHE_N);
     hwif_in.FHE_CAP.L.next             = 4'(FHE_L);
     hwif_in.FHE_CAP.FFT_GENERATED.next = 1'b1;  // twiddles are always generated
+    hwif_in.FHE_CAP.EVKGEN.next        = EVKGEN_EN;
     hwif_in.FHE_CAP.RSVD0.next         = '0;
     hwif_in.FHE_CAP.DMA_STREAM.next    = 1'b1;
     hwif_in.FHE_CAP.RSVD1.next         = '0;
@@ -437,6 +455,9 @@ module fhe_top
     hwif_in.FHE_XFER_STATUS.LIMB.next      = stream_status[11:8];
     hwif_in.FHE_XFER_STATUS.RSVD2.next     = '0;
     hwif_in.FHE_XFER_LEFT.LEFT.next        = stream_left;
+
+    hwif_in.FHE_EVK.GALOIS.hwclr = zeroize;
+    hwif_in.FHE_EVK.ROW.hwclr    = zeroize;
 
     for (int s = 0; s < 4; s++) begin
       hwif_in.FHE_SLOT[s].BASE_L.ADDR.hwclr = zeroize;
@@ -452,6 +473,11 @@ module fhe_top
   logic [63:0] RMODQ [0:FHE_L-1];
   for (genvar i = 0; i < FHE_L; i++) begin : g_rmodq
     assign RMODQ[i] = fhe_rmodq(4'(i));
+  end
+  // Evaluation-key gadget P mod q_j, P = q_{FHE_L-1}.
+  logic [63:0] GADGET [0:FHE_L-1];
+  for (genvar i = 0; i < FHE_L; i++) begin : g_gadget
+    assign GADGET[i] = fhe_gadget(4'(i));
   end
 
   logic [31:0] w_cl, w_ch, w_dl, w_dh;
@@ -472,12 +498,13 @@ module fhe_top
   logic [3:0]   w_desc_limb;
   logic         w_dma_ready, w_rd_valid, w_rd_pop, w_wr_ready;
   logic         k_kg, k_kw;     // walker -> core: this pass's KEYGEN mode and K writes
-  logic [53:0]  k_scale;
+  logic [53:0]  k_scale, k_gad;
   logic         exe_hold, exe_held;
 
   fhe_microseq #(.SRAM_REUSE(1), .LOGN(FHE_LOGN), .N(FHE_N)) walker (
     .step(core_step),
     .k_kg(k_kg), .k_kw(k_kw), .k_scale(k_scale),
+    .evk_h(evk_h), .evk_row(evk_row), .gadget(GADGET), .k_gad(k_gad),
     .sk_en(fhe_aloha_mem.sk_en), .sk_we(fhe_aloha_mem.sk_we),
     .sk_addr(fhe_aloha_mem.sk_addr), .sk_wdata(fhe_aloha_mem.sk_wdata),
     .sk_rdata(fhe_aloha_mem.sk_rdata),
@@ -530,6 +557,7 @@ module fhe_top
     .EXT_COMMAND               (1)    // the walker loads each pass's command
   ) core (
     .k_kg(k_kg), .k_kw(k_kw), .k_scale(k_scale),
+    .k_gad(k_gad), .k_perm_h(evk_h[FHE_LOGN:0]),
     .clk                (core_clk),
     .reseed_en          (w_reseed_en),
     .prng_rst_i         (fhe_prng_rst),

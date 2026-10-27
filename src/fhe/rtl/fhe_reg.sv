@@ -97,6 +97,7 @@ module fhe_reg (
             logic BASE_L;
             logic BASE_H;
         } [4-1:0]FHE_SLOT;
+        logic FHE_EVK;
     } decoded_reg_strb_t;
     decoded_reg_strb_t decoded_reg_strb;
     logic decoded_strb_is_external;
@@ -128,6 +129,7 @@ module fhe_reg (
             decoded_reg_strb.FHE_SLOT[i0].BASE_L = cpuif_req_masked & (cpuif_addr == 7'h30 + i0*7'h8);
             decoded_reg_strb.FHE_SLOT[i0].BASE_H = cpuif_req_masked & (cpuif_addr == 7'h34 + i0*7'h8);
         end
+        decoded_reg_strb.FHE_EVK = cpuif_req_masked & (cpuif_addr == 7'h54);
         decoded_strb_is_external = is_external;
         external_req = is_external;
     end
@@ -194,6 +196,16 @@ module fhe_reg (
                 } ADDR;
             } BASE_H;
         } [4-1:0]FHE_SLOT;
+        struct packed{
+            struct packed{
+                logic [15:0] next;
+                logic load_next;
+            } GALOIS;
+            struct packed{
+                logic [3:0] next;
+                logic load_next;
+            } ROW;
+        } FHE_EVK;
     } field_combo_t;
     field_combo_t field_combo;
 
@@ -240,6 +252,14 @@ module fhe_reg (
                 } ADDR;
             } BASE_H;
         } [4-1:0]FHE_SLOT;
+        struct packed{
+            struct packed{
+                logic [15:0] value;
+            } GALOIS;
+            struct packed{
+                logic [3:0] value;
+            } ROW;
+        } FHE_EVK;
     } field_storage_t;
     field_storage_t field_storage;
 
@@ -480,6 +500,54 @@ module fhe_reg (
         end
         assign hwif_out.FHE_SLOT[i0].BASE_H.ADDR.value = field_storage.FHE_SLOT[i0].BASE_H.ADDR.value;
     end
+    // Field: fhe_reg.FHE_EVK.GALOIS
+    always_comb begin
+        automatic logic [15:0] next_c;
+        automatic logic load_next_c;
+        next_c = field_storage.FHE_EVK.GALOIS.value;
+        load_next_c = '0;
+        if(decoded_reg_strb.FHE_EVK && decoded_req_is_wr && hwif_in.fhe_ready) begin // SW write
+            next_c = (field_storage.FHE_EVK.GALOIS.value & ~decoded_wr_biten[15:0]) | (decoded_wr_data[15:0] & decoded_wr_biten[15:0]);
+            load_next_c = '1;
+        end else if(hwif_in.FHE_EVK.GALOIS.hwclr) begin // HW Clear
+            next_c = '0;
+            load_next_c = '1;
+        end
+        field_combo.FHE_EVK.GALOIS.next = next_c;
+        field_combo.FHE_EVK.GALOIS.load_next = load_next_c;
+    end
+    always_ff @(posedge clk or negedge hwif_in.reset_b) begin
+        if(~hwif_in.reset_b) begin
+            field_storage.FHE_EVK.GALOIS.value <= 16'h0;
+        end else if(field_combo.FHE_EVK.GALOIS.load_next) begin
+            field_storage.FHE_EVK.GALOIS.value <= field_combo.FHE_EVK.GALOIS.next;
+        end
+    end
+    assign hwif_out.FHE_EVK.GALOIS.value = field_storage.FHE_EVK.GALOIS.value;
+    // Field: fhe_reg.FHE_EVK.ROW
+    always_comb begin
+        automatic logic [3:0] next_c;
+        automatic logic load_next_c;
+        next_c = field_storage.FHE_EVK.ROW.value;
+        load_next_c = '0;
+        if(decoded_reg_strb.FHE_EVK && decoded_req_is_wr && hwif_in.fhe_ready) begin // SW write
+            next_c = (field_storage.FHE_EVK.ROW.value & ~decoded_wr_biten[19:16]) | (decoded_wr_data[19:16] & decoded_wr_biten[19:16]);
+            load_next_c = '1;
+        end else if(hwif_in.FHE_EVK.ROW.hwclr) begin // HW Clear
+            next_c = '0;
+            load_next_c = '1;
+        end
+        field_combo.FHE_EVK.ROW.next = next_c;
+        field_combo.FHE_EVK.ROW.load_next = load_next_c;
+    end
+    always_ff @(posedge clk or negedge hwif_in.reset_b) begin
+        if(~hwif_in.reset_b) begin
+            field_storage.FHE_EVK.ROW.value <= 4'h0;
+        end else if(field_combo.FHE_EVK.ROW.load_next) begin
+            field_storage.FHE_EVK.ROW.value <= field_combo.FHE_EVK.ROW.next;
+        end
+    end
+    assign hwif_out.FHE_EVK.ROW.value = field_storage.FHE_EVK.ROW.value;
 
     //--------------------------------------------------------------------------
     // Write response
@@ -514,7 +582,7 @@ module fhe_reg (
     logic [31:0] readback_data;
 
     // Assign readback values to a flattened array
-    logic [19-1:0][31:0] readback_array;
+    logic [20-1:0][31:0] readback_array;
     for(genvar i0=0; i0<2; i0++) begin
         assign readback_array[i0*1 + 0][31:0] = (decoded_reg_strb.FHE_NAME[i0] && !decoded_req_is_wr) ? hwif_in.FHE_NAME[i0].NAME.next : '0;
     end
@@ -537,7 +605,8 @@ module fhe_reg (
     assign readback_array[6][15:0] = (decoded_reg_strb.FHE_CAP && !decoded_req_is_wr) ? hwif_in.FHE_CAP.N.next : '0;
     assign readback_array[6][19:16] = (decoded_reg_strb.FHE_CAP && !decoded_req_is_wr) ? hwif_in.FHE_CAP.L.next : '0;
     assign readback_array[6][20:20] = (decoded_reg_strb.FHE_CAP && !decoded_req_is_wr) ? hwif_in.FHE_CAP.FFT_GENERATED.next : '0;
-    assign readback_array[6][23:21] = (decoded_reg_strb.FHE_CAP && !decoded_req_is_wr) ? hwif_in.FHE_CAP.RSVD0.next : '0;
+    assign readback_array[6][21:21] = (decoded_reg_strb.FHE_CAP && !decoded_req_is_wr) ? hwif_in.FHE_CAP.EVKGEN.next : '0;
+    assign readback_array[6][23:22] = (decoded_reg_strb.FHE_CAP && !decoded_req_is_wr) ? hwif_in.FHE_CAP.RSVD0.next : '0;
     assign readback_array[6][24:24] = (decoded_reg_strb.FHE_CAP && !decoded_req_is_wr) ? hwif_in.FHE_CAP.DMA_STREAM.next : '0;
     assign readback_array[6][27:25] = (decoded_reg_strb.FHE_CAP && !decoded_req_is_wr) ? hwif_in.FHE_CAP.RSVD1.next : '0;
     assign readback_array[6][31:28] = (decoded_reg_strb.FHE_CAP && !decoded_req_is_wr) ? hwif_in.FHE_CAP.MAP_VERSION.next : '0;
@@ -561,6 +630,9 @@ module fhe_reg (
         assign readback_array[i0*2 + 11][31:0] = (decoded_reg_strb.FHE_SLOT[i0].BASE_L && !decoded_req_is_wr) ? field_storage.FHE_SLOT[i0].BASE_L.ADDR.value : '0;
         assign readback_array[i0*2 + 12][31:0] = (decoded_reg_strb.FHE_SLOT[i0].BASE_H && !decoded_req_is_wr) ? field_storage.FHE_SLOT[i0].BASE_H.ADDR.value : '0;
     end
+    assign readback_array[19][15:0] = (decoded_reg_strb.FHE_EVK && !decoded_req_is_wr) ? field_storage.FHE_EVK.GALOIS.value : '0;
+    assign readback_array[19][19:16] = (decoded_reg_strb.FHE_EVK && !decoded_req_is_wr) ? field_storage.FHE_EVK.ROW.value : '0;
+    assign readback_array[19][31:20] = (decoded_reg_strb.FHE_EVK && !decoded_req_is_wr) ? 12'h0 : '0;
 
     // Reduce the array
     always_comb begin
@@ -568,7 +640,7 @@ module fhe_reg (
         readback_done = decoded_req & ~decoded_req_is_wr & ~decoded_strb_is_external;
         readback_err = '0;
         readback_data_var = '0;
-        for(int i=0; i<19; i++) readback_data_var |= readback_array[i];
+        for(int i=0; i<20; i++) readback_data_var |= readback_array[i];
         readback_data = readback_data_var;
     end
 

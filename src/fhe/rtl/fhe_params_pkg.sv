@@ -128,6 +128,12 @@ package fhe_params_pkg;
       if (fhe_rmodq >= q) fhe_rmodq = fhe_rmodq - q;
     end
   endfunction
+  // Evaluation-key gadget for row j, G_j = P mod q_j, with the key-switching
+  // prime P = q_{FHE_L-1} (docs/fhe/21). Plain, not Montgomery: it multiplies
+  // the Montgomery-form key limb. Elaboration-time only.
+  function automatic logic [63:0] fhe_gadget(input logic [3:0] j);
+    fhe_gadget = fhe_q(4'(FHE_L - 1)) % fhe_q(j);
+  endfunction
 
   // Core control word flags, above the [LOGN:0] bank address (N <= 16384).
   // Mirrored as literals in aloha/vendor/Aloha-HE_Common/ComputeCoreWrapper.v.
@@ -140,7 +146,7 @@ package fhe_params_pkg;
     FHE_NONE    = 3'b000,
     FHE_ENCRYPT = 3'b001, // svc1: encode + encrypt (fresh L-limb ct -> DRAM)
     FHE_KEYGEN  = 3'b010, // svc2: keygen (sk->KeyVault, emit pk + evk)
-    FHE_REENC   = 3'b011, // svc3: decrypt + decode + re-encrypt to TARGET_LEVEL
+    FHE_EVKGEN  = 3'b011, // one evaluation-key row (Galois or relinearization)
     FHE_DECRYPT = 3'b100, // decoded slots, limb zero
     FHE_REFRESH = 3'b110, // single-limb centered level refresh
     FHE_RECOVER = 3'b101 // coefficient residues, all selected limbs; no FFT
@@ -159,12 +165,15 @@ package fhe_params_pkg;
     FHE_EC_BAD_WORD   = 4'd8,
     FHE_EC_BAD_ADDR   = 4'd9,
     FHE_EC_TRANSPORT  = 4'd10,
-    FHE_EC_ABORTED    = 4'd11
+    FHE_EC_ABORTED    = 4'd11,
+    FHE_EC_BAD_GALOIS = 4'd12,
+    FHE_EC_BAD_ROW    = 4'd13
   } fhe_err_e;
 
   //----------------------------------------------------------------
   // Segment routes (docs/fhe/16 "Commands, slots and inputs"). Each slot of a
-  // command moves either nothing, its q0 limb, or CONFIG.L limbs. Slots that
+  // command moves either nothing, its q0 limb, CONFIG.L limbs, or, for an
+  // evaluation-key row, L + 1 limbs (the Q limbs and P). Slots that
   // cross the AES boundary (ENCRYPT message in, DECRYPT slots out) go through
   // AES-GCM; every other slot bypasses AES.
   //----------------------------------------------------------------
@@ -175,6 +184,7 @@ package fhe_params_pkg;
       FHE_DECRYPT: return (slot <= 3'd2) ? 4'd1 : 4'd0;
       FHE_RECOVER: return (slot <= 3'd2) ? l : 4'd0;
       FHE_REFRESH: return (slot <= 3'd1) ? 4'd1 : (slot <= 3'd3) ? l : 4'd0;
+      FHE_EVKGEN:  return (slot >= 3'd2 && slot <= 3'd3) ? l + 4'd1 : 4'd0;
       default:     return 4'd0;
     endcase
   endfunction

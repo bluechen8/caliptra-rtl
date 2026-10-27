@@ -74,7 +74,8 @@ module fhe_top_dma_tb
   localparam int CROM_DEPTH = 1 << FHE_CROM_AW;
   localparam logic [31:0] CAP_DMA = 32'd1 << 24;   // DMA_STREAM
   localparam int DMA_AW = 48;   // axi_dma address width (slot range checks)
-  localparam logic [31:0] CAP_EXPECTED = 32'(N) | (32'(FHE_L) << 16) | (32'd1 << 20) | CAP_DMA | (32'd2 << 28);  // [20] generated twiddles
+  localparam logic [31:0] CAP_EXPECTED = 32'(N) | (32'(FHE_L) << 16) | (32'd1 << 20) | CAP_DMA | (32'd2 << 28)  // [20] generated twiddles
+                                        | (32'(FHE_L >= 2) << 21);                                             // [21] EVKGEN
 
   localparam int     RT_SCALE    = 17 + LOGN;
   // The pre-reuse golden key was sampled from this 64-bit seed with IV 0, which
@@ -212,7 +213,7 @@ module fhe_top_dma_tb
   always @(posedge clk) begin
     if (rst_b && aloha_mem.eng_step && dut.k_kw && dut.core_status[0] &&
         dut.walker.op_w[27:20] == T_NTTFWD_CODE) begin
-      automatic int li = dut.walker.limb_idx;
+      automatic int li = dut.walker.prime_idx;   // an EVKGEN row's top limb is P
       automatic bit standalone = dut.k_kg && dut.cmd_q != FHE_KEYGEN;
       if (standalone) begin
         rebuilds++;
@@ -1018,9 +1019,283 @@ module fhe_top_dma_tb
     end
   endtask
 
+  // ---- Evaluation keys (EVKGEN, docs/fhe/21) ----
+  // A row j at key level L is L + 1 limbs per component (q_0..q_{L-1}, then
+  // P = q_{FHE_L-1}); c0 goes to the c0 buffer and c1 to the c1 buffer.
+  localparam logic [AHW-1:0] A_EVK = 'h54;
+  task automatic evk_reg(input int h, input int row);
+    ahb_write(A_EVK, {12'd0, 4'(row), 16'(h)});
+  endtask
+  task automatic evk_slots();
+    set_slot(2, 64'(ADDR_C0)); set_slot(3, 64'(ADDR_C1));
+  endtask
+
+  function automatic logic [63:0] mulmod(input logic [63:0] a, input logic [63:0] b, input logic [63:0] q);
+    logic [127:0] p;
+    p = 128'(a) * 128'(b);
+    return 64'(p % 128'(q));
+  endfunction
+  // Signed coefficient v as a residue mod q.
+  function automatic logic [63:0] modq(input longint signed v, input logic [63:0] q);
+    return v < 0 ? q - 64'((-v) % q) : 64'(v % q);
+  endfunction
+  // log2(N)-bit reversal, and the NTT-domain automorphism index of sigma_g in
+  // Aloha's (bit-reversed) evaluation order: sigma_g(x)[k] = x[pi_g(k)].
+  function automatic int brv(input int x);
+    brv = 0;
+    for (int b = 0; b < LOGN; b++) if (x & (1 << b)) brv |= 1 << (LOGN - 1 - b);
+  endfunction
+  function automatic int pi_g(input int g, input int k);
+    return brv(((g * (2 * brv(k) + 1)) % (2 * N)) >> 1);
+  endfunction
+  // The prime catalog (aloha/vendor/Scripts/fhe_profiles.py), written out
+  // here so the row check does not share fhe_q / fhe_gadget with the DUT.
+  localparam logic [63:0] EVK_Q [0:7] = '{
+    64'h3ffff7000001, 64'h7fffff000001, 64'hffffd8000001, 64'h1fffffb000001,
+    64'h3ffffe4000001, 64'h7fffff9000001, 64'hffffff3000001, 64'h1ffffff6000001};
+  // G_j = P mod q_j with P = q_{FHE_L-1}.
+  function automatic logic [63:0] evk_gadget(input int j);
+    return EVK_Q[FHE_L - 1] % EVK_Q[j];
+  endfunction
+  function automatic int inv_2n(input int g);   // g^-1 mod 2N, g odd
+    for (int h = 1; h < 2 * N; h += 2) if ((g * h) % (2 * N) == 1) return h;
+    return 0;
+  endfunction
+
+  // The secret in coefficient order: RECOVER of c0 = 0, c1 = 1 on limb 0;
+  // and its negacyclic square, the relinearization message.
+  int evk_s [0:N-1];
+  longint signed evk_s2 [0:N-1];
+  task automatic evk_secret();
+    for (int i = 0; i < N; i++) begin
+      dram[ADDR_C0/8 + i] = 0;
+      dram[ADDR_C1/8 + i] = 1;
+    end
+    cfg(1, 12'(rns_scale));
+    dec_slots();
+    run_cmd(FHE_RECOVER, "RECOVER the secret for the evaluation-key checks");
+    for (int i = 0; i < N; i++) evk_s[i] = int'(centred(0, dram[ADDR_OUT/8 + i]));
+    foreach (evk_s2[k]) evk_s2[k] = 0;
+    for (int a = 0; a < N; a++)
+      for (int b = 0; b < N; b++)
+        if (a + b < N) evk_s2[a + b] += evk_s[a] * evk_s[b];
+        else           evk_s2[a + b - N] -= evk_s[a] * evk_s[b];
+  endtask
+
+  // Run one EVKGEN row and check it. K must come back holding limb 0 as it
+  // was (K.sample is never written), with k0_ok set.
+  int evk_rows = 0;
+  task automatic evk_row(input int l, input int g, input int row, input string nm);
+    int h = (g == 0) ? 0 : inv_2n(g);
+    cfg(l, 12'(rns_scale));
+    evk_reg(h, row);
+    evk_slots();
+    run_cmd(FHE_EVKGEN, nm);
+    if (key_diff() != 0 || !dut.walker.k0_ok) begin
+      $display("FAIL: %s left K changed in %0d words, k0_ok %0d", nm, key_diff(), dut.walker.k0_ok); errors++;
+    end
+    evk_rows++;
+    if (FHE_RECOVER_EN) evk_check(l, g, row, nm);
+  endtask
+
+  // Decrypt row j limb by limb through RECOVER, which uses s. A Galois row is
+  // first mapped by sigma_g in the NTT domain, so it decrypts under s:
+  //   sigma_g(c0) + sigma_g(c1) s = sigma_g(e) + [i = j] G_j sigma_g(s),
+  // and a relinearization row gives e + [i = j] G_j s^2. With the gadget term
+  // removed, every limb must hold the same small error.
+  // RECOVER limb i uses q_i: the P limb goes to limb FHE_L-1; limbs between
+  // L and FHE_L-1 decrypt zeros and are not checked.
+  function automatic bit evk_live(input int li, input int l);
+    return li < l || li == FHE_L - 1;
+  endfunction
+  task automatic evk_check(input int l, input int g, input int row, input string nm);
+    longint signed m [0:N-1];
+    logic [63:0] c [0:N-1];
+    int pi [0:N-1];
+    int nz = 0, emax = 0;
+    for (int k = 0; k < N; k++) pi[k] = (g == 0) ? k : pi_g(g, k);
+    for (int p = 0; p < 2; p++) begin
+      int base = (p == 0 ? ADDR_C0 : ADDR_C1) / 8;
+      for (int li = FHE_L - 1; li >= 0; li--) begin
+        int src = (li == FHE_L - 1) ? l : li;
+        for (int k = 0; k < N; k++) c[k] = evk_live(li, l) ? dram[base + src*N + k] : 64'd0;
+        for (int k = 0; k < N; k++) dram[base + li*N + k] = c[pi[k]];
+      end
+    end
+    // The message in coefficient order: s^2 (negacyclic) or sigma_g(s).
+    if (g == 0) m = evk_s2;
+    else begin
+      foreach (m[k]) m[k] = 0;
+      for (int k = 0; k < N; k++) begin
+        int t = (g * k) % (2 * N);
+        if (t < N) m[t] += evk_s[k];
+        else       m[t - N] -= evk_s[k];
+      end
+    end
+    cfg(FHE_L, 12'(rns_scale));
+    dec_slots();
+    run_cmd(FHE_RECOVER, {nm, ": RECOVER"});
+    for (int k = 0; k < N; k++) begin
+      longint signed e0;
+      for (int li = 0; li < FHE_L; li++) begin
+        logic [63:0] q, v;
+        longint signed e;
+        if (!evk_live(li, l)) continue;
+        q = EVK_Q[li];
+        v = dram[ADDR_OUT/8 + li*N + k];
+        if (li == row) v = (v + q - mulmod(evk_gadget(row), modq(m[k], q), q)) % q;
+        e = centred(li, v);
+        if (li == 0) e0 = e;
+        else if (e != e0) begin
+          if (errors < 20) $display("  %s: limb %0d coefficient %0d error %0d, limb 0 has %0d", nm, li, k, e, e0);
+          errors++;
+        end
+      end
+      if (e0 > 31 || e0 < -31) begin
+        if (errors < 20) $display("  %s: coefficient %0d error %0d is not small", nm, k, e0);
+        errors++;
+      end
+      if (e0 != 0) nz++;
+      if (e0 > emax) emax = int'(e0); else if (-e0 > emax) emax = int'(-e0);
+    end
+    if (nz == 0) begin $display("FAIL: %s: zero error polynomial", nm); errors++; end
+    else $display("PASS %s: every limb decrypts to G_j m + e, |e| <= %0d (%0d nonzero)", nm, emax, nz);
+  endtask
+
+  // Output backpressure in the middle of a row's c0 limb, when evk_stall is set.
+  bit evk_stall = 0, evk_stalled = 0;
+  initial forever begin
+    wait (evk_stall);
+    while (!(dut.cmd_q == FHE_EVKGEN && dut.br_active && dut.stream_status[1] &&
+             dut.stream_left < N/2 && !dut.w_wr_push && dut.w_wr_ready)) @(negedge clk);
+    force dut.w_wr_ready = 0;
+    repeat (64) @(negedge clk);
+    release dut.w_wr_ready;
+    evk_stalled = 1;
+    wait (!evk_stall);
+  end
+
+  // One row case: key level l, Galois element g (0: relinearization), row j.
+  typedef struct {int l, g, j;} evk_case_t;
+  function automatic evk_case_t evk_case(input int l, input int g, input int j);
+    evk_case.l = l; evk_case.g = g; evk_case.j = j;
+  endfunction
+
+  task automatic evk_tests();
+    logic [31:0] d;
+    int base, guard, el;
+    el = FHE_L - 1;   // the key level whose P is the top installed prime
+    $display("== evaluation keys (EVKGEN), key level %0d, P = q%0d ==", el, FHE_L - 1);
+    if (FHE_RECOVER_EN) evk_secret();
+    if (!dut.walker.k0_ok) $fatal(1, "evaluation-key tests need limb 0 resident");
+    // The reference gadget: nonzero, a pinned value at FHE_L = 2, and the
+    // DUT's catalog and GADGET table agree with it.
+    for (int j = 0; j < FHE_L; j++)
+      if (fhe_q(4'(j)) != EVK_Q[j] || dut.GADGET[j] != evk_gadget(j) ||
+          (j < FHE_L - 1 && evk_gadget(j) == 0)) begin
+        $display("FAIL: gadget %0d: DUT q 0x%h G 0x%h, reference q 0x%h G 0x%h",
+                 j, fhe_q(4'(j)), dut.GADGET[j], EVK_Q[j], evk_gadget(j)); errors++;
+      end
+    if (FHE_L == 2 && evk_gadget(0) != 64'd285212671) begin
+      $display("FAIL: reference gadget P mod q0 = %0d", evk_gadget(0)); errors++;
+    end
+    save_key();
+
+    // Preconditions.
+    cfg(0, 12'(rns_scale)); evk_reg(0, 0); evk_slots();
+    expect_reject(FHE_EVKGEN, FHE_EC_BAD_L, "EVKGEN at key level 0");
+    cfg(FHE_L, 12'(rns_scale));
+    expect_reject(FHE_EVKGEN, FHE_EC_BAD_L, "EVKGEN at key level FHE_L (no P above it)");
+    cfg(el, 12'(rns_scale));
+    evk_reg(0, el);
+    expect_reject(FHE_EVKGEN, FHE_EC_BAD_ROW, "EVKGEN row L");
+    evk_reg(4, 0);
+    expect_reject(FHE_EVKGEN, FHE_EC_BAD_GALOIS, "EVKGEN with an even Galois element");
+    evk_reg(1, 0);
+    expect_reject(FHE_EVKGEN, FHE_EC_BAD_GALOIS, "EVKGEN with Galois element 1");
+    evk_reg(2 * N + 1, 0);
+    expect_reject(FHE_EVKGEN, FHE_EC_BAD_GALOIS, "EVKGEN with a Galois element >= 2N");
+    // The L Q limbs fit below the DMA limit, the P limb does not.
+    evk_reg(0, 0);
+    set_slot(2, (64'd1 << DMA_AW) - 64'(el * N * 8));
+    expect_reject(FHE_EVKGEN, FHE_EC_BAD_ADDR, "EVKGEN whose P limb runs past the DMA range");
+    if (key_diff() != 0 || !dut.walker.k0_ok) begin $display("FAIL: a refused EVKGEN touched K"); errors++; end
+
+    // Every row of the relinearization key, rotation by 1 (g = 5) and
+    // conjugation (g = 2N - 1); row 0 runs with k0_ok already set. A lower key
+    // level keeps P = q_{FHE_L-1}: its top limb is not q_L. The last row runs
+    // with output backpressure. One call site keeps the generated C++ small.
+    begin
+      evk_case_t cs[$];
+      for (int j = 0; j < el; j++) cs.push_back(evk_case(el, 0, j));
+      for (int j = 0; j < el; j++) cs.push_back(evk_case(el, 5, j));
+      cs.push_back(evk_case(el, 2 * N - 1, el - 1));
+      if (el >= 2) begin
+        cs.push_back(evk_case(el - 1, 0, el - 2));
+        cs.push_back(evk_case(el - 1, 25, 0));
+      end
+      cs.push_back(evk_case(el, 5, 0));
+      foreach (cs[c]) begin
+        string nm;
+        evk_stall = (c == cs.size() - 1);
+        if (cs[c].g == 0) nm = $sformatf("relinearization key at level %0d, row %0d", cs[c].l, cs[c].j);
+        else nm = $sformatf("Galois key g=%0d at level %0d, row %0d", cs[c].g, cs[c].l, cs[c].j);
+        if (evk_stall) nm = {nm, ", output backpressure"};
+        evk_row(cs[c].l, cs[c].g, cs[c].j, nm);
+      end
+      evk_stall = 0;
+      if (!evk_stalled) begin $display("FAIL: EVKGEN backpressure injection did not run"); errors++; end
+    end
+    // A DECRYPT after EVKGEN finds limb 0 resident (finish_run counts rebuilds).
+    enc_slots(); cfg(1, 12'(rns_scale)); run_cmd(FHE_ENCRYPT, "ENCRYPT after EVKGEN");
+    cfg(1, 12'(i2f_val)); dec_slots(); run_cmd(FHE_DECRYPT, "DECRYPT after EVKGEN");
+    begin
+      longint reco [];
+      reco = new[N];
+      capture_slots(reco, ADDR_OUT);
+      check_fft(reco, g_input, N, "round trip after EVKGEN", 1.0e-3);
+    end
+
+    // ZEROIZE in a row's PERM pass: aborted, the key and k0_ok are gone.
+    cfg(el, 12'(rns_scale));
+    evk_reg(inv_2n(5), 0);
+    evk_slots();
+    issue_cmd(FHE_EVKGEN, base);
+    guard = 0;
+    while (!(dut.cmd_q == FHE_EVKGEN && !dut.core.CORE.pwm_rst && dut.walker.op_w[10] &&
+             dut.walker.limb_idx == 0) && guard < 10_000_000) begin
+      @(negedge clk); guard++;
+    end
+    if (guard >= 10_000_000) $fatal(1, "never reached EVKGEN's PWM_ENC pass");
+    ahb_write(A_CTRL, CTRL_ZEROIZE);
+    wait_status(ST_VALID, "ZEROIZE mid-EVKGEN");
+    ahb_read(A_STATUS, d);
+    if (d[ST_READY] && d[ST_ERROR] && d[7:4] == FHE_EC_ABORTED && !d[ST_KEY_VALID] && !dut.walker.k0_ok)
+      $display("PASS ZEROIZE mid-EVKGEN: aborted, KEY_VALID and k0_ok clear");
+    else begin $display("FAIL: ZEROIZE mid-EVKGEN left STATUS=0x%08h k0_ok %0d", d, dut.walker.k0_ok); errors++; end
+    ahb_read(A_EVK, d);
+    if (d != 0) begin $display("FAIL: ZEROIZE left EVK=0x%08h", d); errors++; end
+    rekey("KEYGEN (restore seed A after EVKGEN)");
+    $display("PASS evaluation keys: %0d rows", evk_rows);
+  endtask
+  // evk_tests runs in its own process, so its code is emitted once, not at
+  // each finish_run call site.
+  event evk_go;
+  bit evk_done = 0;
+  initial forever begin
+    @evk_go;
+    evk_tests();
+    evk_done = 1;
+  end
+
   // Level sweep, optional MNIST, verdict.
   task automatic finish_run();
     string mnist_dir;
+    if (FHE_L >= 2) begin
+      evk_done = 0;
+      -> evk_go;
+      wait (evk_done);
+    end
     level_sweep();
     if ($value$plusargs("MNIST=%s",mnist_dir)) run_mnist(mnist_dir);
     if (unexpected_rebuilds != 0) begin
@@ -1818,7 +2093,7 @@ module fhe_top_dma_tb
 
       // (2) Preconditions, each refused without running a pass.
       expect_reject(FHE_KEYGEN, FHE_EC_NO_SEED, "KEYGEN without a fresh seed read");
-      expect_reject(3'b011, FHE_EC_BAD_OPCODE, "opcode 011 (former REENC)");
+      if (FHE_L < 2) expect_reject(FHE_EVKGEN, FHE_EC_BAD_OPCODE, "EVKGEN in an FHE_L=1 build");
       expect_reject(3'b111, FHE_EC_BAD_OPCODE, "opcode 111");
       cfg(limbs, 12'(rns_scale), LOGN + 1);
       expect_reject(FHE_ENCRYPT, FHE_EC_BAD_LOGN, "ENCRYPT with LOGN mismatch");
@@ -1860,6 +2135,12 @@ module fhe_top_dma_tb
       if (d[ST_KEY_VALID] || d[ST_VALID]) begin $display("FAIL: idle ZEROIZE left STATUS=0x%08h", d); errors++; end
       cfg(limbs, 12'(i2f_val));
       expect_reject(FHE_DECRYPT, FHE_EC_NO_KEY, "DECRYPT after ZEROIZE (no key)");
+      if (FHE_L >= 2) begin
+        cfg(FHE_L - 1, 12'(rns_scale));
+        evk_reg(0, 0);
+        evk_slots();
+        expect_reject(FHE_EVKGEN, FHE_EC_NO_KEY, "EVKGEN after ZEROIZE (no key)");
+      end
 
       // (6) ZEROIZE during a command completes it as aborted (cause 11).
       load_seed(SEED_B);

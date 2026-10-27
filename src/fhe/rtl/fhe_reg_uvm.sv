@@ -233,7 +233,8 @@ package fhe_reg_uvm;
         fhe_reg__FHE_CAP_bit_cg N_bit_cg[16];
         fhe_reg__FHE_CAP_bit_cg L_bit_cg[4];
         fhe_reg__FHE_CAP_bit_cg FFT_GENERATED_bit_cg[1];
-        fhe_reg__FHE_CAP_bit_cg RSVD0_bit_cg[3];
+        fhe_reg__FHE_CAP_bit_cg EVKGEN_bit_cg[1];
+        fhe_reg__FHE_CAP_bit_cg RSVD0_bit_cg[2];
         fhe_reg__FHE_CAP_bit_cg DMA_STREAM_bit_cg[1];
         fhe_reg__FHE_CAP_bit_cg RSVD1_bit_cg[3];
         fhe_reg__FHE_CAP_bit_cg MAP_VERSION_bit_cg[4];
@@ -241,6 +242,7 @@ package fhe_reg_uvm;
         rand uvm_reg_field N;
         rand uvm_reg_field L;
         rand uvm_reg_field FFT_GENERATED;
+        rand uvm_reg_field EVKGEN;
         rand uvm_reg_field RSVD0;
         rand uvm_reg_field DMA_STREAM;
         rand uvm_reg_field RSVD1;
@@ -262,8 +264,10 @@ package fhe_reg_uvm;
             this.L.configure(this, 4, 16, "RO", 1, 'h0, 0, 1, 0);
             this.FFT_GENERATED = new("FFT_GENERATED");
             this.FFT_GENERATED.configure(this, 1, 20, "RO", 1, 'h0, 1, 1, 0);
+            this.EVKGEN = new("EVKGEN");
+            this.EVKGEN.configure(this, 1, 21, "RO", 1, 'h0, 1, 1, 0);
             this.RSVD0 = new("RSVD0");
-            this.RSVD0.configure(this, 3, 21, "RO", 1, 'h0, 0, 1, 0);
+            this.RSVD0.configure(this, 2, 22, "RO", 1, 'h0, 0, 1, 0);
             this.DMA_STREAM = new("DMA_STREAM");
             this.DMA_STREAM.configure(this, 1, 24, "RO", 1, 'h0, 1, 1, 0);
             this.RSVD1 = new("RSVD1");
@@ -274,6 +278,7 @@ package fhe_reg_uvm;
                 foreach(N_bit_cg[bt]) N_bit_cg[bt] = new();
                 foreach(L_bit_cg[bt]) L_bit_cg[bt] = new();
                 foreach(FFT_GENERATED_bit_cg[bt]) FFT_GENERATED_bit_cg[bt] = new();
+                foreach(EVKGEN_bit_cg[bt]) EVKGEN_bit_cg[bt] = new();
                 foreach(RSVD0_bit_cg[bt]) RSVD0_bit_cg[bt] = new();
                 foreach(DMA_STREAM_bit_cg[bt]) DMA_STREAM_bit_cg[bt] = new();
                 foreach(RSVD1_bit_cg[bt]) RSVD1_bit_cg[bt] = new();
@@ -543,6 +548,46 @@ package fhe_reg_uvm;
         endfunction : build
     endclass : fhe_reg__fhe_slot_t
 
+    // Reg - fhe_reg::FHE_EVK
+    class fhe_reg__FHE_EVK extends uvm_reg;
+        protected uvm_reg_data_t m_current;
+        protected uvm_reg_data_t m_data;
+        protected bit            m_is_read;
+
+        fhe_reg__FHE_EVK_bit_cg GALOIS_bit_cg[16];
+        fhe_reg__FHE_EVK_bit_cg ROW_bit_cg[4];
+        fhe_reg__FHE_EVK_bit_cg RSVD_bit_cg[12];
+        fhe_reg__FHE_EVK_fld_cg fld_cg;
+        rand uvm_reg_field GALOIS;
+        rand uvm_reg_field ROW;
+        rand uvm_reg_field RSVD;
+
+        function new(string name = "fhe_reg__FHE_EVK");
+            super.new(name, 32, build_coverage(UVM_CVR_ALL));
+        endfunction : new
+        extern virtual function void sample_values();
+        extern protected virtual function void sample(uvm_reg_data_t  data,
+                                                      uvm_reg_data_t  byte_en,
+                                                      bit             is_read,
+                                                      uvm_reg_map     map);
+
+        virtual function void build();
+            this.GALOIS = new("GALOIS");
+            this.GALOIS.configure(this, 16, 0, "RW", 1, 'h0, 1, 1, 0);
+            this.ROW = new("ROW");
+            this.ROW.configure(this, 4, 16, "RW", 1, 'h0, 1, 1, 0);
+            this.RSVD = new("RSVD");
+            this.RSVD.configure(this, 12, 20, "RO", 0, 'h0, 1, 1, 0);
+            if (has_coverage(UVM_CVR_REG_BITS)) begin
+                foreach(GALOIS_bit_cg[bt]) GALOIS_bit_cg[bt] = new();
+                foreach(ROW_bit_cg[bt]) ROW_bit_cg[bt] = new();
+                foreach(RSVD_bit_cg[bt]) RSVD_bit_cg[bt] = new();
+            end
+            if (has_coverage(UVM_CVR_FIELD_VALS))
+                fld_cg = new();
+        endfunction : build
+    endclass : fhe_reg__FHE_EVK
+
     // Addrmap - fhe_reg
     class fhe_reg extends uvm_reg_block;
         rand fhe_reg__FHE_NAME FHE_NAME[2];
@@ -556,6 +601,7 @@ package fhe_reg_uvm;
         rand fhe_reg__FHE_XFER_STATUS FHE_XFER_STATUS;
         rand fhe_reg__FHE_XFER_LEFT FHE_XFER_LEFT;
         rand fhe_reg__fhe_slot_t FHE_SLOT[4];
+        rand fhe_reg__FHE_EVK FHE_EVK;
 
         function new(string name = "fhe_reg");
             super.new(name);
@@ -623,6 +669,11 @@ package fhe_reg_uvm;
                 this.FHE_SLOT[i0].build();
                 this.default_map.add_submap(this.FHE_SLOT[i0].default_map, 'h30 + i0*'h8);
             end
+            this.FHE_EVK = new("FHE_EVK");
+            this.FHE_EVK.configure(this);
+
+            this.FHE_EVK.build();
+            this.default_map.add_reg(this.FHE_EVK, 'h54);
         endfunction : build
     endclass : fhe_reg
 

@@ -61,6 +61,7 @@ module tb_fhe_microseq;
     .clk(clk), .rst_b(rst_b), .zeroize(zeroize),
     .cmd_valid(cmd_valid), .cmd(cmd),
     .k_kg(), .k_kw(), .k_scale(),
+    .evk_h('0), .evk_row('0), .gadget('{default: '0}), .k_gad(),   // EVKGEN needs shared storage
     .scale(scale), .reseed_en(reseed_en),
     .num_limbs(num_limbs), .r2modq(r2modq),
     .rmodq('{default: '0}),   // the one-limb key's table; unused without shared storage

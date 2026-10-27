@@ -6,11 +6,13 @@
 // With the one-limb resident key, the K lane rebuilds the target limb's key
 // in the same pass: it reads the ternary secret from K.sample at the same
 // address and writes it, mapped to {0, k_scale, q - k_scale}, with the lift.
+// zero_src lifts a zero message instead of the snapshot, so the pass writes
+// the sampled error alone (an evaluation-key row, docs/fhe/21).
 module CenterLift #(
     parameter int LOGN = 13,
     parameter int BRAM_RD_LAT = 2
 )(
-    input logic clk, rst, snapshot,
+    input logic clk, rst, snapshot, zero_src,
     input logic [53:0] target_q,
     output logic [LOGN-1:0] rd_addr, wr_addr,
     input logic [63:0] msg0, msg1, saved,
@@ -32,7 +34,7 @@ module CenterLift #(
     always_comb begin
         msg = addr_pipe[BRAM_RD_LAT-1][0] ? msg1 : msg0;
         k = addr_pipe[BRAM_RD_LAT-1][0] ? k1 : k0;
-        source = saved[53:0];
+        source = zero_src ? 54'd0 : saved[53:0];
         lifted = source > (SOURCE_Q >> 1) ? target_q - (SOURCE_Q - source) : source;
         magnitude = msg[60:56];
         // Sign-magnitude CBD sample in M's high byte; magnitude <= 31.

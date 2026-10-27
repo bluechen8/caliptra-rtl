@@ -100,7 +100,11 @@ package fhe_reg_pkg;
     } fhe_reg__FHE_CAP__FFT_GENERATED__in_t;
 
     typedef struct packed{
-        logic [2:0] next;
+        logic next;
+    } fhe_reg__FHE_CAP__EVKGEN__in_t;
+
+    typedef struct packed{
+        logic [1:0] next;
     } fhe_reg__FHE_CAP__RSVD0__in_t;
 
     typedef struct packed{
@@ -119,6 +123,7 @@ package fhe_reg_pkg;
         fhe_reg__FHE_CAP__N__in_t N;
         fhe_reg__FHE_CAP__L__in_t L;
         fhe_reg__FHE_CAP__FFT_GENERATED__in_t FFT_GENERATED;
+        fhe_reg__FHE_CAP__EVKGEN__in_t EVKGEN;
         fhe_reg__FHE_CAP__RSVD0__in_t RSVD0;
         fhe_reg__FHE_CAP__DMA_STREAM__in_t DMA_STREAM;
         fhe_reg__FHE_CAP__RSVD1__in_t RSVD1;
@@ -236,6 +241,19 @@ package fhe_reg_pkg;
     } fhe_reg__fhe_slot_t__in_t;
 
     typedef struct packed{
+        logic hwclr;
+    } fhe_reg__FHE_EVK__GALOIS__in_t;
+
+    typedef struct packed{
+        logic hwclr;
+    } fhe_reg__FHE_EVK__ROW__in_t;
+
+    typedef struct packed{
+        fhe_reg__FHE_EVK__GALOIS__in_t GALOIS;
+        fhe_reg__FHE_EVK__ROW__in_t ROW;
+    } fhe_reg__FHE_EVK__in_t;
+
+    typedef struct packed{
         logic reset_b;
         logic fhe_ready;
         fhe_reg__FHE_NAME__in_t [2-1:0]FHE_NAME;
@@ -249,6 +267,7 @@ package fhe_reg_pkg;
         fhe_reg__FHE_XFER_STATUS__in_t FHE_XFER_STATUS;
         fhe_reg__FHE_XFER_LEFT__in_t FHE_XFER_LEFT;
         fhe_reg__fhe_slot_t__in_t [4-1:0]FHE_SLOT;
+        fhe_reg__FHE_EVK__in_t FHE_EVK;
     } fhe_reg__in_t;
 
     typedef struct packed{
@@ -321,10 +340,24 @@ package fhe_reg_pkg;
     } fhe_reg__fhe_slot_t__out_t;
 
     typedef struct packed{
+        logic [15:0] value;
+    } fhe_reg__FHE_EVK__GALOIS__out_t;
+
+    typedef struct packed{
+        logic [3:0] value;
+    } fhe_reg__FHE_EVK__ROW__out_t;
+
+    typedef struct packed{
+        fhe_reg__FHE_EVK__GALOIS__out_t GALOIS;
+        fhe_reg__FHE_EVK__ROW__out_t ROW;
+    } fhe_reg__FHE_EVK__out_t;
+
+    typedef struct packed{
         fhe_reg__FHE_CTRL__external__out_t FHE_CTRL;
         fhe_reg__FHE_CONFIG__out_t FHE_CONFIG;
         kv_read_ctrl_reg__out_t FHE_KV_RD_SEED_CTRL;
         fhe_reg__fhe_slot_t__out_t [4-1:0]FHE_SLOT;
+        fhe_reg__FHE_EVK__out_t FHE_EVK;
     } fhe_reg__out_t;
 
     typedef enum logic [31:0] {

@@ -51,9 +51,9 @@ addrmap fhe_reg {
         desc = "Command issue, zeroize and input commit. Reads return 0.";
         default sw = w;
         default hw = r;
-        field {desc = "Command: 001 ENCRYPT, 010 KEYGEN, 100 DECRYPT, 101 RECOVER,
-                       110 REFRESH. Accepted only while READY. 011 and 111 complete
-                       with ERROR.";} CMD[3] = 3'b0;
+        field {desc = "Command: 001 ENCRYPT, 010 KEYGEN, 011 EVKGEN, 100 DECRYPT,
+                       101 RECOVER, 110 REFRESH. Accepted only while READY. 111
+                       completes with ERROR.";} CMD[3] = 3'b0;
         field {desc = "Abort any command, clear registers, key-valid state and the
                        latched KeyVault seed. Does not scrub SRAM.";} ZEROIZE = 1'b0;
         field {desc = "Release the ENCRYPT input-commit barrier. Effective only
@@ -74,7 +74,8 @@ addrmap fhe_reg {
         field {desc = "Error cause: 0 none, 1 no key, 2 L out of range, 3 illegal opcode,
                        4 no fresh seed, 5 KeyVault read error, 6 DMA busy, 7 LOGN mismatch,
                        8 bad input word, 9 bad slot address, 10 transport error,
-                       11 aborted by ZEROIZE.";} ERR_CAUSE[4] = 4'b0;
+                       11 aborted by ZEROIZE, 12 bad Galois element, 13 key row out
+                       of range.";} ERR_CAUSE[4] = 4'b0;
         field {desc = "ENCRYPT inputs are loaded; waiting for CTRL.INPUT_COMMIT.";} COMMIT_WAIT = 1'b0;
         field {desc = "Aloha holds the DMA lease.";} DMA_LEASED = 1'b0;
         field {desc = "Reserved";} RSVD[22] = 22'b0;
@@ -88,8 +89,8 @@ addrmap fhe_reg {
         default swwe = fhe_ready;
         default hwclr = true;
         default resetsignal = reset_b;
-        field {desc = "Limb count: limbs emitted by ENCRYPT/RECOVER, target limbs for REFRESH.
-                       Ignored by KEYGEN and DECRYPT.";} L[4] = 4'b0;
+        field {desc = "Limb count: limbs emitted by ENCRYPT/RECOVER, target limbs for REFRESH,
+                       the key level for EVKGEN (1..CAP.L-1). Ignored by KEYGEN and DECRYPT.";} L[4] = 4'b0;
         field {desc = "log2 N. Must equal the built ring dimension.";} LOGN[4] = 4'b0;
         field {desc = "Reserved"; sw = r; hw = na; swwe = false; hwclr = false;} RSVD0[8] = 8'b0;
         field {desc = "Instruction scale field; meaning depends on the command
@@ -104,7 +105,8 @@ addrmap fhe_reg {
         field {desc = "Ring dimension N";} N[16];
         field {desc = "Installed limbs";} L[4];
         field {desc = "FFT twiddles generated (no stored table)";} FFT_GENERATED = 1'b0;
-        field {desc = "Reserved";} RSVD0[3];
+        field {desc = "EVKGEN present (CAP.L >= 2)";} EVKGEN = 1'b0;
+        field {desc = "Reserved";} RSVD0[2];
         field {desc = "DMA stream transport present (always 1)";} DMA_STREAM = 1'b0;
         field {desc = "Reserved (was the firmware-forward stream)";} RSVD1[3];
         field {desc = "Register map version";} MAP_VERSION[4];
@@ -157,4 +159,18 @@ addrmap fhe_reg {
         } BASE_H;
     };
     fhe_slot_t FHE_SLOT[4] @ 0x30;
+
+    /* ---- Evaluation-key row (EVKGEN) ---- */
+    reg {
+        name = "FHE evaluation-key row";
+        default sw = rw;
+        default hw = r;
+        default swwe = fhe_ready;
+        default hwclr = true;
+        default resetsignal = reset_b;
+        field {desc = "Galois element h applied to the secret: 0 for the relinearization
+                       key, else odd with 1 < h < 2N (h = g^-1 mod 2N for rotation g).";} GALOIS[16] = 16'b0;
+        field {desc = "Key row j, j < CONFIG.L";} ROW[4] = 4'b0;
+        field {desc = "Reserved"; sw = r; hw = na; swwe = false; hwclr = false;} RSVD[12] = 12'b0;
+    } FHE_EVK @ 0x54;
 };

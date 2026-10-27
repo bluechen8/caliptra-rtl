@@ -88,7 +88,7 @@ module tb_ckks_roundtrip;
       .N(N),
       .SCHEME(SCHEME)
     ) dut (
-    .k_kg(1'b0), .k_kw(1'b0), .k_scale(54'd0),
+    .k_kg(1'b0), .k_kw(1'b0), .k_scale(54'd0), .k_gad(54'd0), .k_perm_h('0),
       .clk(clk),
       // legacy: reseed every pass, Trivium reset coupled to the core reset (this
       // TB validates the golden per-pass-reload keystream, not free-run).
