@@ -9,7 +9,7 @@
 # KeyVault seed read, CONFIG and slot bases, commands, GCM setup, tag checks
 # and sealing. It checks round trips, recovery, refresh, the single-seed
 # stream, command preconditions, the commit barrier, lease, address, error and
-# abort cases. Options: FHE_L=<1..8> (largest level, default 2), LIMBS2=1
+# abort cases. Options: FHE_L=<1..15> (largest level, default 2), LIMBS2=1
 # (two-limb ciphertexts and the N=256 key golden), STREAM_STALLS=1, MNIST_DIR=<dir>,
 # RECOVER=0 (production build without the RECOVER command: checks it is refused
 # and runs the level sweep by round trip only). +RPC turns the binary into the

@@ -35,7 +35,7 @@
   `define FHE_N 8192       // validated Aloha default
 `endif
 `ifndef FHE_L
-  `define FHE_L 2          // installed primes = largest level, 1..8
+  `define FHE_L 2          // installed primes = largest level, 1..15
 `endif
 `ifndef FHE_BATCH
   `define FHE_BATCH 1      // ciphertexts resident / processed at a time
@@ -49,13 +49,18 @@ package fhe_params_pkg;
   parameter FHE_WORD       = 32;                 // fixed RNS limb width
   parameter FHE_N          = `FHE_N;             // ring dimension
   parameter FHE_LOGN       = $clog2(FHE_N);      // 13 for N=8192
+  parameter FHE_LOGN_MAX   = 14;                 // N <= 16384 (fhe_profiles.geometry)
   parameter FHE_L          = `FHE_L;             // RNS chain length
+  parameter int FHE_L_CATALOG = 15;  // catalog primes; also the 4-bit level fields' limit
   parameter FHE_LEVEL_W    = $clog2(FHE_L) + 1;  // bits to encode a target level (1..L)
   // CROM: a 128-word FFT/RNS prefix, then one (log N + 26)-word NTT seed profile
   // per installed prime (fhe_profiles.geometry); fhe_aloha_mem_if's FHE_CROM_AW
   // is the same width.
   parameter FHE_CROM_WORDS = 128 + FHE_L * (FHE_LOGN + 26);
   parameter FHE_CROM_AW    = $clog2(FHE_CROM_WORDS);
+  // Byte-address width of the CROM host window: sized for the full catalog at
+  // the largest N, so the register map is the same in every build.
+  parameter FHE_CROM_WIN_AW = 4 + $clog2(128 + FHE_L_CATALOG * (FHE_LOGN_MAX + 26));
   // RECOVER returns decrypted coefficients (plaintext-equivalent, no AES), so it
   // exists only in verification builds that define FHE_RECOVER_CMD.
 `ifdef FHE_RECOVER_CMD
@@ -101,21 +106,34 @@ package fhe_params_pkg;
   parameter FHE_MEM_SK_ADDR_W      = $clog2(FHE_MEM_SK_DEPTH);
 
   //----------------------------------------------------------------
-  // Prime catalog (aloha/vendor/Scripts/fhe_profiles.py): limb i uses
-  // q_i = 2^(46+i) - qm_i*2^24 + 1, i = 0..7, and the core selects it by
-  // k = i and modulus/constants select = i. FHE_L installs the first FHE_L.
+  // Prime catalog (aloha/vendor/Scripts/fhe_profiles.py PRIMES, checked by
+  // Scripts/test_constants_rom.py): limb i uses q_i = 2^(46+k_i) - qm_i*2^24 + 1,
+  // i = 0..14, and the core selects it by k = k_i and modulus/constants
+  // select = i. FHE_L installs the first FHE_L.
   //----------------------------------------------------------------
-  function automatic logic [16:0] fhe_qm(input logic [3:0] i);
-    case (i[2:0])
-      3'd0: fhe_qm = 17'd9;   3'd1: fhe_qm = 17'd1;
-      3'd2: fhe_qm = 17'd40;  3'd3: fhe_qm = 17'd5;
-      3'd4: fhe_qm = 17'd28;  3'd5: fhe_qm = 17'd7;
-      3'd6: fhe_qm = 17'd13;  default: fhe_qm = 17'd10;
+  // {k_i, qm_i}
+  function automatic logic [20:0] fhe_kqm(input logic [3:0] i);
+    case (i)
+      4'd0:  fhe_kqm = {4'd0, 17'd9};   4'd1:  fhe_kqm = {4'd1, 17'd1};
+      4'd2:  fhe_kqm = {4'd2, 17'd40};  4'd3:  fhe_kqm = {4'd3, 17'd5};
+      4'd4:  fhe_kqm = {4'd4, 17'd28};  4'd5:  fhe_kqm = {4'd5, 17'd7};
+      4'd6:  fhe_kqm = {4'd6, 17'd13};  4'd7:  fhe_kqm = {4'd7, 17'd10};
+      4'd8:  fhe_kqm = {4'd7, 17'd14};  4'd9:  fhe_kqm = {4'd7, 17'd31};
+      4'd10: fhe_kqm = {4'd7, 17'd34};  4'd11: fhe_kqm = {4'd7, 17'd35};
+      4'd12: fhe_kqm = {4'd7, 17'd52};  4'd13: fhe_kqm = {4'd7, 17'd55};
+      default: fhe_kqm = {4'd7, 17'd62};
     endcase
+  endfunction
+  function automatic logic [16:0] fhe_qm(input logic [3:0] i);
+    logic [20:0] kqm; kqm = fhe_kqm(i); fhe_qm = kqm[16:0];
+  endfunction
+  // Bit width of q_i minus 46 (the core's current_k).
+  function automatic logic [3:0] fhe_k(input logic [3:0] i);
+    logic [20:0] kqm; kqm = fhe_kqm(i); fhe_k = kqm[20:17];
   endfunction
   // Index with a constant; a runtime index builds a shifter (use a genvar table).
   function automatic logic [63:0] fhe_q(input logic [3:0] i);
-    fhe_q = (64'd1 << (46 + i[2:0])) - (64'(fhe_qm(i)) << 24) + 64'd1;
+    fhe_q = (64'd1 << (46 + fhe_k(i))) - (64'(fhe_qm(i)) << 24) + 64'd1;
   endfunction
   // R mod q_i, R = 2^72: the unit of the one-limb key's ternary map, so the
   // forward NTT yields the Montgomery-form key. Elaboration-time only.

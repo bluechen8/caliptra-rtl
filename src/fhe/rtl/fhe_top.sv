@@ -82,8 +82,9 @@ module fhe_top
   logic                      dv, cif_write;
   logic [31:0]               cif_wdata, cif_rdata, reg_rdata;
   logic [AHB_ADDR_WIDTH-1:0] cif_addr;
-  // The CROM window takes 0x4000-0x5FFF; the register block never sees it.
-  wire crom_window = cif_addr[AHB_ADDR_WIDTH-1:13] == (CROM_BASE >> 13);
+  // The CROM window takes 0x4000-0x7FFF (FHE_CROM_WIN_AW); the register block
+  // never sees it.
+  wire crom_window = cif_addr[AHB_ADDR_WIDTH-1:FHE_CROM_WIN_AW] == (CROM_BASE >> FHE_CROM_WIN_AW);
   // Registers take 0x00-0x7F; any other offset reads 0 and ignores writes.
   wire reg_window = cif_addr[AHB_ADDR_WIDTH-1:FHE_REG_ADDR_WIDTH] == '0;
   assign cif_rdata = reg_window ? reg_rdata : 32'd0;  // the CROM window is write-only
@@ -195,8 +196,8 @@ module fhe_top
   // next store's data phase cannot change them before that edge.
   logic [95:0] crom_stage;
   logic [31:0] crom_lane3;
-  wire [8:0] crom_word = cif_addr[12:4];
-  wire crom_store = dv && cif_write && crom_window && ready && (10'(crom_word) < 10'(1 << FHE_CROM_AW));
+  wire [FHE_CROM_WIN_AW-5:0] crom_word = cif_addr[FHE_CROM_WIN_AW-1:4];
+  wire crom_store = dv && cif_write && crom_window && ready && (int'(crom_word) < (1 << FHE_CROM_AW));
   wire crom_last  = cif_addr[3:2] == 2'd3;
   always_ff @(posedge clk or negedge rst_b)
     if (!rst_b) fhe_aloha_mem.crom_wea <= 1'b0;

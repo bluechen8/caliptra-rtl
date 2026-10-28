@@ -206,7 +206,7 @@ module fhe_microseq
 
   // =====================================================================
   // Limb i's prime fields {qm, k, modsel}: catalog prime i (fhe_params_pkg),
-  // with k = modsel = i.
+  // with qm = fhe_qm(i), k = fhe_k(i) (7 for limbs 8..14) and modsel = i.
   // =====================================================================
   // neg_qm = (-qm) & 0x1ffff  (17-bit), matches TB neg_qm()
   function automatic logic [16:0] neg_qm(input logic [16:0] qm); neg_qm = (~qm + 17'd1); endfunction
@@ -557,7 +557,7 @@ module fhe_microseq
     if (patch) begin
       if (tmpl_use_q(t))   w = w | (40'(neg_qm(fhe_qm(li))) << 13);
       if (tmpl_use_rom(t)) w = w | (40'(li) << 9);
-      if (tmpl_use_q(t))   w = w | (40'(li) << 5);
+      if (tmpl_use_q(t))   w = w | (40'(fhe_k(li)) << 5);
       if (sc != SC_NONE)   w = w | scale_bits(sc);
     end
     patch_word = w;

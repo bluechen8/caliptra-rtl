@@ -1050,9 +1050,11 @@ module fhe_top_dma_tb
   endfunction
   // The prime catalog (aloha/vendor/Scripts/fhe_profiles.py), written out
   // here so the row check does not share fhe_q / fhe_gadget with the DUT.
-  localparam logic [63:0] EVK_Q [0:7] = '{
+  localparam logic [63:0] EVK_Q [0:14] = '{
     64'h3ffff7000001, 64'h7fffff000001, 64'hffffd8000001, 64'h1fffffb000001,
-    64'h3ffffe4000001, 64'h7fffff9000001, 64'hffffff3000001, 64'h1ffffff6000001};
+    64'h3ffffe4000001, 64'h7fffff9000001, 64'hffffff3000001, 64'h1ffffff6000001,
+    64'h1ffffff2000001, 64'h1fffffe1000001, 64'h1fffffde000001, 64'h1fffffdd000001,
+    64'h1fffffcc000001, 64'h1fffffc9000001, 64'h1fffffc2000001};
   // G_j = P mod q_j with P = q_{FHE_L-1}.
   function automatic logic [63:0] evk_gadget(input int j);
     return EVK_Q[FHE_L - 1] % EVK_Q[j];
@@ -1190,8 +1192,12 @@ module fhe_top_dma_tb
     if (!dut.walker.k0_ok) $fatal(1, "evaluation-key tests need limb 0 resident");
     // The reference gadget: nonzero, a pinned value at FHE_L = 2, and the
     // DUT's catalog and GADGET table agree with it.
+    for (int j = 0; j < FHE_L_CATALOG; j++)
+      if (fhe_q(4'(j)) != EVK_Q[j]) begin
+        $display("FAIL: catalog prime %0d: DUT 0x%h, reference 0x%h", j, fhe_q(4'(j)), EVK_Q[j]); errors++;
+      end
     for (int j = 0; j < FHE_L; j++)
-      if (fhe_q(4'(j)) != EVK_Q[j] || dut.GADGET[j] != evk_gadget(j) ||
+      if (dut.GADGET[j] != evk_gadget(j) ||
           (j < FHE_L - 1 && evk_gadget(j) == 0)) begin
         $display("FAIL: gadget %0d: DUT q 0x%h G 0x%h, reference q 0x%h G 0x%h",
                  j, fhe_q(4'(j)), dut.GADGET[j], EVK_Q[j], evk_gadget(j)); errors++;
@@ -1405,7 +1411,7 @@ module fhe_top_dma_tb
     if (!d[ST_READY] || d[ST_VALID]) begin $display("FAIL: CROM store started a command"); errors++; end
     crom_store(1, crom_image[1]);
     // A store past the CROM depth must not wrap onto word 0.
-    if (CROM_DEPTH < 512) crom_store(CROM_DEPTH, ~crom_image[0]);
+    if (CROM_DEPTH < (1 << (FHE_CROM_WIN_AW - 4))) crom_store(CROM_DEPTH, ~crom_image[0]);
     crom_settle();
     if (u_aloha_mem.crom.mem[0] !== crom_image[0] || u_aloha_mem.crom.mem[1] !== crom_image[1]) begin
       $display("FAIL: CROM word 0/1 changed by an aliased or out-of-range store"); errors++;
