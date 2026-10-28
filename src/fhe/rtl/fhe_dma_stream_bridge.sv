@@ -140,7 +140,7 @@ module fhe_dma_stream_bridge
     hw_req.flush      = (state == B_FLUSH);
     hw_req.rd_ready   = in_pop;
     hw_req.wr_valid   = out_push;
-    hw_req.wr_data    = abort_q ? 32'd0 : (half_out ? obuf[63:32] : obuf[31:0]);
+    hw_req.wr_data    = half_out ? obuf[63:32] : obuf[31:0];
   end
 
   always_ff @(posedge clk or negedge rst_b) begin
@@ -222,6 +222,11 @@ module fhe_dma_stream_bridge
         end
         default: state <= B_IDLE;
       endcase
+      // The staging words hold message or slot plaintext: zero outside a live
+      // segment, so an abort drain moves zeros.
+      if (abort || abort_q || xfer_end) begin
+        ibuf <= '0; ilo <= '0; obuf <= '0;
+      end
     end
   end
 

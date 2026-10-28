@@ -607,10 +607,15 @@ module fhe_microseq
       limb_active <= 1'b0; limb_idx <= 4'd0; limb_cnt <= 4'd1;
       widx <= '0; wn <= '0; rd_wait <= 3'd0;
       rd_iss <= '0; rd_pipe <= '0; rdq_n <= '0;
+      for (int i = 0; i < RD_LAT; i++) rdq[i] <= 64'd0;
       reseed_en <= 1'b0;
     end else if (zeroize) begin
       st <= S_IDLE; busy <= 1'b0; done <= 1'b0; error <= 1'b0;
       control_low_word <= 32'd0; control_high_word <= 32'd1;
+      // Message and slot words in flight are plaintext.
+      dina_low <= 32'd0; dina_high <= 32'd0;
+      rd_iss <= '0; rd_pipe <= '0; rdq_n <= '0;
+      for (int i = 0; i < RD_LAT; i++) rdq[i] <= 64'd0;
       limb_active <= 1'b0;
       reseed_en <= 1'b0;
       k0_ok <= 1'b0;

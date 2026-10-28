@@ -37,6 +37,11 @@ module fhe_top
   input  logic clk,
   input  logic clock_live, // parent gate enable, for ungated lifted SRAMs
   input  logic rst_b,
+  // Debug-unlock / scan-mode / lifecycle switch or fatal error: acts as a
+  // ZEROIZE, like the other crypto blocks' ZEROIZE. A fatal error holds it:
+  // the engine stays cleared and refuses commands (a CTRL write is dropped)
+  // until it drops; an interrupted command then completes ABORTED.
+  input  logic debugUnlock_or_scan_mode_switch,
   // AHB-Lite responder slice (from caliptra_top responder_inst[SEL_FHE])
   input  logic [AHB_ADDR_WIDTH-1:0] haddr_i,
   input  logic [AHB_DATA_WIDTH-1:0] hwdata_i,
@@ -163,9 +168,9 @@ module fhe_top
   assign ctrl_wdata = hwif_out.FHE_CTRL.wr_data;
   assign hwif_in.FHE_CTRL.wr_ack = hwif_out.FHE_CTRL.req;
 
-  assign zeroize   = ctrl_wr & ctrl_wdata[3];
+  assign zeroize   = (ctrl_wr & ctrl_wdata[3]) | debugUnlock_or_scan_mode_switch;
   assign cmd_in    = fhe_cmd_e'(ctrl_wdata[2:0]);
-  assign cmd_write = ctrl_wr & ~ctrl_wdata[3] & ready & (ctrl_wdata[2:0] != 3'b000);
+  assign cmd_write = ctrl_wr & ~zeroize & ready & (ctrl_wdata[2:0] != 3'b000);
   // CTRL.INPUT_COMMIT (bit 4) releases the ENCRYPT commit barrier.
   logic commit_wait;
   wire  input_commit = ctrl_wr & ctrl_wdata[4] & commit_wait;
@@ -175,7 +180,14 @@ module fhe_top
   // buffer cannot take a write that collides with the step's read
   // (fhe_ilv_bank); the requests are core and walker registers, so the stall
   // settles before the clock-gate latch opens.
-  wire core_step = clock_live && rst_b && !zeroize && !fhe_aloha_mem.eng_stall;
+  // ZEROIZE also resets the sampler Trivium (its state regenerates s and every
+  // e): a registered one-cycle reset (fhe_prng_rst), during which the core
+  // takes no step, so the reset releases with no core_clk edge.
+  logic prng_clr_q;
+  always_ff @(posedge clk or negedge rst_b)
+    if (!rst_b) prng_clr_q <= 1'b0;
+    else        prng_clr_q <= zeroize;
+  wire core_step = clock_live && rst_b && !zeroize && !prng_clr_q && !fhe_aloha_mem.eng_stall;
   // Low-phase latch is the standard glitch-free clock-gate pattern. The core,
   // including the sampler, runs on core_clk; AHB and the stream stay ungated.
   wire core_clk;
@@ -225,7 +237,7 @@ module fhe_top
   logic kv_start, kv_seed_valid, kv_seed_error, kv_busy;
   logic seed_fresh, seed_wipe;
 
-  assign kv_start  = hwif_out.FHE_KV_RD_SEED_CTRL.read_en.value & ~kv_busy & ready;
+  assign kv_start  = hwif_out.FHE_KV_RD_SEED_CTRL.read_en.value & ~kv_busy & ready & ~zeroize;
   // The seed copy lives only until the KEYGEN that consumes it completes.
   assign seed_wipe = zeroize | (w_done & (cmd_q == FHE_KEYGEN));
 
@@ -485,10 +497,10 @@ module fhe_top
   logic [31:0] w_cl, w_ch, w_dl, w_dh;
   logic [31:0] core_dout_lo, core_dout_hi, core_status;
   logic [39:0] core_cmd;     // walker -> ComputeCore command, held per pass
-  // The sampler Trivium is reset only at power-on; its state otherwise
-  // persists across passes and commands (one continuous stream per key).
+  // The sampler Trivium persists across passes and commands (one continuous
+  // stream per key) until ZEROIZE (prng_clr_q).
   logic        fhe_prng_rst;
-  assign       fhe_prng_rst = ~rst_b;
+  assign       fhe_prng_rst = ~rst_b | prng_clr_q;
   logic        w_reseed_en;
 
   logic [2:0]   w_ext_sel;

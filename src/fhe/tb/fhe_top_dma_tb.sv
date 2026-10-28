@@ -109,6 +109,8 @@ module fhe_top_dma_tb
   assign hready = hreadyout;
   logic [DW-1:0]  hrdata;
   logic error_intr, notif_intr;
+  logic security_clear = 1'b0;  // debug-unlock / scan / lifecycle / fatal clear
+  wire  sampler_valid = dut.core.CORE.random_sampling.trivium_adapter.valid_q;
 
   fhe_mem_if mem_if();
   axi_pkg::axi_dma_hw_req_t  dma_req;
@@ -118,7 +120,7 @@ module fhe_top_dma_tb
     .AHB_DATA_WIDTH(DW), .AHB_ADDR_WIDTH(AHW), .DMA_AW(DMA_AW)
   ) dut (
     .clock_live(parent_clock_live),
-    .clk(parent_clk), .rst_b(rst_b),
+    .clk(parent_clk), .rst_b(rst_b), .debugUnlock_or_scan_mode_switch(security_clear),
     .haddr_i(haddr), .hwdata_i(hwdata), .hsel_i(hsel), .hwrite_i(hwrite),
     .hready_i(hready), .htrans_i(htrans), .hsize_i(hsize),
     .hresp_o(hresp), .hreadyout_o(hreadyout), .hrdata_o(hrdata),
@@ -506,10 +508,10 @@ module fhe_top_dma_tb
   // held while HREADYOUT is low; err reports an ERROR response.
   task automatic ahb_access(input bit write, input logic [AHW-1:0] a,
                             input logic [31:0] wd, output logic [31:0] rd,
-                            output bit err);
+                            output bit err, input logic [2:0] size = 3'b010);
     begin
       @(negedge clk);
-      hsel <= 1'b1; htrans <= 2'b10; hsize <= 3'b010; hwrite <= write; haddr <= a;
+      hsel <= 1'b1; htrans <= 2'b10; hsize <= size; hwrite <= write; haddr <= a;
       @(negedge clk);
       hsel <= 1'b0; htrans <= 2'b00; hwrite <= 1'b0;
       if (write) hwdata <= a[2] ? {wd, 32'h0} : {32'h0, wd};
@@ -930,13 +932,14 @@ module fhe_top_dma_tb
     rebuild_ref_valid = 0;
   endtask
 
-  // ZEROIZE (one clock of the decoded strobe) at a chosen point of a limb-0
-  // rebuild, or of KEYGEN's sample pass. KEY_VALID and k0_ok must end clear,
-  // and the completion is ABORTED. point: 0 during the KW RNS pass, 1 the clock
+  // ZEROIZE (one clock of the decoded strobe, or of the security clear) at a
+  // chosen point of a limb-0 rebuild, or of KEYGEN's sample pass. KEY_VALID,
+  // k0_ok, the sampler and the seed copy must end clear, and the completion is
+  // ABORTED. point: 0 during the KW RNS pass, 1 the clock
   // after it completes, 2 during the KW NTT pass, 3 on the NTT's completion
   // clock (the one that would set k0_ok), 4 during KEYGEN's sample pass.
   localparam logic [7:0] T_RNS_CODE = 8'd2, T_SAMPLE_CODE = 8'd9;
-  task automatic zeroize_in_rebuild(input int point, input string nm);
+  task automatic zeroize_in_rebuild(input int point, input string nm, input bit by_clear = 0);
     int base, guard = 0;
     logic [31:0] d;
     bit hit;
@@ -964,16 +967,45 @@ module fhe_top_dma_tb
     end while (!hit && guard < 10_000_000);
     if (!hit) $fatal(1, "%s: never reached the ZEROIZE point", nm);
     if (point == 1) @(negedge clk);    // the walker is between the two passes
-    force dut.zeroize = 1'b1;
+    if (by_clear) security_clear = 1'b1;
+    else          force dut.zeroize = 1'b1;
     @(negedge clk);
+    security_clear = 1'b0;
     release dut.zeroize;
     rebuild_expected = 0;
     wait_status(ST_VALID, nm);
     ahb_read(A_STATUS, d);
-    if (d[ST_READY] && d[ST_ERROR] && d[7:4] == FHE_EC_ABORTED && !d[ST_KEY_VALID] && !dut.walker.k0_ok)
-      $display("PASS %s: aborted, KEY_VALID and k0_ok clear", nm);
+    if (d[ST_READY] && d[ST_ERROR] && d[7:4] == FHE_EC_ABORTED && !d[ST_KEY_VALID] && !dut.walker.k0_ok &&
+        !sampler_valid && dut.kv_seed == '0)
+      $display("PASS %s: aborted, KEY_VALID, k0_ok, sampler and seed clear", nm);
     else begin $display("FAIL: %s left STATUS=0x%08h k0_ok %0d", nm, d, dut.walker.k0_ok); errors++; end
     gcm_discard();
+  endtask
+
+  // The security clear while idle drops the key and resets the sampler (in a
+  // command: zeroize_in_rebuild). A sub-word AHB write is refused with ERROR
+  // and changes nothing.
+  task automatic security_clear_tests();
+    logic [31:0] d, cfg_before, unused;
+    bit err;
+    rekey("KEYGEN (security clear while idle)");
+    @(negedge clk); security_clear = 1'b1;
+    @(negedge clk); security_clear = 1'b0;
+    ahb_read(A_STATUS, d);
+    if (d[ST_READY] && !d[ST_KEY_VALID] && !d[ST_VALID] && !sampler_valid)
+      $display("PASS security clear while idle drops KEY_VALID and resets the sampler");
+    else begin $display("FAIL: idle security clear left STATUS=0x%08h", d); errors++; end
+    cfg(tb_limbs(), 12'(rns_scale));
+    expect_reject(FHE_ENCRYPT, FHE_EC_NO_KEY, "ENCRYPT after the security clear (no key)");
+    zeroize_in_rebuild(4, "security clear during KEYGEN's sample pass", 1);
+
+    ahb_read(A_CONFIG, cfg_before);
+    for (int sz = 0; sz < 2; sz++) begin
+      ahb_access(1'b1, A_CONFIG, 32'hFFFF_FFFF, unused, err, 3'(sz));
+      ahb_read(A_CONFIG, d);
+      if (err && d == cfg_before) $display("PASS %0d-byte AHB write refused with ERROR", 1 << sz);
+      else begin $display("FAIL: %0d-byte write err %0d, CONFIG 0x%08h -> 0x%08h", 1 << sz, err, cfg_before, d); errors++; end
+    end
   endtask
 
   // The core's debug-read mux must not expose K (docs/fhe/20.9): with a key
@@ -2178,6 +2210,7 @@ module fhe_top_dma_tb
       zeroize_in_rebuild(2, "ZEROIZE during the limb-0 rebuild's NTT");
       zeroize_in_rebuild(3, "ZEROIZE on the clock the limb-0 NTT completes");
       zeroize_in_rebuild(4, "ZEROIZE during KEYGEN's sample pass");
+      security_clear_tests();
 
       dma_stream_tests();
 

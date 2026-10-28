@@ -1175,6 +1175,7 @@ fhe_top #(
      .clk               (clk_cg),
      .clock_live        (clk_cg_en),
      .rst_b             (cptra_noncore_rst_b),
+     .debugUnlock_or_scan_mode_switch (debug_lock_or_scan_mode_switch),
      .haddr_i           (responder_inst[`CALIPTRA_SLAVE_SEL_FHE].haddr[`CALIPTRA_SLAVE_ADDR_WIDTH(`CALIPTRA_SLAVE_SEL_FHE)-1:0]),
      .hwdata_i          (responder_inst[`CALIPTRA_SLAVE_SEL_FHE].hwdata),
      .hsel_i            (responder_inst[`CALIPTRA_SLAVE_SEL_FHE].hsel),
