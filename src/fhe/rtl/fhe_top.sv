@@ -280,14 +280,15 @@ module fhe_top
   // EVKGEN needs a key-switching prime above the key level, so FHE_L >= 2.
   localparam bit EVKGEN_EN = FHE_L >= 2;
 
-  // The slots a command uses must be 16-byte aligned and must not run past the
-  // DMA's address space: BASE + limbs*N*8 <= 2^DMA_AW.
+  // The slots a command uses must be 4-byte aligned (the DMA's 32-bit beats;
+  // a protocol v5 blob body sits at +20) and must not run past the DMA's
+  // address space: BASE + limbs*N*8 <= 2^DMA_AW.
   logic [63:0] slot_base [0:3];
   logic        slots_ok, dma_idle;
   function automatic logic slot_ok(input logic [63:0] base, input logic [3:0] limbs);
     logic [DMA_AW:0] slot_end;
     slot_end = (DMA_AW+1)'(base[DMA_AW-1:0]) + (DMA_AW+1)'(limbs) * (DMA_AW+1)'(FHE_N * 8);
-    return (base[3:0] == 4'd0) && (base[63:DMA_AW] == '0) && (slot_end <= (DMA_AW+1)'(1) << DMA_AW);
+    return (base[1:0] == 2'd0) && (base[63:DMA_AW] == '0) && (slot_end <= (DMA_AW+1)'(1) << DMA_AW);
   endfunction
   always_comb begin
     slots_ok = 1'b1;

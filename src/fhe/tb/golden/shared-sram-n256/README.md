@@ -9,3 +9,11 @@ These are public test keys, not provisioned secrets.
 The SRAM reuse regression compares both limbs, so matching errors in hardware
 encrypt/decrypt cannot hide a changed secret or ciphertext. Do not regenerate
 these from the implementation under test.
+
+`slots5.hex`: the expected DECRYPT of `ciphertext.hex` since Aloha's slot j is
+the root zeta^(5^j) (Lattigo's order; this ciphertext encoded `input.txt` in the
+original 3^j order). Computed outside the RTL from `key.hex` (NTT(s)*2^72 mod
+q0) and `ciphertext.hex` limb 0: INTT of c0 + c1*s with the minimum 512th root,
+centred, divided by 2^25, evaluated at zeta^(5^k), k < 128; N/2 complex values,
+real then imaginary, as binary64 hex. Each equals an `input.txt` slot or its
+conjugate to 3.3e-6.

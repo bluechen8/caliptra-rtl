@@ -1581,8 +1581,8 @@ module fhe_top_dma_tb
     if (d[0] || diff != 0) begin $display("FAIL: firmware DMA copy (busy=%0d, %0d bad words)", d[0], diff); errors++; end
     else $display("PASS firmware DMA copy completed alongside the refused command");
 
-    // (5) Slot addresses: 16-byte alignment and the DMA address range (cause 9).
-    set_slot(2, 64'(ADDR_C0 + 8));
+    // (5) Slot addresses: 4-byte alignment and the DMA address range (cause 9).
+    set_slot(2, 64'(ADDR_C0 + 2));
     expect_reject(FHE_ENCRYPT, FHE_EC_BAD_ADDR, "ENCRYPT with a misaligned output slot");
     enc_slots();
     set_slot(3, (64'd1 << DMA_AW) - 64'(N * 8));
@@ -1908,16 +1908,19 @@ module fhe_top_dma_tb
     begin
       string dir;
       logic [63:0] reference [0:4*N-1], saved0 [0:2*N-1], saved1 [0:2*N-1];
-      longint reco[];
+      longint reco[], slots5 [0:N];
       if ($value$plusargs("GOLDEN_DIR=%s",dir)) begin
         $readmemh({dir,"/ciphertext.hex"},reference);
+        // The golden ciphertext predates the 5^j slot order; slots5.hex is its
+        // decryption under the golden key in that order (README.md).
+        $readmemh({dir,"/slots5.hex"},slots5);
         for(int i=0;i<2*N;i++) begin
           saved0[i]=dram[ADDR_C0/8+i]; saved1[i]=dram[ADDR_C1/8+i];
           dram[ADDR_C0/8+i]=reference[2*i]; dram[ADDR_C1/8+i]=reference[2*i+1];
         end
         run_cmd(FHE_DECRYPT,"OTF decode stored-FFT golden ciphertext");
         reco=new[N]; capture_slots(reco,ADDR_OUT);
-        check_fft(reco,g_input,N,"OTF / stored-table ciphertext interoperability",1.0e-3);
+        check_fft(reco,slots5,N,"OTF / stored-table ciphertext interoperability",1.0e-3);
         for(int i=0;i<2*N;i++) begin
           dram[ADDR_C0/8+i]=saved0[i]; dram[ADDR_C1/8+i]=saved1[i];
         end
